@@ -179,16 +179,18 @@ fn everything_on_a_real_desktop() {
     let a = "Claude Code";
     // Measured around one action at a time, so a person using the mouse meanwhile cannot fail it.
     let unmoved = |action: &[&str]| {
-        for _ in 0..4 {
+        let mut last = String::new();
+        for _ in 0..6 {
             let before = pointer_and_focus();
             let reply = dc(a, action);
-            let same = pointer_and_focus() == before;
-            if same || !reply.0 {
-                return (same, reply.1);
+            let after = pointer_and_focus();
+            if after == before || !reply.0 {
+                return (after == before, reply.1);
             }
-            thread::sleep(Duration::from_millis(500));
+            last = format!("{before:?} became {after:?}: {}", reply.1);
+            thread::sleep(Duration::from_millis(700));
         }
-        (false, String::new())
+        (false, last)
     };
 
     // Reading.
