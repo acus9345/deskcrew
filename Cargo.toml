@@ -6,6 +6,10 @@ description = "Every coding agent gets its own cursor on your Windows desktop, f
 license = "MIT"
 repository = "https://github.com/acus9345/deskcrew"
 readme = "README.md"
+exclude = ["demo/"]
+
+[package.metadata.docs.rs]
+default-target = "x86_64-pc-windows-msvc"
 
 [dependencies]
 png = "0.17"
