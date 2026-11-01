@@ -267,6 +267,7 @@ struct Home {
     guard: Option<FocusGuard>,
     pids: Vec<u32>,
     leaving: Option<Instant>,
+    on_loan: bool,
 }
 
 impl Service {
@@ -437,7 +438,7 @@ impl Service {
         loop {
             let held = {
                 let mut home = self.home.lock().unwrap();
-                let held = home.guard.clone().map(|guard| (guard, home.pids.clone()));
+                let held = home.guard.clone().filter(|_| !home.on_loan).map(|guard| (guard, home.pids.clone()));
                 if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
                     home.guard = None;
                     home.pids.clear();
@@ -450,6 +451,7 @@ impl Service {
                     guard.restore(&pids);
                     thread::sleep(FOCUS_WATCH);
                 }
+                None if self.home.lock().unwrap().on_loan => thread::sleep(FOCUS_WATCH),
                 None => thread::park(),
             }
         }
@@ -556,13 +558,19 @@ impl Service {
 
     fn with_front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], mouse: bool, work: impl FnOnce() -> T) -> Result<T, String> {
         let _turn = self.real_input.lock().unwrap();
-        let _borrowed = real::borrow(tracked.hwnd, &view.pids, mouse)?;
-        let mut family = view.surfaces.clone();
-        family.push(tracked.hwnd);
-        if let Some((x, y)) = points.iter().find(|(x, y)| !win::owns_point(&family, *x, *y)) {
-            return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
-        }
-        Ok(work())
+        // The focus keeper stands aside while focus is on loan, or it would take it straight back.
+        self.home.lock().unwrap().on_loan = true;
+        let result = (|| {
+            let _borrowed = real::borrow(tracked.hwnd, &view.pids, mouse)?;
+            let mut family = view.surfaces.clone();
+            family.push(tracked.hwnd);
+            if let Some((x, y)) = points.iter().find(|(x, y)| !win::owns_point(&family, *x, *y)) {
+                return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
+            }
+            Ok(work())
+        })();
+        self.home.lock().unwrap().on_loan = false;
+        result
     }
 
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
