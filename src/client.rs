@@ -50,7 +50,7 @@ fn agent(args: &mut Vec<String>) -> String {
     } else if has("AMP_CURRENT_THREAD_ID") {
         "Amp".into()
     } else {
-        launched_by().unwrap_or("agent").into()
+        launched_by().unwrap_or("your agent").into()
     }
 }
 
