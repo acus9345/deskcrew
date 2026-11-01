@@ -246,6 +246,8 @@ impl Agent {
             self.layer.show();
             self.visible = true;
         }
+        // A window that is itself always on top rises over the cursor when it takes the strokes.
+        self.layer.raise();
     }
 
     fn fly(&mut self, to: Point, arrived: Sender<()>) {
