@@ -1,6 +1,6 @@
 // The pictures: a cursor with its name beside it, and the outline a press leaves on a control.
 use crate::motion::Rgb;
-use tiny_skia::{Color, FillRule, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
+use tiny_skia::{Color, FillRule, GradientStop, LineJoin, Paint, Path, PathBuilder, Pixmap, Point, RadialGradient, SpreadMode, Stroke, Transform};
 
 /// The arrow's corners and how much each is rounded, in pixels on a 100% screen. The tip is at 0,0.
 const ARROW: [(f32, f32); 4] = [(0.0, 0.0), (31.0, 18.0), (15.0, 21.5), (5.0, 34.5)];
@@ -18,6 +18,13 @@ const OUTLINE_FILL: f32 = 0.18;
 const OUTLINE_LINE: f32 = 2.0;
 const OUTLINE_ALPHA: f32 = 0.92;
 const OUTLINE_ROUNDING: f32 = 7.0;
+const OUTLINE_THIN: f32 = 0.9;
+const RISE_MS: f32 = 110.0;
+const TINT_MS: f32 = 140.0;
+const GLOW_ARRIVE_MS: f32 = 35.0;
+const GLOW_PEAK: f32 = 0.62;
+/// When the press has finished moving and only the settled outline is left.
+pub const PRESS_SETTLE_MS: f32 = 320.0;
 
 fn paint(colour: Rgb, alpha: f32) -> Paint<'static> {
     let mut paint = Paint::default();
@@ -172,16 +179,37 @@ pub fn outline_margin(s: f32) -> i32 {
     (OUTLINE_LINE * s).ceil() as i32
 }
 
-pub fn outline(colour: Rgb, w: i32, h: i32, s: f32) -> Option<Pixmap> {
+/// A control `ms` after being pressed: a glow bursts from its middle and spreads to the edges while
+/// a thin outline fades in and thickens, leaving the outline and a light tint.
+pub fn press(colour: Rgb, w: i32, h: i32, s: f32, ms: f32) -> Option<Pixmap> {
     let margin = outline_margin(s);
     let mut canvas = Pixmap::new((w + margin * 2) as u32, (h + margin * 2) as u32)?;
     let inset = OUTLINE_LINE * s / 2.0;
     let (width, height) = (canvas.width() as f32 - inset * 2.0, canvas.height() as f32 - inset * 2.0);
     let radius = (OUTLINE_ROUNDING * s).min(height * 0.25);
     let box_path = rounded(inset, inset, width, height, radius)?;
-    canvas.fill_path(&box_path, &paint(colour, OUTLINE_FILL), FillRule::Winding, Transform::identity(), None);
-    let line = Stroke { width: OUTLINE_LINE * s, ..Stroke::default() };
-    canvas.stroke_path(&box_path, &paint(colour, OUTLINE_ALPHA), &line, Transform::identity(), None);
+    let rise = (ms / RISE_MS).clamp(0.0, 1.0);
+    let rise = rise * rise * (3.0 - 2.0 * rise);
+
+    let tint = OUTLINE_FILL * (ms / TINT_MS).clamp(0.0, 1.0);
+    canvas.fill_path(&box_path, &paint(colour, tint), FillRule::Winding, Transform::identity(), None);
+
+    let spread = (ms / PRESS_SETTLE_MS).clamp(0.0, 1.0);
+    if spread < 1.0 {
+        let strength = GLOW_PEAK * (1.0 - spread).powf(1.4) * (ms / GLOW_ARRIVE_MS).clamp(0.0, 1.0);
+        let outward = 1.0 - (1.0 - spread) * (1.0 - spread);
+        let reach = width.hypot(height) / 2.0 * (0.2 + 0.95 * outward);
+        let middle = Point::from_xy(canvas.width() as f32 / 2.0, canvas.height() as f32 / 2.0);
+        let tone = |alpha: f32| Color::from_rgba8(colour.0, colour.1, colour.2, (alpha * 255.0) as u8);
+        let stops = vec![GradientStop::new(0.0, tone(strength)), GradientStop::new(0.5, tone(strength * 0.55)), GradientStop::new(1.0, tone(0.0))];
+        if let Some(shader) = RadialGradient::new(middle, middle, reach, stops, SpreadMode::Pad, Transform::identity()) {
+            let glow = Paint { shader, anti_alias: true, ..Paint::default() };
+            canvas.fill_path(&box_path, &glow, FillRule::Winding, Transform::identity(), None);
+        }
+    }
+
+    let line = Stroke { width: (OUTLINE_THIN + (OUTLINE_LINE - OUTLINE_THIN) * rise) * s, ..Stroke::default() };
+    canvas.stroke_path(&box_path, &paint(colour, OUTLINE_ALPHA * rise), &line, Transform::identity(), None);
     Some(canvas)
 }
 
@@ -196,12 +224,20 @@ mod tests {
 
     #[test]
     fn the_outline_is_solid_at_the_edge_and_see_through_inside() {
-        let canvas = outline((240, 48, 110), 200, 100, 1.0).unwrap();
+        let canvas = press((240, 48, 110), 200, 100, 1.0, PRESS_SETTLE_MS).unwrap();
         let (_, _, _, edge) = pixel(&canvas, 103, 1);
         let (r, _, _, inside) = pixel(&canvas, 103, 53);
         assert!(edge >= 220, "edge alpha {edge}");
         assert!((40..=50).contains(&inside), "fill alpha {inside}");
         assert!(r <= inside);
+    }
+
+    #[test]
+    fn a_press_starts_with_a_bright_middle_and_a_thin_faint_edge_then_settles() {
+        let early = press((240, 48, 110), 200, 100, 1.0, 40.0).unwrap();
+        let settled = press((240, 48, 110), 200, 100, 1.0, PRESS_SETTLE_MS).unwrap();
+        assert!(pixel(&early, 102, 52).3 > pixel(&settled, 102, 52).3 * 2, "glow");
+        assert!(pixel(&early, 102, 1).3 < pixel(&settled, 102, 1).3 / 2, "edge");
     }
 
     #[test]
@@ -220,11 +256,12 @@ mod tests {
     #[ignore = "writes a picture to look at: set DESKCREW_PREVIEW to a .png path"]
     fn preview() {
         let Some(path) = std::env::var_os("DESKCREW_PREVIEW") else { return };
-        let (width, height) = (960u32, 440u32);
+        let (width, height) = (960u32, 590u32);
         let mut sheet = Pixmap::new(width, height).unwrap();
         sheet.fill(Color::from_rgba8(248, 248, 250, 255));
         let mut dark = PathBuilder::new();
         dark.push_rect(tiny_skia::Rect::from_xywh(480.0, 0.0, 480.0, 440.0).unwrap());
+        dark.push_rect(tiny_skia::Rect::from_xywh(0.0, 440.0, 960.0, 150.0).unwrap());
         sheet.fill_path(&dark.finish().unwrap(), &paint((30, 30, 34), 1.0), FillRule::Winding, Transform::identity(), None);
         let spots = [("Claude Code", (255, 165, 31), 40, 30), ("Cursor", (240, 48, 110), 250, 30), ("fx", (21, 101, 240), 40, 170), ("Claude Code", (255, 165, 31), 520, 30), ("Cursor", (240, 48, 110), 730, 30), ("fx", (21, 101, 240), 520, 170)];
         for (name, colour, x, y) in spots {
@@ -232,8 +269,12 @@ mod tests {
             sheet.draw_pixmap(x, y, picture.as_ref(), &Default::default(), Transform::identity(), None);
         }
         for (x, colour) in [(250, (240, 48, 110)), (730, (255, 165, 31))] {
-            let box_picture = outline(colour, 130, 90, 1.5).unwrap();
+            let box_picture = press(colour, 130, 90, 1.5, PRESS_SETTLE_MS).unwrap();
             sheet.draw_pixmap(x, 200, box_picture.as_ref(), &Default::default(), Transform::identity(), None);
+        }
+        for (at, ms) in [15.0, 45.0, 80.0, 110.0, 150.0, 200.0, 260.0, 320.0].into_iter().enumerate() {
+            let frame = press((240, 48, 110), 105, 105, 1.0, ms).unwrap();
+            sheet.draw_pixmap(8 + at as i32 * 118, 460, frame.as_ref(), &Default::default(), Transform::identity(), None);
         }
         let file = std::fs::File::create(path).unwrap();
         let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), width, height);

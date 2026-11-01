@@ -5,7 +5,7 @@ mod layer;
 
 use crate::motion::{self, Point, Rgb};
 use crate::real;
-use draw::{cursor, outline, outline_margin};
+use draw::{PRESS_SETTLE_MS, cursor, outline_margin, press};
 use layer::{Layer, text_mask};
 use std::{
     mem::zeroed,
@@ -36,9 +36,11 @@ use windows_sys::Win32::{
 
 /// An action fires this long after asking to move, even if drawing has fallen behind.
 const ARRIVAL_TIMEOUT: Duration = Duration::from_millis(900);
-const FLASH_IN_MS: f32 = 80.0;
-const FLASH_HOLD_MS: f32 = 900.0;
-const FLASH_OUT_MS: f32 = 220.0;
+const FLASH_IN_MS: f32 = 110.0;
+const FLASH_HOLD_MS: f32 = 480.0;
+const FLASH_OUT_MS: f32 = 300.0;
+/// Past this size the glow is too much to redraw every frame, so a big control just fades in.
+const FLASH_MOST_PIXELS: i64 = 500_000;
 const REST_AFTER: Duration = Duration::from_secs(6);
 const REST_FADE_MS: f32 = 160.0;
 const ARRIVE_FROM: f32 = 90.0;
@@ -303,22 +305,36 @@ struct Flash {
     y: i32,
     started: Instant,
     aside: bool,
+    colour: Rgb,
+    target: Rect,
+    scale: f32,
+    animated: bool,
+    settled: bool,
 }
 
 impl Flash {
     fn new(colour: Rgb, target: Rect, scale: f32) -> Option<Flash> {
         let margin = outline_margin(scale);
-        let layer = Layer::new(&outline(colour, target.w, target.h, scale)?);
-        let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now(), aside: false };
+        let animated = (target.w as i64) * (target.h as i64) <= FLASH_MOST_PIXELS;
+        let first = if animated { 0.0 } else { PRESS_SETTLE_MS };
+        let layer = Layer::new(&press(colour, target.w, target.h, scale, first)?);
+        let settled = !animated;
+        let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now(), aside: false, colour, target, scale, animated, settled };
         flash.layer.present(flash.x, flash.y, 0);
         flash.layer.show();
         Some(flash)
     }
 
     /// Draw this frame. False once it has faded out.
-    fn step(&self, now: Instant) -> bool {
+    fn step(&mut self, now: Instant) -> bool {
         let ms = now.duration_since(self.started).as_secs_f32() * 1000.0;
-        let opacity = if ms < FLASH_IN_MS {
+        if !self.settled {
+            self.settled = ms >= PRESS_SETTLE_MS;
+            if let Some(frame) = press(self.colour, self.target.w, self.target.h, self.scale, ms.min(PRESS_SETTLE_MS)) {
+                self.layer.repaint(&frame);
+            }
+        }
+        let opacity = if ms < FLASH_IN_MS && !self.animated {
             ms / FLASH_IN_MS
         } else if ms < FLASH_HOLD_MS {
             1.0
@@ -432,7 +448,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
             flying |= agent.step(now);
             fading |= agent.rest(now);
         }
-        flashes.retain(|flash| flash.step(now));
+        flashes.retain_mut(|flash| flash.step(now));
 
         if flying {
             if let Some(last) = last_frame {

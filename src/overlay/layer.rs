@@ -62,6 +62,16 @@ impl Surface {
     }
 }
 
+impl Surface {
+    /// The picture is premultiplied RGBA and the window wants premultiplied BGRA.
+    fn paint(&self, picture: &Pixmap) {
+        let target = unsafe { std::slice::from_raw_parts_mut(self.bits, (self.w * self.h * 4) as usize) };
+        for (to, from) in target.as_chunks_mut::<4>().0.iter_mut().zip(picture.data().as_chunks::<4>().0) {
+            *to = [from[2], from[1], from[0], from[3]];
+        }
+    }
+}
+
 impl Drop for Surface {
     fn drop(&mut self) {
         unsafe {
@@ -107,11 +117,7 @@ impl Layer {
         register();
         let (w, h) = (picture.width() as i32, picture.height() as i32);
         let surface = Surface::new(w, h);
-        // The picture is premultiplied RGBA and the window wants premultiplied BGRA.
-        let target = unsafe { std::slice::from_raw_parts_mut(surface.bits, (w * h * 4) as usize) };
-        for (to, from) in target.as_chunks_mut::<4>().0.iter_mut().zip(picture.data().as_chunks::<4>().0) {
-            *to = [from[2], from[1], from[0], from[3]];
-        }
+        surface.paint(picture);
         let hwnd = unsafe {
             CreateWindowExW(
                 WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
@@ -129,6 +135,11 @@ impl Layer {
             )
         };
         Layer { hwnd, surface }
+    }
+
+    /// Swap in a new picture of the same size, for an animation drawn frame by frame.
+    pub fn repaint(&self, picture: &Pixmap) {
+        self.surface.paint(picture);
     }
 
     /// Put the window at `x,y` at this opacity. Cheap enough to call every frame.
