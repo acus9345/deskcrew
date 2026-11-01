@@ -39,6 +39,7 @@ const REST_AFTER: Duration = Duration::from_secs(6);
 const REST_FADE_MS: f32 = 160.0;
 const ARRIVE_FROM: f32 = 90.0;
 const APPEAR_MS: f32 = 140.0;
+const LABEL_PIXELS: f32 = 12.5;
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -167,7 +168,7 @@ struct Agent {
 impl Agent {
     fn new(name: &str, to: Point, taken: &[Rgb], scale: f32) -> Option<Agent> {
         let colour = motion::colour_for(name, taken);
-        let label = text_mask(name, (14.0 * scale) as i32);
+        let label = text_mask(name, (LABEL_PIXELS * scale) as i32);
         let (picture, x, y) = cursor(colour, &label, scale)?;
         Some(Agent {
             name: name.to_string(),

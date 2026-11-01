@@ -3,19 +3,19 @@ use crate::motion::Rgb;
 use tiny_skia::{Color, FillRule, LineJoin, Paint, Path, PathBuilder, Pixmap, Stroke, Transform};
 
 /// The arrow's corners and how much each is rounded, in pixels on a 100% screen. The tip is at 0,0.
-const ARROW: [(f32, f32); 4] = [(0.0, 0.0), (41.0, 24.0), (20.0, 28.5), (6.5, 46.0)];
-const ARROW_ROUNDING: [f32; 4] = [4.5, 4.5, 3.0, 4.5];
+const ARROW: [(f32, f32); 4] = [(0.0, 0.0), (31.0, 18.0), (15.0, 21.5), (5.0, 34.5)];
+const ARROW_ROUNDING: [f32; 4] = [3.5, 3.5, 2.3, 3.5];
 /// Where the rounded tip really ends up, which is where a press lands.
-const TIP: (f32, f32) = (1.7, 1.5);
-const ARROW_RIM: f32 = 1.7;
-const LABEL_AT: (f32, f32) = (25.0, 38.0);
-const LABEL_PAD: f32 = 12.0;
-const LABEL_HEIGHT_EXTRA: f32 = 9.0;
+const TIP: (f32, f32) = (1.3, 1.2);
+const ARROW_RIM: f32 = 2.6;
+const LABEL_AT: (f32, f32) = (20.0, 30.0);
+const LABEL_PAD: f32 = 10.0;
+const LABEL_HEIGHT_EXTRA: f32 = 8.0;
 const LABEL_EDGE_ALPHA: f32 = 0.16;
 const SHADOW_ROOM: f32 = 12.0;
-const SHADOW_DROP: f32 = 2.5;
+const SHADOW_DROP: f32 = 3.0;
 const SHADOW_BLUR: f32 = 3.0;
-const SHADOW_OPACITY: f32 = 0.34;
+const SHADOW_OPACITY: f32 = 0.55;
 const OUTLINE_FILL: f32 = 0.18;
 const OUTLINE_LINE: f32 = 2.0;
 const OUTLINE_ALPHA: f32 = 0.92;
@@ -195,10 +195,10 @@ mod tests {
         let label = Mask { w: 30, h: 16, alpha: vec![255; 480] };
         let (canvas, x, y) = cursor((255, 165, 31), &label, 1.0).unwrap();
         assert_eq!((x, y), (13, 13));
-        assert_eq!(pixel(&canvas, 26, 30), (255, 165, 31, 255));
+        assert_eq!(pixel(&canvas, 20, 24), (255, 165, 31, 255));
         let rim = (0..canvas.width()).map(|x| pixel(&canvas, x, 27)).find(|(_, _, _, a)| *a > 200);
         assert!(rim.is_some_and(|(r, _, _, _)| r < 90), "rim {rim:?}");
-        let (_, _, _, shadow) = pixel(&canvas, 60, 78);
+        let (_, _, _, shadow) = pixel(&canvas, 50, 68);
         assert!(shadow > 5 && shadow < 120, "shadow {shadow}");
     }
 
@@ -214,7 +214,7 @@ mod tests {
         sheet.fill_path(&dark.finish().unwrap(), &paint((30, 30, 34), 1.0), FillRule::Winding, Transform::identity(), None);
         let spots = [("Claude Code", (255, 165, 31), 40, 30), ("Cursor", (240, 48, 110), 250, 30), ("fx", (21, 101, 240), 40, 170), ("Claude Code", (255, 165, 31), 520, 30), ("Cursor", (240, 48, 110), 730, 30), ("fx", (21, 101, 240), 520, 170)];
         for (name, colour, x, y) in spots {
-            let (picture, _, _) = cursor(colour, &crate::overlay::label_for_test(name, 21), 1.5).unwrap();
+            let (picture, _, _) = cursor(colour, &crate::overlay::label_for_test(name, 18), 1.5).unwrap();
             sheet.draw_pixmap(x, y, picture.as_ref(), &Default::default(), Transform::identity(), None);
         }
         for (x, colour) in [(250, (240, 48, 110)), (730, (255, 165, 31))] {

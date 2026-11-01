@@ -1,0 +1,9 @@
+{
+  "name": "deskcrew",
+  "version": "0.1.0",
+  "description": "Every coding agent gets its own cursor on your Windows desktop, for very few tokens.",
+  "author": { "name": "acus9345" },
+  "repository": "https://github.com/acus9345/deskcrew",
+  "license": "MIT",
+  "skills": "./skills/"
+}
