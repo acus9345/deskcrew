@@ -1,8 +1,10 @@
 # deskcrew
 
 **Windows only for now.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
+<img width="1163" height="719" alt="image" src="https://github.com/user-attachments/assets/2cad4d13-546e-41d4-84b9-0406ff783b78" />
 
-Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.
+
+Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.*even when ur doing something in fullscreen*the agents can still work and do things
 
 **[Watch the 11-second demo](demo/deskcrew-demo.mp4):** three agents draw in Photon Studio, use Calculator and type a note at the same time. Calculator's title and mode label were overlaid in English in the video.
 
