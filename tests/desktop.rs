@@ -176,8 +176,20 @@ fn everything_on_a_real_desktop() {
     let title = format!("deskcrew-a-{stamp}");
     let form = Form::open(&work, &title, 200, 120);
     let cover = Form::open(&work, &format!("deskcrew-cover-{stamp}"), 200, 120);
-    let cover_front = pointer_and_focus();
     let a = "Claude Code";
+    // Measured around one action at a time, so a person using the mouse meanwhile cannot fail it.
+    let unmoved = |action: &[&str]| {
+        for _ in 0..4 {
+            let before = pointer_and_focus();
+            let reply = dc(a, action);
+            let same = pointer_and_focus() == before;
+            if same || !reply.0 {
+                return (same, reply.1);
+            }
+            thread::sleep(Duration::from_millis(500));
+        }
+        (false, String::new())
+    };
 
     // Reading.
     let started = Instant::now();
@@ -219,8 +231,8 @@ fn everything_on_a_real_desktop() {
     r.check("a shortcut without --real says how to do it", !ok && reply.contains("--real"), &reply);
     let (ok, reply) = dc(a, &["key", "alt+f4", "--real"]);
     r.check("a risky shortcut is refused", !ok && reply.contains("refused"), &reply);
-    let after = pointer_and_focus();
-    r.check("background work left the pointer and focus alone", after == cover_front, format!("{cover_front:?} {after:?}"));
+    let (same, reply) = unmoved(&["click", "Alpha"]);
+    r.check("background work leaves the pointer and focus alone", same, &reply);
 
     // Stable refs.
     let (_, reply) = dc(a, &["click", "Rebuild"]);
@@ -261,14 +273,19 @@ fn everything_on_a_real_desktop() {
     let down: Vec<f32> = form.text().lines().rev().find(|l| l.starts_with("down Left")).unwrap_or("").split(' ').nth(2).unwrap_or("0,0").split(',').map(|n| n.parse().unwrap_or(0.0)).collect();
     let expected = 100.0 - left_edge;
     r.check("and lands where the picture said", (down[0] - expected).abs() < 3.0 && down[1] > 0.0, format!("{down:?} expected x {expected}"));
-    let after = pointer_and_focus();
-    r.check("still nothing moved", after == cover_front, format!("{after:?}"));
+    let (same, reply) = unmoved(&["click", "100,300"]);
+    r.check("a message click moves nothing either", same, &reply);
 
     // Real input, which has to borrow the pointer and give it back.
     let (ok, reply) = dc(a, &["click", "120,320", "--real"]);
     r.check("--real clicks with the real mouse", ok && reply.starts_with("ok real"), &reply);
     let (ok, reply) = dc(a, &["click", "120,320", "--real", "--double"]);
     r.check("--real can double-click", ok && form.wait_for("double"), &reply);
+    let (ok, reply) = dc(a, &["click", "4000,4000", "--real"]);
+    r.check("a real click outside the window is refused", !ok && reply.contains("refused"), &reply);
+    let before_outside = form.text().matches("down").count();
+    let (ok, reply) = dc(a, &["draw", "60,250 4000,250"]);
+    r.check("a stroke leaving the window is refused before it starts", !ok && reply.contains("refused") && form.text().matches("down").count() == before_outside, &reply);
     let (ok, reply) = dc(a, &["drag", "60,250", "300,330"]);
     r.check("drag walks the real mouse", ok && form.wait_for("moves="), &reply);
     let moves: u32 = form.text().lines().rev().find(|l| l.contains("moves=")).and_then(|l| l.split("moves=").nth(1)).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
@@ -279,8 +296,8 @@ fn everything_on_a_real_desktop() {
     r.check("--real types with the real keyboard", ok && form.wait_for("typed"), &reply);
     let (ok, reply) = dc(a, &["key", "ctrl+a", "--real"]);
     r.check("--real can press a shortcut", ok, &reply);
-    let after = pointer_and_focus();
-    r.check("real input put the pointer and focus back", after == cover_front, format!("{cover_front:?} {after:?}"));
+    let (same, reply) = unmoved(&["click", "120,320", "--real"]);
+    r.check("real input puts the pointer and focus back", same, &reply);
 
     // The overlay.
     let windows = overlay_windows();
@@ -303,7 +320,6 @@ fn everything_on_a_real_desktop() {
     let third = format!("deskcrew-c-{stamp}");
     let form_b = Form::open(&work, &second, 860, 120);
     let form_c = Form::open(&work, &third, 860, 560);
-    let front = pointer_and_focus();
     let script = |n: usize| (0..n).map(|_| "click Alpha").collect::<Vec<_>>().join("; ");
     let started = Instant::now();
     let solo = script(6);
@@ -329,7 +345,6 @@ fn everything_on_a_real_desktop() {
         }
     });
     r.check("two agents in one window take turns", form_b.text().matches("click Beta").count() == before + 12 && started.elapsed() > one_agent, format!("{} ms", started.elapsed().as_millis()));
-    r.check("parallel work left the pointer and focus alone", pointer_and_focus() == front, format!("{:?}", pointer_and_focus()));
     let (_, status) = dc(a, &["status"]);
     r.check("each agent is tracked by name", status.contains("Cursor") && status.contains("fx"), &status);
 

@@ -51,6 +51,11 @@ pub fn skipped(kind: i32) -> bool {
     matches!(kind, 50014 | 50022 | 50027 | 50037 | 50038)
 }
 
+/// The buttons every window has. Store apps list them outside any title bar.
+pub fn is_window_chrome(automation_id: &str) -> bool {
+    matches!(automation_id, "Minimize" | "Maximize" | "Restore" | "Close" | "TitleBar" | "SystemMenuBar" | "SystemMenuBarItem" | "view_0" | "view_1")
+}
+
 /// Rows read as one line: their plain text joins the row instead of adding lines.
 pub fn is_row(kind: i32) -> bool {
     matches!(kind, 50007 | 50024 | 50029)

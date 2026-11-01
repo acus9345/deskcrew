@@ -69,6 +69,11 @@ fn start(app: &str, args: &str) -> Result<(), String> {
     if is_path {
         return shell_open(app, args);
     }
+    // Store apps run through their alias: a direct start misses the libraries they ship with.
+    let alias = std::env::var_os("LOCALAPPDATA").map(|root| std::path::Path::new(&root).join("Microsoft\\WindowsApps").join(format!("{lower}.exe")));
+    if let Some(alias) = alias.filter(|path| path.exists()) {
+        return shell_open(&alias.to_string_lossy(), args);
+    }
     let apps = start_menu();
     if let Some((_, id)) = apps.iter().find(|(name, _)| name.to_lowercase() == lower) {
         return shell_open("explorer.exe", &format!(r"shell:AppsFolder\{id}"));

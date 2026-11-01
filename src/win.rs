@@ -20,10 +20,10 @@ use windows_sys::{
         UI::WindowsAndMessaging::{
             BringWindowToTop, ChildWindowFromPointEx, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, EnumChildWindows,
             EnumWindows, GUITHREADINFO, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
-            GW_OWNER, GetDlgCtrlID, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+            GA_ROOT, GW_OWNER, GetAncestor, GetDlgCtrlID, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic,
             IsWindow, IsWindowVisible, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
-            ShowWindow, SwitchToThisWindow, WS_EX_TOOLWINDOW,
+            ShowWindow, SwitchToThisWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
         },
     },
     core::BOOL,
@@ -151,6 +151,14 @@ pub fn list() -> Vec<Win> {
 /// Every visible window of these processes, popups included.
 pub fn of_processes(pids: &[u32]) -> Vec<Hwnd> {
     top_level().into_iter().filter(|&hwnd| shown(hwnd) && pids.contains(&pid(hwnd)) && class(hwnd) != "deskcrew").collect()
+}
+
+/// True if a real click at this point would reach one of these windows and nothing else.
+pub fn owns_point(family: &[Hwnd], x: i32, y: i32) -> bool {
+    unsafe {
+        let hit = WindowFromPoint(POINT { x, y });
+        !hit.is_null() && family.contains(&(GetAncestor(hit, GA_ROOT) as Hwnd))
+    }
 }
 
 /// A popup, menu or dialog of this window rather than an unrelated window of the same app.
@@ -293,13 +301,17 @@ pub struct FocusGuard {
 
 impl FocusGuard {
     pub fn take() -> FocusGuard {
-        FocusGuard { front: foreground() }
+        // A Store app reports its inner window, which cannot be brought forward on its own.
+        let front = foreground();
+        let outer = unsafe { GetAncestor(raw(front), GA_ROOT) } as Hwnd;
+        FocusGuard { front: if outer != 0 { outer } else { front } }
     }
 
     /// True if focus had to be taken back. A switch to any other app was the person's, so it stays.
     pub fn restore(&self, target_pids: &[u32]) -> bool {
         let now = foreground();
-        if now == self.front || now == 0 || self.front == 0 || !exists(self.front) {
+        let outer = unsafe { GetAncestor(raw(now), GA_ROOT) } as Hwnd;
+        if now == self.front || outer == self.front || now == 0 || self.front == 0 || !exists(self.front) {
             return false;
         }
         if !target_pids.contains(&pid(now)) && !target_pids.contains(&content_pid(now)) {

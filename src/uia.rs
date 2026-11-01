@@ -244,6 +244,10 @@ unsafe fn walk(
             } else {
                 // WinForms hands out window handles as ids, which mean nothing and change every run.
                 let automation_id = Some(text(el.CachedAutomationId())).filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default();
+                if lines::is_window_chrome(&automation_id) {
+                    walk_children(el, parent, row, all, nodes, hidden, depth);
+                    return;
+                }
                 let mut states = Vec::new();
                 if !flag(el.CachedIsEnabled()) {
                     states.push("disabled");

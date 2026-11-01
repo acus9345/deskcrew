@@ -437,9 +437,16 @@ impl Service {
         Ok((node, rect))
     }
 
-    fn with_real<T>(&self, tracked: &Tracked, view: &View, work: impl FnOnce() -> T) -> Result<T, String> {
+    /// Take the real mouse and keyboard. Every point has to land on this window: a real press
+    /// anywhere else would hit whatever the person has open there.
+    fn with_real<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], work: impl FnOnce() -> T) -> Result<T, String> {
         let _turn = self.real_input.lock().unwrap();
         let _borrowed = real::borrow(tracked.hwnd, &view.pids)?;
+        let mut family = view.surfaces.clone();
+        family.push(tracked.hwnd);
+        if let Some((x, y)) = points.iter().find(|(x, y)| !win::owns_point(&family, *x, *y)) {
+            return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
+        }
         Ok(work())
     }
 
@@ -457,7 +464,7 @@ impl Service {
             }
         };
         if flags.real {
-            self.with_real(tracked, view, || real::click(x, y, flags.right, flags.double))?;
+            self.with_real(tracked, view, &[(x, y)], || real::click(x, y, flags.right, flags.double))?;
             return Ok("real".into());
         }
         if let Some(node) = &node {
@@ -486,7 +493,7 @@ impl Service {
         if flags.real {
             let (x, y) = act::centre(rect);
             let all = real::chord("ctrl+a")?;
-            self.with_real(tracked, view, || {
+            self.with_real(tracked, view, &[(x, y)], || {
                 real::click(x, y, false, false);
                 real::press_chord(&all);
                 real::type_text(value);
@@ -512,7 +519,8 @@ impl Service {
             hwnd = act::native_window(&node, tracked.hwnd);
         }
         if flags.real {
-            self.with_real(tracked, view, || {
+            let points: Vec<(i32, i32)> = place.into_iter().collect();
+            self.with_real(tracked, view, &points, || {
                 if let Some((x, y)) = place {
                     real::click(x, y, false, false);
                 }
@@ -533,7 +541,7 @@ impl Service {
         }
         let chord = real::chord(spec)?;
         if flags.real {
-            self.with_real(tracked, view, || real::press_chord(&chord))?;
+            self.with_real(tracked, view, &[], || real::press_chord(&chord))?;
             return Ok("real".into());
         }
         act::post_key(tracked.hwnd, &chord, spec)
@@ -564,7 +572,7 @@ impl Service {
         let (x, y) = act::centre(rect);
         let notches = if down { -times } else { times };
         if flags.real {
-            self.with_real(tracked, view, || real::wheel(x, y, notches))?;
+            self.with_real(tracked, view, &[(x, y)], || real::wheel(x, y, notches))?;
             return Ok("real".into());
         }
         if node.can.scroll {
@@ -584,7 +592,8 @@ impl Service {
     }
 
     fn walk(&self, who: &str, tracked: &Tracked, view: &View, strokes: Vec<Vec<(f32, f32)>>) -> Reply {
-        let finished = self.with_real(tracked, view, || {
+        let points: Vec<(i32, i32)> = strokes.iter().flatten().map(|p| (p.0.round() as i32, p.1.round() as i32)).collect();
+        let finished = self.with_real(tracked, view, &points, || {
             strokes.iter().all(|path| real::stroke(path, &self.stop, |x, y| self.overlay.jump(who, x, y)))
         })?;
         if finished { Ok("real".into()) } else { Err(STOPPED.into()) }
@@ -744,7 +753,7 @@ impl Service {
             Err(error) => out.push(error),
         }
         if focus_back {
-            out.push("the app took focus; it was given back".into());
+            out.push("focus returned".into());
         }
         match failure {
             Some(error) if routes.is_empty() => Err(error),
