@@ -748,6 +748,8 @@ impl Service {
                 }
                 if nothing && routes.iter().any(|r| r == "message") {
                     out.push("nothing changed: try --real if it should have".into());
+                } else if nothing && routes.iter().any(|r| r == "real") {
+                    out.push("nothing changed: check with shot".into());
                 }
             }
             Err(error) => out.push(error),

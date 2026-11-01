@@ -140,9 +140,11 @@ pub fn native_window(node: &Node, root: Hwnd) -> Option<Hwnd> {
     (!win::draws_itself(hwnd) && !win::draws_itself(root)).then_some(hwnd)
 }
 
+/// A plain text box. Rich text boxes are left out: replacing their text this way leaves the app
+/// unaware of the edit, so it would not offer to save it.
 fn is_classic_text(node: &Node, root: Hwnd) -> bool {
     let class = win::class(node.native).to_uppercase();
-    node.native != 0 && !win::draws_itself(root) && (class.contains("EDIT") || class.contains("RICH"))
+    node.native != 0 && !win::draws_itself(root) && class.contains("EDIT") && !class.contains("RICH")
 }
 
 pub fn set(node: &Node, root: Hwnd, value: &str) -> Result<String, String> {
@@ -157,10 +159,7 @@ pub fn set(node: &Node, root: Hwnd, value: &str) -> Result<String, String> {
     if node.can.value && !node.element.value_read_only() {
         return node.element.set_value(value).map(|_| "value".into());
     }
-    match native_window(node, root) {
-        Some(hwnd) if node.native != 0 => set_window_text(hwnd, value).map(|_| "message".into()),
-        _ => Err(NEEDS_REAL.into()),
-    }
+    Err(NEEDS_REAL.into())
 }
 
 /// Characters as window messages, where the app's own text handling picks them up.

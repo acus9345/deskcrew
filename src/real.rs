@@ -27,6 +27,8 @@ use windows_sys::Win32::{
 const ARRIVE: Duration = Duration::from_millis(25);
 const PRESS: Duration = Duration::from_millis(40);
 const KEY_GAP: Duration = Duration::from_millis(6);
+/// A window just brought forward drops the first press if it comes too soon.
+const FOCUS_SETTLE: Duration = Duration::from_millis(350);
 /// Input already sent still has to reach the app before focus can move away from it.
 const DRAIN: Duration = Duration::from_millis(120);
 const QUIET_FOR: Duration = Duration::from_millis(350);
@@ -269,8 +271,12 @@ pub fn borrow(root: Hwnd, pids: &[u32]) -> Result<Borrowed, String> {
     let mut pointer = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pointer) };
     let guard = win::FocusGuard::take();
+    let already_front = win::foreground() == root;
     if !win::bring_forward(root) {
         return Err("Windows would not bring that window forward".into());
+    }
+    if !already_front {
+        thread::sleep(FOCUS_SETTLE);
     }
     Ok(Borrowed { pointer, guard, root_pids: pids.to_vec() })
 }
