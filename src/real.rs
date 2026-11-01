@@ -342,8 +342,8 @@ pub fn is_risky(spec: &str) -> bool {
 }
 
 /// Real keys go to whatever has focus, so they are only sent while the target still has it.
-pub fn check_front(root: Hwnd, pids: &[u32]) -> Result<(), String> {
-    if win::front_is(root, pids) { Ok(()) } else { Err(FOCUS_MOVED.into()) }
+pub fn check_front(root: Hwnd, surfaces: &[Hwnd]) -> Result<(), String> {
+    if win::front_is(root, surfaces) { Ok(()) } else { Err(FOCUS_MOVED.into()) }
 }
 
 pub fn press_chord(chord: &Chord) {
@@ -371,12 +371,12 @@ pub fn hold_chord(chord: &Chord, hold: Duration) {
 }
 
 /// False if stopped on the way. Fails, having sent what it reports, if focus moves away.
-pub fn type_text(text: &str, root: Hwnd, pids: &[u32], stop: &AtomicBool) -> Result<bool, String> {
+pub fn type_text(text: &str, root: Hwnd, surfaces: &[Hwnd], stop: &AtomicBool) -> Result<bool, String> {
     for (sent, unit) in text.encode_utf16().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return Ok(false);
         }
-        if !win::front_is(root, pids) {
+        if !win::front_is(root, surfaces) {
             return Err(format!("{FOCUS_MOVED}: {sent} characters had been typed"));
         }
         if unit == 10 {

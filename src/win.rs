@@ -305,10 +305,21 @@ pub fn identity(hwnd: Hwnd) -> (u32, u64) {
     }
 }
 
-/// Whether the window in front is this one, or another of its app's, such as its own dialog.
-pub fn front_is(root: Hwnd, pids: &[u32]) -> bool {
+/// Whether the window in front is this one or a dialog or popup of its own. Being the same process
+/// is not enough: two windows of one app share a process, and keys must not reach the other one.
+pub fn front_is(root: Hwnd, surfaces: &[Hwnd]) -> bool {
     let front = foreground();
-    front == root || pids.contains(&pid(front)) || pids.contains(&content_pid(front))
+    if front == root || surfaces.contains(&front) {
+        return true;
+    }
+    let mut owner = front;
+    while owner != 0 {
+        owner = unsafe { GetWindow(raw(owner), GW_OWNER) } as Hwnd;
+        if owner == root {
+            return true;
+        }
+    }
+    false
 }
 
 /// Every monitor as x, y, width, height, and whether it is the primary one.

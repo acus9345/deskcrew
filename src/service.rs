@@ -788,7 +788,7 @@ impl Service {
             }
             let chord = real::chord("ctrl+v")?;
             self.with_front(tracked, view, &[], || {
-                real::check_front(tracked.hwnd, &view.pids)?;
+                real::check_front(tracked.hwnd, &view.surfaces)?;
                 real::press_chord(&chord);
                 thread::sleep(PASTE_SETTLE);
                 Ok::<(), String>(())
@@ -908,9 +908,9 @@ impl Service {
             let all = real::chord("ctrl+a")?;
             return self.with_front(tracked, view, &[(x, y)], || {
                 press_at(tracked.hwnd, x, y, flags)?;
-                real::check_front(tracked.hwnd, &view.pids)?;
+                real::check_front(tracked.hwnd, &view.surfaces)?;
                 real::press_chord(&all);
-                if !real::type_text(value, tracked.hwnd, &view.pids, &self.stop)? {
+                if !real::type_text(value, tracked.hwnd, &view.surfaces, &self.stop)? {
                     return Err(STOPPED.to_string());
                 }
                 Ok("keyboard".to_string())
@@ -942,7 +942,7 @@ impl Service {
                 if let Some((x, y)) = place {
                     press_at(tracked.hwnd, x, y, flags)?;
                 }
-                if !real::type_text(text, tracked.hwnd, &view.pids, &self.stop)? {
+                if !real::type_text(text, tracked.hwnd, &view.surfaces, &self.stop)? {
                     return Err(STOPPED.to_string());
                 }
                 Ok("keyboard".to_string())
@@ -996,7 +996,7 @@ impl Service {
             return Ok("keyboard".into());
         }
         if flags.real {
-            self.with_front(tracked, view, &[], || real::check_front(tracked.hwnd, &view.pids).map(|_| real::press_chord(&chord)))??;
+            self.with_front(tracked, view, &[], || real::check_front(tracked.hwnd, &view.surfaces).map(|_| real::press_chord(&chord)))??;
             return Ok("keyboard".into());
         }
         act::post_key(tracked.hwnd, &chord, spec)
