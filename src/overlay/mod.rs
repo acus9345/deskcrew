@@ -38,6 +38,7 @@ const FLASH_OUT_MS: f32 = 220.0;
 const REST_AFTER: Duration = Duration::from_secs(6);
 const REST_FADE_MS: f32 = 160.0;
 const ARRIVE_FROM: f32 = 90.0;
+const APPEAR_MS: f32 = 140.0;
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -63,6 +64,11 @@ pub fn screen_size() -> (i32, i32) {
 /// Work in real screen pixels, so accessibility bounds and the overlay agree.
 pub fn make_aware() {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+#[cfg(test)]
+pub fn label_for_test(text: &str, px: i32) -> draw::Mask {
+    text_mask(text, px)
 }
 
 pub struct Overlay {
@@ -155,6 +161,7 @@ struct Agent {
     alpha: u8,
     visible: bool,
     aside: bool,
+    appeared: Instant,
 }
 
 impl Agent {
@@ -174,11 +181,13 @@ impl Agent {
             alpha: 255,
             visible: false,
             aside: false,
+            appeared: Instant::now(),
         })
     }
 
     fn draw(&self) {
-        let alpha = if self.aside { 0 } else { self.alpha };
+        let arriving = (self.appeared.elapsed().as_secs_f32() * 1000.0 / APPEAR_MS).min(1.0);
+        let alpha = if self.aside { 0 } else { (self.alpha as f32 * arriving) as u8 };
         self.layer.present(self.at.0.round() as i32 - self.tip.0, self.at.1.round() as i32 - self.tip.1, alpha);
     }
 
@@ -196,8 +205,9 @@ impl Agent {
     fn fly(&mut self, to: Point, arrived: Sender<()>) {
         self.last_active = Instant::now();
         self.alpha = 255;
-        self.draw();
         if !self.visible {
+            self.appeared = Instant::now();
+            self.draw();
             self.layer.show();
             self.visible = true;
         }
