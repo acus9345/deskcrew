@@ -9,7 +9,11 @@ use layer::{Layer, text_mask};
 use std::{
     mem::zeroed,
     ptr::null_mut,
-    sync::mpsc::{self, Receiver, Sender},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
@@ -18,9 +22,10 @@ use windows_sys::Win32::{
     System::Threading::{GetCurrentThreadId, INFINITE},
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext},
+        Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, VK_ESCAPE},
         WindowsAndMessaging::{
             DispatchMessageW, GetSystemMetrics, MSG, MsgWaitForMultipleObjects, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
-            PostThreadMessageW, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, WM_APP,
+            PostThreadMessageW, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, WM_APP, WM_HOTKEY,
         },
     },
 };
@@ -44,16 +49,19 @@ pub struct Rect {
 
 enum Command {
     Move { agent: String, to: Point, arrived: Sender<()> },
+    Jump { agent: String, to: Point },
     Press { agent: String, target: Rect },
+    Aside { on: bool, cleared: Sender<()> },
     Quit,
 }
 
 pub fn screen_size() -> (i32, i32) {
-    unsafe { aware() };
+    make_aware();
     unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
 }
 
-unsafe fn aware() {
+/// Work in real screen pixels, so accessibility bounds and the overlay agree.
+pub fn make_aware() {
     unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
 }
 
@@ -64,10 +72,11 @@ pub struct Overlay {
 }
 
 impl Overlay {
-    pub fn start() -> Overlay {
+    /// `stop` goes up when the person presses Ctrl+Alt+Esc.
+    pub fn start(stop: Arc<AtomicBool>) -> Overlay {
         let (commands, inbox) = mpsc::channel();
         let (ready, thread) = mpsc::channel();
-        let worker = thread::spawn(move || run(inbox, ready));
+        let worker = thread::spawn(move || run(inbox, ready, stop));
         Overlay { commands, thread: thread.recv().unwrap_or(0), worker }
     }
 
@@ -80,6 +89,18 @@ impl Overlay {
     pub fn move_to(&self, agent: &str, x: i32, y: i32) {
         let (arrived, wait) = mpsc::channel();
         self.send(Command::Move { agent: agent.to_string(), to: (x as f32, y as f32), arrived });
+        let _ = wait.recv_timeout(ARRIVAL_TIMEOUT);
+    }
+
+    /// Follow a path the real pointer is walking, with no glide of its own.
+    pub fn jump(&self, agent: &str, x: i32, y: i32) {
+        self.send(Command::Jump { agent: agent.to_string(), to: (x as f32, y as f32) });
+    }
+
+    /// Clear every cursor off the screen for a screen copy, or bring them back.
+    pub fn aside(&self, on: bool) {
+        let (cleared, wait) = mpsc::channel();
+        self.send(Command::Aside { on, cleared });
         let _ = wait.recv_timeout(ARRIVAL_TIMEOUT);
     }
 
@@ -133,6 +154,7 @@ struct Agent {
     last_active: Instant,
     alpha: u8,
     visible: bool,
+    aside: bool,
 }
 
 impl Agent {
@@ -151,11 +173,24 @@ impl Agent {
             last_active: Instant::now(),
             alpha: 255,
             visible: false,
+            aside: false,
         })
     }
 
     fn draw(&self) {
-        self.layer.present(self.at.0.round() as i32 - self.tip.0, self.at.1.round() as i32 - self.tip.1, self.alpha);
+        let alpha = if self.aside { 0 } else { self.alpha };
+        self.layer.present(self.at.0.round() as i32 - self.tip.0, self.at.1.round() as i32 - self.tip.1, alpha);
+    }
+
+    fn jump(&mut self, to: Point) {
+        self.last_active = Instant::now();
+        self.alpha = 255;
+        self.at = to;
+        self.draw();
+        if !self.visible {
+            self.layer.show();
+            self.visible = true;
+        }
     }
 
     fn fly(&mut self, to: Point, arrived: Sender<()>) {
@@ -213,13 +248,14 @@ struct Flash {
     x: i32,
     y: i32,
     started: Instant,
+    aside: bool,
 }
 
 impl Flash {
     fn new(colour: Rgb, target: Rect, scale: f32) -> Option<Flash> {
         let margin = outline_margin(scale);
         let layer = Layer::new(&outline(colour, target.w, target.h, scale)?);
-        let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now() };
+        let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now(), aside: false };
         flash.layer.present(flash.x, flash.y, 0);
         flash.layer.show();
         Some(flash)
@@ -235,22 +271,25 @@ impl Flash {
         } else {
             1.0 - (ms - FLASH_HOLD_MS) / FLASH_OUT_MS
         };
-        self.layer.present(self.x, self.y, (opacity.clamp(0.0, 1.0) * 255.0) as u8);
+        let alpha = if self.aside { 0.0 } else { opacity.clamp(0.0, 1.0) * 255.0 };
+        self.layer.present(self.x, self.y, alpha as u8);
         opacity > 0.0
     }
 }
 
-fn run(inbox: Receiver<Command>, ready: Sender<u32>) -> Stats {
+fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> Stats {
     let mut stats = Stats::default();
     let mut agents: Vec<Agent> = Vec::new();
     let mut flashes: Vec<Flash> = Vec::new();
     let mut last_frame: Option<Instant> = None;
+    let mut aside = false;
     unsafe {
-        aware();
+        make_aware();
         // Windows only gives a thread a message queue once it asks for a message.
         let mut message: MSG = zeroed();
         PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
         let _ = ready.send(GetCurrentThreadId());
+        RegisterHotKey(null_mut(), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_ESCAPE as u32);
     }
     let scale = (unsafe { GetDpiForSystem() } as f32 / 96.0).max(1.0);
 
@@ -258,6 +297,9 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>) -> Stats {
         unsafe {
             let mut message: MSG = zeroed();
             while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if message.message == WM_HOTKEY {
+                    stop.store(true, Ordering::Relaxed);
+                }
                 DispatchMessageW(&message);
             }
         }
@@ -270,8 +312,18 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>) -> Stats {
                         agents.extend(Agent::new(&agent, to, &taken, scale));
                     }
                     if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        found.aside = aside;
                         found.fly(to, arrived);
                         stats.flights += 1;
+                    }
+                }
+                Command::Jump { agent, to } => {
+                    if !agents.iter().any(|a| a.name == agent) {
+                        let taken: Vec<Rgb> = agents.iter().map(|a| a.colour).collect();
+                        agents.extend(Agent::new(&agent, to, &taken, scale));
+                    }
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        found.jump(to);
                     }
                 }
                 Command::Press { agent, target } => {
@@ -280,6 +332,27 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>) -> Stats {
                         flashes.extend(Flash::new(found.colour, target, scale));
                         found.layer.raise();
                     }
+                }
+                Command::Aside { on, cleared } => {
+                    aside = on;
+                    for agent in &mut agents {
+                        agent.aside = on;
+                        if agent.visible {
+                            agent.draw();
+                        }
+                    }
+                    for flash in &mut flashes {
+                        flash.aside = on;
+                        flash.step(Instant::now());
+                    }
+                    if on {
+                        // The second flush covers a composition already under way at the first.
+                        unsafe {
+                            DwmFlush();
+                            DwmFlush();
+                        }
+                    }
+                    let _ = cleared.send(());
                 }
             }
         }

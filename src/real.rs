@@ -1,0 +1,319 @@
+// The real mouse and keyboard, for what accessibility cannot reach. One agent at a time, it waits
+// for a pause in the person's own typing, and it puts the pointer and focus back afterwards.
+use crate::win::{self, Hwnd};
+use std::{
+    mem::zeroed,
+    sync::atomic::{AtomicBool, Ordering},
+    thread,
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::POINT,
+    System::SystemInformation::GetTickCount,
+    UI::{
+        Input::KeyboardAndMouse::{
+            GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LASTINPUTINFO, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+            MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+            VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
+            VK_TAB, VK_UP, VkKeyScanW,
+        },
+        WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN},
+    },
+};
+
+/// Canvases sample the pointer on their own clock, so a press has to last and arrive after the move.
+const ARRIVE: Duration = Duration::from_millis(25);
+const PRESS: Duration = Duration::from_millis(40);
+const KEY_GAP: Duration = Duration::from_millis(6);
+/// Input already sent still has to reach the app before focus can move away from it.
+const DRAIN: Duration = Duration::from_millis(120);
+const QUIET_FOR: Duration = Duration::from_millis(350);
+const QUIET_TIMEOUT: Duration = Duration::from_secs(3);
+const STEP_PIXELS: f32 = 6.0;
+const PIXELS_PER_SECOND: f32 = 1000.0;
+
+/// Shortcuts that end a session or reach the shell: refused unless asked for with --force.
+const RISKY: [&str; 8] = ["alt+f4", "win+l", "win+r", "win+d", "win+x", "alt+tab", "ctrl+shift+esc", "win+e"];
+
+fn send(inputs: &[INPUT]) {
+    unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
+}
+
+fn mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    }
+}
+
+fn key(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
+    INPUT {
+        r#type: INPUT_KEYBOARD,
+        Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    }
+}
+
+/// A real pointer move, which XAML and raw-input apps see and SetCursorPos does not reach.
+pub fn move_to(x: i32, y: i32) {
+    unsafe {
+        let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as i64;
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as i64;
+        let dx = ((x - left) as i64 * 65536 + width - 1) / width;
+        let dy = ((y - top) as i64 * 65536 + height - 1) / height;
+        send(&[mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_ABSOLUTE, dx as i32, dy as i32, 0)]);
+    }
+}
+
+fn press(right: bool, down: bool) {
+    let flags = match (right, down) {
+        (false, true) => MOUSEEVENTF_LEFTDOWN,
+        (false, false) => MOUSEEVENTF_LEFTUP,
+        (true, true) => MOUSEEVENTF_RIGHTDOWN,
+        (true, false) => MOUSEEVENTF_RIGHTUP,
+    };
+    send(&[mouse(flags, 0, 0, 0)]);
+}
+
+pub fn click(x: i32, y: i32, right: bool, double: bool) {
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    for _ in 0..if double { 2 } else { 1 } {
+        press(right, true);
+        thread::sleep(PRESS);
+        press(right, false);
+        thread::sleep(PRESS);
+    }
+}
+
+pub fn wheel(x: i32, y: i32, notches: i32) {
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    send(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, (notches * 120) as u32)]);
+}
+
+/// Points every few pixels along a stroke, through a smooth curve if asked for.
+pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
+    let at = |i: isize| {
+        let p = points[i.clamp(0, points.len() as isize - 1) as usize];
+        (p.0 as f32, p.1 as f32)
+    };
+    let mut out = vec![at(0)];
+    for i in 0..points.len().saturating_sub(1) as isize {
+        let (a, b, c, d) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let steps = (((c.0 - b.0).hypot(c.1 - b.1) / STEP_PIXELS).ceil() as usize).max(1);
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            out.push(if smooth {
+                let curve = |p0: f32, p1: f32, p2: f32, p3: f32| {
+                    0.5 * (2.0 * p1
+                        + (p2 - p0) * t
+                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t
+                        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t * t)
+                };
+                (curve(a.0, b.0, c.0, d.0), curve(a.1, b.1, c.1, d.1))
+            } else {
+                (b.0 + (c.0 - b.0) * t, b.1 + (c.1 - b.1) * t)
+            });
+        }
+    }
+    out
+}
+
+/// Press, follow the path at a steady speed, and always let go.
+pub fn stroke(path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> bool {
+    let Some(first) = path.first() else { return true };
+    move_to(first.0 as i32, first.1 as i32);
+    thread::sleep(ARRIVE);
+    press(false, true);
+    thread::sleep(PRESS);
+    let started = Instant::now();
+    let mut finished = true;
+    for (at, point) in path.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            finished = false;
+            break;
+        }
+        let due = Duration::from_secs_f32(at as f32 * STEP_PIXELS / PIXELS_PER_SECOND);
+        while let Some(left) = due.checked_sub(started.elapsed()) {
+            if left > Duration::from_millis(2) {
+                thread::sleep(left - Duration::from_millis(2));
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        move_to(point.0.round() as i32, point.1.round() as i32);
+        if at % 3 == 0 {
+            moved(point.0.round() as i32, point.1.round() as i32);
+        }
+    }
+    thread::sleep(PRESS);
+    press(false, false);
+    finished
+}
+
+fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
+    let lower = name.to_lowercase();
+    let found = match lower.as_str() {
+        "enter" | "return" => (VK_RETURN, false),
+        "tab" => (VK_TAB, false),
+        "esc" | "escape" => (VK_ESCAPE, false),
+        "space" => (VK_SPACE, false),
+        "backspace" => (VK_BACK, false),
+        "delete" | "del" => (VK_DELETE, true),
+        "insert" => (VK_INSERT, true),
+        "home" => (VK_HOME, true),
+        "end" => (VK_END, true),
+        "pageup" => (VK_PRIOR, true),
+        "pagedown" => (VK_NEXT, true),
+        "left" => (VK_LEFT, true),
+        "right" => (VK_RIGHT, true),
+        "up" => (VK_UP, true),
+        "down" => (VK_DOWN, true),
+        "ctrl" | "control" => (VK_CONTROL, false),
+        "shift" => (VK_SHIFT, false),
+        "alt" => (VK_MENU, false),
+        "win" | "meta" | "cmd" => (VK_LWIN, true),
+        _ => {
+            if let Some(number) = lower.strip_prefix('f').and_then(|n| n.parse::<u16>().ok())
+                && (1..=24).contains(&number) {
+                    return Some((VK_F1 + number - 1, false));
+                }
+            let mut chars = lower.chars();
+            let (c, None) = (chars.next()?, chars.next()) else { return None };
+            let scan = unsafe { VkKeyScanW(c as u16) };
+            if scan == -1 {
+                return None;
+            }
+            ((scan as u16) & 0xFF, false)
+        }
+    };
+    Some(found)
+}
+
+#[derive(Debug)]
+pub struct Chord {
+    pub keys: Vec<(VIRTUAL_KEY, bool)>,
+    pub modified: bool,
+}
+
+pub fn chord(spec: &str) -> Result<Chord, String> {
+    let mut keys = Vec::new();
+    for part in spec.split('+').filter(|p| !p.is_empty()) {
+        keys.push(named_key(part).ok_or_else(|| format!("unknown key '{part}'"))?);
+    }
+    if keys.is_empty() {
+        return Err("no key given".into());
+    }
+    Ok(Chord { modified: keys.len() > 1, keys })
+}
+
+pub fn is_risky(spec: &str) -> bool {
+    let wanted = spec.to_lowercase().replace("escape", "esc").replace("control", "ctrl");
+    RISKY.contains(&wanted.as_str())
+}
+
+pub fn press_chord(chord: &Chord) {
+    let extended = |e: bool| if e { KEYEVENTF_EXTENDEDKEY } else { 0 };
+    for (vk, e) in &chord.keys {
+        send(&[key(*vk, 0, extended(*e))]);
+    }
+    thread::sleep(PRESS);
+    for (vk, e) in chord.keys.iter().rev() {
+        send(&[key(*vk, 0, extended(*e) | KEYEVENTF_KEYUP)]);
+    }
+}
+
+pub fn type_text(text: &str) {
+    for unit in text.encode_utf16() {
+        if unit == 10 {
+            send(&[key(VK_RETURN, 0, 0)]);
+            send(&[key(VK_RETURN, 0, KEYEVENTF_KEYUP)]);
+        } else {
+            send(&[key(0, unit, KEYEVENTF_UNICODE)]);
+            send(&[key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]);
+        }
+        thread::sleep(KEY_GAP);
+    }
+}
+
+fn idle_for() -> Duration {
+    unsafe {
+        let mut info: LASTINPUTINFO = zeroed();
+        info.cbSize = size_of::<LASTINPUTINFO>() as u32;
+        GetLastInputInfo(&mut info);
+        Duration::from_millis(GetTickCount().wrapping_sub(info.dwTime) as u64)
+    }
+}
+
+/// Wait for a gap in the person's own input, so their click cannot land in the middle of ours.
+pub fn wait_for_quiet() {
+    let started = Instant::now();
+    while idle_for() < QUIET_FOR && started.elapsed() < QUIET_TIMEOUT {
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Everything a real action borrows, handed back when it ends.
+pub struct Borrowed {
+    pointer: POINT,
+    guard: win::FocusGuard,
+    root_pids: Vec<u32>,
+}
+
+pub fn borrow(root: Hwnd, pids: &[u32]) -> Result<Borrowed, String> {
+    wait_for_quiet();
+    let mut pointer = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pointer) };
+    let guard = win::FocusGuard::take();
+    if !win::bring_forward(root) {
+        return Err("Windows would not bring that window forward".into());
+    }
+    Ok(Borrowed { pointer, guard, root_pids: pids.to_vec() })
+}
+
+impl Drop for Borrowed {
+    fn drop(&mut self) {
+        thread::sleep(DRAIN);
+        move_to(self.pointer.x, self.pointer.y);
+        self.guard.restore(&self.root_pids);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn key_names_parse_and_unknown_ones_are_named() {
+        assert!(!chord("enter").unwrap().modified);
+        assert!(chord("ctrl+shift+s").unwrap().modified);
+        assert_eq!(chord("f5").unwrap().keys[0].0, VK_F1 + 4);
+        assert!(chord("nonsense").unwrap_err().contains("nonsense"));
+    }
+
+    #[test]
+    fn dangerous_shortcuts_are_recognised() {
+        assert!(is_risky("Alt+F4"));
+        assert!(is_risky("ctrl+shift+escape"));
+        assert!(!is_risky("ctrl+s"));
+    }
+
+    #[test]
+    fn a_stroke_is_walked_in_small_steps_and_ends_on_its_last_point() {
+        let path = trace(&[(0, 0), (60, 0)], false);
+        assert_eq!(path.len(), 11);
+        assert_eq!(path[1], (6.0, 0.0));
+        assert_eq!(*path.last().unwrap(), (60.0, 0.0));
+    }
+
+    #[test]
+    fn a_smooth_stroke_still_passes_through_its_points() {
+        let path = trace(&[(0, 0), (60, 60), (120, 0)], true);
+        assert!(path.iter().any(|p| (p.0 - 60.0).abs() < 0.01 && (p.1 - 60.0).abs() < 0.01));
+        assert_eq!(*path.last().unwrap(), (120.0, 0.0));
+    }
+}

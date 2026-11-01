@@ -1,5 +1,6 @@
 // Three pretend agents, each working one column of the screen. Nothing underneath is touched.
 use crate::overlay::{Overlay, Rect, screen_size};
+use std::sync::{Arc, atomic::AtomicBool};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -18,7 +19,7 @@ impl Dice {
 }
 
 pub fn run(seconds: u64, linger: u64) {
-    let overlay = Overlay::start();
+    let overlay = Overlay::start(Arc::new(AtomicBool::new(false)));
     let (width, height) = screen_size();
     let (cell_w, cell_h) = (width / 3, height / 4);
     let (button_w, button_h) = (width / 10, height / 14);
