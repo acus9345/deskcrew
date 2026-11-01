@@ -54,9 +54,9 @@ Each reply names the route it took.
 
 | Route | Used for | Your cursor | Your focus |
 | --- | --- | --- | --- |
-| `invoke`, `toggle`, `select`, `expand`, `value`, `range`, `scroll` | the app's own accessibility actions | untouched | some apps take it for a moment: it is given back and the reply says `focus returned` |
-| `command`, `message` | classic Windows controls and menus, by window message | untouched | untouched |
-| `pen` | `drag`, `draw` and `--real` in apps that draw themselves, such as Paint and browsers | untouched | borrowed for the action |
+| `invoke`, `toggle`, `select`, `expand`, `value`, `range`, `scroll` | the app's own accessibility actions | untouched | some apps take it for a moment, and it is handed straight back |
+| `command`, `message` | classic Windows controls and menus, plus clicks, typing, `drag` and `draw` in browsers and Electron apps, by window message | untouched | untouched in classic apps, and a Chromium window can take it for a moment |
+| `pen` | `drag`, `draw` and `--real` in apps that draw themselves and ignore messages, such as Paint | untouched | borrowed for the action |
 | `keyboard` | `key`, `type` and `set` with `--real` | untouched | borrowed for the action |
 | `mouse` | only with `--mouse`, when nothing else works | moved, then put back | borrowed for the action |
 
@@ -64,7 +64,9 @@ Each reply names the route it took.
 
 Anything that borrows focus waits for a pause in your own typing, is one agent at a time, and gives focus back afterwards. It is refused if a point is not on the target window, so it cannot land on something else you have open.
 
-Agents in different windows run at the same time. Agents in one window take turns.
+Agents in different windows click, type and draw at the same time. In a test on 2026-11-01, three agents each typed in two fields, pressed a button and drew in their own visible Edge window, all at once, using separate browser profiles. Over three rounds that took 3.5 to 3.9 s against about 3 s for one agent alone. Everything landed in the right window, there were no synthetic mouse events, and focus left the person's window for about 100 ms in total each round. `type` reads a field back and sets it directly if Chromium dropped the characters.
+
+Agents in one window take turns, because an app has one mouse state and one text cursor. The pen and `--real` also take turns across all windows, because they need the window in front.
 
 **Ctrl+Alt+Esc** stops every agent. Reading still works, and work resumes with `deskcrew resume`. Shortcuts such as Alt+F4 and Win+R are refused without `--force`.
 
@@ -84,12 +86,14 @@ The second one drives throwaway windows it opens itself, including a real mouse 
 
 - Windows only. macOS and Linux are not written, and could not be tested on the machine this was built on.
 - Keyboard shortcuts need `--real`, because they have to go to the window in front. While a `--real` action runs, anything you type goes to that window.
-- Text boxes drawn by XAML or Chromium take `set`, but `type` needs `--real`.
+- Text boxes drawn by XAML take `set`, but `type` needs `--real`.
+- Browser and Electron windows need to be showing for the parallel route. A covered one drops window messages, so clicks and `type` fall back to accessibility, which can take focus for a moment, and `draw` is refused without `--real`. A covered browser also stops repainting, so `shot` can show an old picture of it.
+- Windows of the same browser share one process, and activate each other when worked at the same time, which loses input. Parallel agents need separate apps or separate browser profiles.
 - Rich text boxes, such as Notepad's, need `--real`.
 - The pen needs the window in front, so a `draw` borrows your focus for as long as it runs.
 - WinForms and some other classic apps ignore posted mouse clicks while another window covers them, and WinForms canvases do not see a posted drag as a drag. Use `--real` for the first and `--mouse` for the second.
 - Classic popup menus, and some other classic controls, are refused without `--mouse`.
-- Checkboxes in WinForms, modern menus and Edge take focus for a moment before it is given back. A modern menu left open across commands closes when focus returns, so open it and pick from it in one command.
+- Checkboxes in WinForms, modern menus and `set` in Chromium take focus for a moment before it is given back. A modern menu left open across commands closes when focus returns, so open it and pick from it in one command.
 - Right click by pen has only been tried through its code path, not confirmed in an app.
 - A drawn cursor floats above whatever covers its target window.
 - `launch` can reopen an app's saved session, so a new window is not always empty.

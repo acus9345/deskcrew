@@ -213,11 +213,22 @@ pub fn find_menu(menu: isize, wanted: &str) -> Option<MenuEntry> {
     entries.into_iter().find(|e| e.label.to_lowercase() == wanted).or_else(|| submenus.into_iter().find_map(|s| find_menu(s, &wanted)))
 }
 
-/// True if a real click at this point would reach one of these windows and nothing else.
+/// True if a real click at this point would reach one of these windows, or a popup one of them
+/// owns, and nothing else.
 pub fn owns_point(family: &[Hwnd], x: i32, y: i32) -> bool {
     unsafe {
         let hit = WindowFromPoint(POINT { x, y });
-        !hit.is_null() && family.contains(&(GetAncestor(hit, GA_ROOT) as Hwnd))
+        if hit.is_null() {
+            return false;
+        }
+        let mut at = GetAncestor(hit, GA_ROOT);
+        while !at.is_null() {
+            if family.contains(&(at as Hwnd)) {
+                return true;
+            }
+            at = GetWindow(at, GW_OWNER);
+        }
+        false
     }
 }
 
@@ -304,10 +315,16 @@ pub fn child_at(root: Hwnd, x: i32, y: i32) -> (Hwnd, i32, i32) {
     }
 }
 
+/// Browsers and Electron apps. They draw themselves, but they do read posted mouse and character
+/// messages, even while covered, so several can be worked at once.
+pub fn is_chromium(hwnd: Hwnd) -> bool {
+    class(hwnd).starts_with("Chrome_")
+}
+
 /// Windows drawn by their own engine: posted messages never reach their controls.
 pub fn draws_itself(hwnd: Hwnd) -> bool {
     let name = class(hwnd);
-    ["Xaml", "CoreWindow", "DesktopChildSiteBridge", "InputSite", "ApplicationFrame", "Chrome_", "Mozilla", "HwndWrapper", "Qt"]
+    ["Xaml", "CoreWindow", "DesktopChildSiteBridge", "InputSite", "ApplicationFrame", "Mozilla", "HwndWrapper", "Qt"]
         .iter()
         .any(|part| name.contains(part))
 }
@@ -355,6 +372,7 @@ pub fn bring_forward(hwnd: Hwnd) -> bool {
 }
 
 /// Remembers the person's window, and takes focus back if the app under control grabbed it.
+#[derive(Clone)]
 pub struct FocusGuard {
     front: Hwnd,
 }

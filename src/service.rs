@@ -15,7 +15,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
@@ -30,6 +30,10 @@ const SETTLE_LEAST: Duration = Duration::from_millis(150);
 const SETTLE_MOST: Duration = Duration::from_millis(800);
 const BETWEEN_STEPS: Duration = Duration::from_millis(40);
 const NAME_WAIT: Duration = Duration::from_millis(600);
+const FIELD_SETTLE: Duration = Duration::from_millis(60);
+const TYPE_CHECK: Duration = Duration::from_millis(350);
+const FOCUS_WATCH: Duration = Duration::from_millis(10);
+const FOCUS_LINGER: Duration = Duration::from_millis(500);
 /// Chromium fills in its page some time after the first request, in bursts.
 const CHROMIUM_STEP: Duration = Duration::from_millis(250);
 const CHROMIUM_READS: usize = 16;
@@ -250,9 +254,19 @@ pub struct Service {
     windows: Mutex<(u32, HashMap<Hwnd, Arc<Tracked>>)>,
     agents: Mutex<HashMap<String, AgentState>>,
     real_input: Mutex<()>,
+    home: Mutex<Home>,
+    keeper: OnceLock<thread::Thread>,
     stop: Arc<AtomicBool>,
     last_request: Mutex<Instant>,
     active: AtomicUsize,
+}
+
+#[derive(Default)]
+struct Home {
+    agents: usize,
+    guard: Option<FocusGuard>,
+    pids: Vec<u32>,
+    leaving: Option<Instant>,
 }
 
 impl Service {
@@ -393,6 +407,54 @@ impl Service {
         Ok(notes)
     }
 
+    /// Remember the person's window once, however many agents are working. An agent arriving
+    /// while another app has just grabbed focus must not mistake that app for the person's.
+    fn focus_in(&self, pids: &[u32]) {
+        let mut home = self.home.lock().unwrap();
+        if home.guard.is_none() {
+            home.guard = Some(FocusGuard::take());
+            if let Some(keeper) = self.keeper.get() {
+                keeper.unpark();
+            }
+        }
+        home.agents += 1;
+        home.leaving = None;
+        home.pids.extend_from_slice(pids);
+    }
+
+    /// Done with this action. The keeper hands focus back, so no agent queues behind a restore.
+    fn focus_out(&self) {
+        let mut home = self.home.lock().unwrap();
+        home.agents -= 1;
+        if home.agents == 0 {
+            home.leaving = Some(Instant::now());
+        }
+    }
+
+    /// Watch for apps taking focus while agents work, and hand it straight back. It sleeps
+    /// through idle time and is woken when an agent starts.
+    fn keep_focus(&self) {
+        loop {
+            let held = {
+                let mut home = self.home.lock().unwrap();
+                let held = home.guard.clone().map(|guard| (guard, home.pids.clone()));
+                if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
+                    home.guard = None;
+                    home.pids.clear();
+                    home.leaving = None;
+                }
+                held
+            };
+            match held {
+                Some((guard, pids)) => {
+                    guard.restore(&pids);
+                    thread::sleep(FOCUS_WATCH);
+                }
+                None => thread::park(),
+            }
+        }
+    }
+
     fn seen(&self, who: &str, hwnd: Hwnd) -> Option<Seen> {
         self.agents.lock().unwrap().get(who).and_then(|a| a.seen.get(&hwnd).cloned())
     }
@@ -485,6 +547,13 @@ impl Service {
     /// Bring the window forward for work that needs it, and give focus back after. Every point has
     /// to land on this window: a press anywhere else would hit whatever the person has open there.
     /// The person's cursor is only borrowed for --mouse.
+    /// True if something else is on top of this point of the window.
+    fn covered(&self, tracked: &Tracked, view: &View, x: i32, y: i32) -> bool {
+        let mut family = view.surfaces.clone();
+        family.push(tracked.hwnd);
+        !win::owns_point(&family, x, y)
+    }
+
     fn with_front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], mouse: bool, work: impl FnOnce() -> T) -> Result<T, String> {
         let _turn = self.real_input.lock().unwrap();
         let _borrowed = real::borrow(tracked.hwnd, &view.pids, mouse)?;
@@ -524,7 +593,10 @@ impl Service {
                 return run_menu_entry(tracked.hwnd, &entry);
             }
         }
-        let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd));
+        // A browser's accessibility click pulls its window forward, so a message is better while
+        // the window shows. A covered browser drops messages, so that is when accessibility is needed.
+        let chromium_shows = win::is_chromium(tracked.hwnd) && !self.covered(tracked, view, x, y);
+        let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !chromium_shows);
         if let (Some(node), true) = (&node, plain) {
             let classic = !act::draws_at(tracked.hwnd, x, y);
             let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press(node), false) };
@@ -565,12 +637,14 @@ impl Service {
         };
         let mut place = None;
         let mut hwnd = None;
+        let mut field = None;
         if let Some(word) = target {
             let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("type needs a control".into()) };
             let (node, rect) = self.locate(id, tracked, view)?;
             self.cursor_on(who, flags, rect);
             place = Some(act::centre(rect));
             hwnd = act::native_window(&node, tracked.hwnd);
+            field = Some(node);
         }
         if flags.real || flags.mouse {
             let points: Vec<(i32, i32)> = place.into_iter().collect();
@@ -582,10 +656,38 @@ impl Service {
                 Ok("keyboard".to_string())
             })?;
         }
+        if let (Some(_), Some(node)) = (place.filter(|(x, y)| win::is_chromium(tracked.hwnd) && self.covered(tracked, view, *x, *y)), &field) {
+            let mut value = node.element.value_text();
+            value.push_str(text);
+            return act::set(node, tracked.hwnd, &value);
+        }
+        if let (Some((x, y)), true) = (place, win::is_chromium(tracked.hwnd)) {
+            // The page has to know which field has focus, and a click inside it says so.
+            act::post_click(tracked.hwnd, x, y, false, false)?;
+            thread::sleep(FIELD_SETTLE);
+            // Every window of a browser shares a thread, so "the focused window" could be another
+            // agent's. This field's own window keeps the text here.
+            let before = field.as_ref().filter(|node| node.can.value).map(|node| node.element.value_text());
+            let route = act::post_text(win::child_at(tracked.hwnd, x, y).0, text, &self.stop)?;
+            // Chromium can drop characters while its window is not active, and says nothing. A
+            // field that can be read is read back, and set directly if the text did not land.
+            if let (Some(before), Some(node)) = (before, &field) {
+                let wanted = format!("{before}{text}");
+                let until = Instant::now() + TYPE_CHECK;
+                while node.element.value_text() != wanted && Instant::now() < until {
+                    thread::sleep(SETTLE_STEP);
+                }
+                if node.element.value_text() != wanted {
+                    return act::set(node, tracked.hwnd, &wanted);
+                }
+            }
+            return Ok(route);
+        }
         match (target, hwnd) {
             (Some(_), None) => Err(NEEDS_REAL.into()),
-            (Some(_), Some(hwnd)) => act::post_text(hwnd, text),
-            (None, _) => act::post_text(win::keyboard_target(tracked.hwnd), text),
+            (Some(_), Some(hwnd)) => act::post_text(hwnd, text, &self.stop),
+            (None, _) if win::is_chromium(tracked.hwnd) => act::post_text(tracked.hwnd, text, &self.stop),
+            (None, _) => act::post_text(win::keyboard_target(tracked.hwnd), text, &self.stop),
         }
     }
 
@@ -674,6 +776,9 @@ impl Service {
         } else {
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::inside(tracked.hwnd, *x, *y)) {
                 return Err(format!("refused: {x},{y} on screen is not on this window"));
+            }
+            if !flags.real && win::is_chromium(tracked.hwnd) && points.iter().any(|(x, y)| self.covered(tracked, view, *x, *y)) {
+                return Err("this browser window is covered and would drop the strokes: uncover it or add --real".into());
             }
             let send = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, &self.stop, jump)?));
             let done = if flags.real { self.with_front(tracked, view, &points, false, send)?? } else { send()? };
@@ -797,10 +902,9 @@ impl Service {
             self.first_read(&tracked, view, false)?;
         }
         let before = self.seen(who, tracked.hwnd).unwrap_or_else(|| view.lines.clone());
-        let focus = FocusGuard::take();
+        self.focus_in(&view.pids);
         let mut routes = Vec::new();
         let mut failure = None;
-        let mut focus_back = false;
         for step in steps {
             if self.stop.load(Ordering::Relaxed) {
                 failure = Some(STOPPED.to_string());
@@ -817,7 +921,7 @@ impl Service {
         }
         let waited_only = routes.iter().all(|r| r == "found" || r == "waited") && !routes.is_empty();
         let settled = if waited_only { Ok(Vec::new()) } else { self.settle(&tracked, view) };
-        focus_back |= focus.restore(&view.pids);
+        self.focus_out();
 
         let mut out = Vec::new();
         out.push(if routes.len() > 1 { format!("ok {} steps", routes.len()) } else { format!("ok {}", routes.first().map_or("", String::as_str)) });
@@ -837,9 +941,6 @@ impl Service {
                 }
             }
             Err(error) => out.push(error),
-        }
-        if focus_back {
-            out.push("focus returned".into());
         }
         match failure {
             Some(error) if routes.is_empty() => Err(error),
@@ -1112,10 +1213,15 @@ pub fn run() {
         windows: Mutex::new((0, HashMap::new())),
         agents: Mutex::new(HashMap::new()),
         real_input: Mutex::new(()),
+        home: Mutex::new(Home::default()),
+        keeper: OnceLock::new(),
         stop,
         last_request: Mutex::new(Instant::now()),
         active: AtomicUsize::new(0),
     });
+
+    let keeper = service.clone();
+    let _ = service.keeper.set(thread::spawn(move || keeper.keep_focus()).thread().clone());
 
     let watcher = service.clone();
     thread::spawn(move || {

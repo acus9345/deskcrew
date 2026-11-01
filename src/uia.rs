@@ -417,6 +417,11 @@ impl Element {
         unsafe { self.0.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(UIA_ScrollItemPatternId).and_then(|p| p.ScrollIntoView()).map_err(say) }
     }
 
+    /// What is in a field right now, and nothing else: an empty field gives an empty string.
+    pub fn value_text(&self) -> String {
+        unsafe { self.0.GetCurrentPropertyValue(UIA_ValueValuePropertyId) }.ok().and_then(|v| BSTR::try_from(&v).ok()).map(|s| s.to_string()).unwrap_or_default()
+    }
+
     /// All of a control's text: its document, then its value, then its name.
     pub fn full_text(&self) -> String {
         unsafe {

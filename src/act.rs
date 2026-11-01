@@ -3,7 +3,8 @@
 use crate::real::{self, Chord};
 use crate::uia::{Done, Element, Node, Uia};
 use crate::win::{self, Hwnd};
-use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND},
     UI::{
@@ -20,6 +21,7 @@ pub const NEEDS_REAL: &str = "no background way to do this here: add --real";
 pub const NEEDS_MOUSE: &str = "this control only answers the real mouse: add --mouse, which moves the person's cursor";
 pub const NO_PEN: &str = "Windows would not take pen input here: add --mouse, which moves the person's cursor";
 const WHEEL_DELTA: i32 = 120;
+const TYPE_GAP: Duration = Duration::from_millis(12);
 const ACCESS_DENIED: u32 = 5;
 const MK_LBUTTON: usize = 1;
 const MK_RBUTTON: usize = 2;
@@ -192,13 +194,17 @@ pub fn set(node: &Node, root: Hwnd, value: &str) -> Result<String, String> {
     Err(NEEDS_REAL.into())
 }
 
-/// Characters as window messages, where the app's own text handling picks them up.
-pub fn post_text(hwnd: Hwnd, text: &str) -> Result<String, String> {
+/// Characters as window messages, one at a time, where the app's own text handling picks them up.
+pub fn post_text(hwnd: Hwnd, text: &str, stop: &AtomicBool) -> Result<String, String> {
     if win::draws_itself(hwnd) {
         return Err(NEEDS_REAL.into());
     }
     for unit in text.encode_utf16() {
+        if stop.load(Ordering::Relaxed) {
+            return Err("stopped by the person with Ctrl+Alt+Esc".into());
+        }
         post(hwnd, WM_CHAR, if unit == 10 { 13 } else { unit as usize }, 1)?;
+        std::thread::sleep(TYPE_GAP);
     }
     Ok("message".into())
 }

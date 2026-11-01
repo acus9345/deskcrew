@@ -14,7 +14,9 @@ Run `deskcrew help` once for the commands. Windows only.
 - Pictures only when text is not enough: `deskcrew shot` prints a PNG path to open. `unchanged` means you already have it. `click x,y` uses pixels in the last shot.
 - Name yourself once per session, so parallel agents get separate cursors: `--agent name` or `DESKCREW_AGENT`.
 
-Background first. A failure saying `add --real` means the action needs the window in front: `--real` borrows the person's focus briefly, and uses the keyboard or a pen, so their cursor stays put. `drag` and `draw` pick the quietest way themselves. Agents take turns on this, and it is refused if a point is not on the target window.
+Background first. A failure saying `add --real` means the action needs the window in front: `--real` borrows the person's focus briefly, and uses the keyboard or a pen, so their cursor stays put. `drag` and `draw` pick the quietest way themselves. Agents take turns on `--real`, and it is refused if a point is not on the target window.
+
+Work in your own window: agents in different apps run at the same time, and agents sharing a window take turns. In browsers and Electron apps, `type e3 "text"`, `click` and `draw` run in the background while the window is showing.
 
 `--mouse` is the last resort: it moves the person's cursor. Use it only when a reply asks for it.
 
