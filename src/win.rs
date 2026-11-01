@@ -240,6 +240,51 @@ pub fn belongs(hwnd: Hwnd, family: &[Hwnd]) -> bool {
     family.contains(&owner) || name == "#32768" || name == "#32770" || name.contains("Popup") || name.contains("DropDown")
 }
 
+/// Put an overlay window directly above this window, or above the highest of its menus and popups,
+/// and under whatever else covers them. Only overlay windows may sit in between.
+pub fn stack_above(layer: Hwnd, root: Hwnd, force: bool) {
+    use windows_sys::Win32::{
+        System::Threading::GetCurrentProcessId,
+        UI::WindowsAndMessaging::{HWND_NOTOPMOST, HWND_TOPMOST, IsWindow, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, WS_EX_TOOLWINDOW, WS_EX_TOPMOST},
+    };
+    unsafe {
+        let (layer, root) = (raw(layer), raw(root));
+        if IsWindow(root) == 0 {
+            return;
+        }
+        let process = |window: HWND| {
+            let mut id = 0;
+            GetWindowThreadProcessId(window, &mut id);
+            id
+        };
+        let topmost = |window: HWND| GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
+        let (me, theirs) = (GetCurrentProcessId(), process(root));
+        let mut top = root;
+        let mut at = GetWindow(root, GW_HWNDPREV);
+        while !at.is_null() {
+            let popup = GetWindow(at, GW_OWNER) == root || (process(at) == theirs && GetWindowLongPtrW(at, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0);
+            if popup && IsWindowVisible(at) != 0 {
+                top = at;
+            }
+            at = GetWindow(at, GW_HWNDPREV);
+        }
+        let mut above = GetWindow(top, GW_HWNDPREV);
+        while !above.is_null() && process(above) == me {
+            if above == layer && !force {
+                return;
+            }
+            above = GetWindow(above, GW_HWNDPREV);
+        }
+        let after = match (topmost(top), above.is_null()) {
+            (true, true) => HWND_TOPMOST,
+            (false, true) => HWND_NOTOPMOST,
+            (false, false) if topmost(above) => HWND_NOTOPMOST,
+            _ => above,
+        };
+        SetWindowPos(layer, after, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
 /// Every monitor as x, y, width, height, and whether it is the primary one.
 pub fn screens() -> Vec<(i32, i32, i32, i32, bool)> {
     unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> i32 {

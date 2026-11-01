@@ -1,5 +1,6 @@
 // A click-through window drawn from a picture. It never takes focus and is never hidden from
 // capture: a window excluded from capture makes NVIDIA's recorder stop, so this one stays in.
+use crate::win::{self, Hwnd};
 use super::draw::Mask;
 use std::{mem::zeroed, ptr::null_mut, sync::Once};
 use tiny_skia::Pixmap;
@@ -13,7 +14,7 @@ use windows_sys::Win32::{
     UI::WindowsAndMessaging::{
         CreateWindowExW, DefWindowProcW, DestroyWindow, HWND_TOPMOST, RegisterClassW, SW_HIDE, SW_SHOWNOACTIVATE,
         SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SetWindowPos, ShowWindow, ULW_ALPHA, UpdateLayeredWindow, WNDCLASSW,
-        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TOPMOST, WS_EX_TRANSPARENT, WS_POPUP,
+        WS_EX_LAYERED, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW, WS_EX_TRANSPARENT, WS_POPUP,
     },
 };
 
@@ -120,7 +121,7 @@ impl Layer {
         surface.paint(picture);
         let hwnd = unsafe {
             CreateWindowExW(
-                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW | WS_EX_TOPMOST,
+                WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_NOACTIVATE | WS_EX_TOOLWINDOW,
                 CLASS.as_ptr(),
                 CLASS.as_ptr(),
                 WS_POPUP,
@@ -162,6 +163,10 @@ impl Layer {
     }
 
     /// Back above everything, so cursors stay over the outlines they leave.
+    pub fn above(&self, window: Hwnd, force: bool) {
+        win::stack_above(self.hwnd as Hwnd, window, force);
+    }
+
     pub fn raise(&self) {
         unsafe { SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
     }

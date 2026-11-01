@@ -6,6 +6,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Remove `--mouse` and every real-mouse route, so nothing moves the person's cursor.
+- Keep cursors and press effects just above their window, so other windows can cover them.
+- Run `type --paste` in classic text boxes and `click --with` without focus.
+
 ## [0.1.1] - 2026-11-01
 
 - Add hover, triple, middle, back and forward clicks, modifier clicks, and held keys and mouse buttons.

@@ -4,7 +4,7 @@ mod draw;
 mod layer;
 
 use crate::motion::{self, Point, Rgb};
-use crate::real;
+use crate::win::Hwnd;
 use draw::{PRESS_SETTLE_MS, cursor, outline_margin, press};
 use layer::{Layer, text_mask};
 use std::{
@@ -37,6 +37,7 @@ use windows_sys::Win32::{
 /// An action fires this long after asking to move, even if drawing has fallen behind.
 const ARRIVAL_TIMEOUT: Duration = Duration::from_millis(900);
 const FLASH_IN_MS: f32 = 110.0;
+const STACK_EVERY: Duration = Duration::from_millis(50);
 const FLASH_HOLD_MS: f32 = 480.0;
 const FLASH_OUT_MS: f32 = 300.0;
 /// Past this size the glow is too much to redraw every frame, so a big control just fades in.
@@ -58,7 +59,7 @@ unsafe extern "system" fn shield(code: i32, wparam: WPARAM, lparam: LPARAM) -> L
     unsafe {
         if code >= 0 {
             let event = &*(lparam as *const MSLLHOOKSTRUCT);
-            if event.flags & LLMHF_INJECTED != 0 && event.dwExtraInfo != real::OURS {
+            if event.flags & LLMHF_INJECTED != 0 {
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
                 return 1;
             }
@@ -78,6 +79,7 @@ pub struct Rect {
 enum Command {
     Move { agent: String, to: Point, arrived: Sender<()> },
     Jump { agent: String, to: Point },
+    Over { agent: String, window: Hwnd },
     Press { agent: String, target: Rect },
     Aside { on: bool, cleared: Sender<()> },
     Shield { on: bool, ready: Sender<()> },
@@ -129,6 +131,12 @@ impl Overlay {
     /// Follow a path the real pointer is walking, with no glide of its own.
     pub fn jump(&self, agent: &str, x: i32, y: i32) {
         self.send(Command::Jump { agent: agent.to_string(), to: (x as f32, y as f32) });
+    }
+
+    /// Keep this agent's cursor and press effects just above this window, so that whatever covers
+    /// the window covers them too.
+    pub fn over(&self, agent: &str, window: Hwnd) {
+        self.send(Command::Over { agent: agent.to_string(), window });
     }
 
     /// Clear every cursor off the screen for a screen copy, or bring them back.
@@ -208,6 +216,7 @@ struct Agent {
     visible: bool,
     aside: bool,
     appeared: Instant,
+    over: Option<Hwnd>,
 }
 
 impl Agent {
@@ -228,6 +237,7 @@ impl Agent {
             visible: false,
             aside: false,
             appeared: Instant::now(),
+            over: None,
         })
     }
 
@@ -246,8 +256,13 @@ impl Agent {
             self.layer.show();
             self.visible = true;
         }
-        // A window that is itself always on top rises over the cursor when it takes the strokes.
-        self.layer.raise();
+    }
+
+    fn stack(&self, force: bool) {
+        match self.over {
+            Some(window) => self.layer.above(window, force),
+            None => self.layer.raise(),
+        }
     }
 
     fn fly(&mut self, to: Point, arrived: Sender<()>) {
@@ -312,19 +327,28 @@ struct Flash {
     scale: f32,
     animated: bool,
     settled: bool,
+    over: Option<Hwnd>,
 }
 
 impl Flash {
-    fn new(colour: Rgb, target: Rect, scale: f32) -> Option<Flash> {
+    fn new(colour: Rgb, target: Rect, scale: f32, over: Option<Hwnd>) -> Option<Flash> {
         let margin = outline_margin(scale);
         let animated = (target.w as i64) * (target.h as i64) <= FLASH_MOST_PIXELS;
         let first = if animated { 0.0 } else { PRESS_SETTLE_MS };
         let layer = Layer::new(&press(colour, target.w, target.h, scale, first)?);
         let settled = !animated;
-        let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now(), aside: false, colour, target, scale, animated, settled };
+        let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now(), aside: false, colour, target, scale, animated, settled, over };
         flash.layer.present(flash.x, flash.y, 0);
+        flash.stack();
         flash.layer.show();
         Some(flash)
+    }
+
+    fn stack(&self) {
+        match self.over {
+            Some(window) => self.layer.above(window, false),
+            None => self.layer.raise(),
+        }
     }
 
     /// Draw this frame. False once it has faded out.
@@ -357,6 +381,8 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
     let mut aside = false;
     let mut shields = 0;
     let mut hook: HHOOK = null_mut();
+    let mut stacked = Instant::now();
+    let mut waiting: Vec<(String, Hwnd)> = Vec::new();
     unsafe {
         make_aware();
         // Windows only gives a thread a message queue once it asks for a message.
@@ -380,12 +406,28 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
         for command in inbox.try_iter() {
             match command {
                 Command::Quit => return stats,
+                Command::Over { agent, window } => {
+                    match agents.iter_mut().find(|a| a.name == agent) {
+                        Some(found) => {
+                            found.over = Some(window);
+                            found.stack(false);
+                        }
+                        None => {
+                            waiting.retain(|(name, _)| *name != agent);
+                            waiting.push((agent, window));
+                        }
+                    }
+                }
                 Command::Move { agent, to, arrived } => {
                     if !agents.iter().any(|a| a.name == agent) {
                         let taken: Vec<Rgb> = agents.iter().map(|a| a.colour).collect();
                         agents.extend(Agent::new(&agent, to, &taken, scale));
                     }
                     if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        if let Some(at) = waiting.iter().position(|(name, _)| *name == agent) {
+                            found.over = Some(waiting.swap_remove(at).1);
+                        }
+                        found.stack(false);
                         found.aside = aside;
                         found.fly(to, arrived);
                         stats.flights += 1;
@@ -397,14 +439,18 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
                         agents.extend(Agent::new(&agent, to, &taken, scale));
                     }
                     if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        if let Some(at) = waiting.iter().position(|(name, _)| *name == agent) {
+                            found.over = Some(waiting.swap_remove(at).1);
+                        }
                         found.jump(to);
+                        found.stack(false);
                     }
                 }
                 Command::Press { agent, target } => {
                     if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
                         found.last_active = Instant::now();
-                        flashes.extend(Flash::new(found.colour, target, scale));
-                        found.layer.raise();
+                        flashes.extend(Flash::new(found.colour, target, scale, found.over));
+                        found.stack(true);
                     }
                 }
                 Command::Shield { on, ready } => {
@@ -444,6 +490,12 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
         }
 
         let now = Instant::now();
+        // Windows change order on their own, so the stack has to keep following.
+        if now.duration_since(stacked) >= STACK_EVERY {
+            stacked = now;
+            flashes.iter().for_each(Flash::stack);
+            agents.iter().filter(|a| a.visible).for_each(|a| a.stack(false));
+        }
         let mut flying = false;
         let mut fading = false;
         for agent in &mut agents {
@@ -473,6 +525,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
             .filter(|a| a.visible)
             .map(|a| (REST_AFTER.saturating_sub(now.duration_since(a.last_active))).as_millis() as u32 + 1)
             .min()
+            .map(|left| left.min(STACK_EVERY.as_millis() as u32))
             .unwrap_or(INFINITE);
         unsafe { MsgWaitForMultipleObjects(0, std::ptr::null(), 0, wake, QS_ALLINPUT) };
     }

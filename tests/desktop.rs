@@ -328,25 +328,20 @@ fn everything_on_a_real_desktop() {
     let lifted = form.text().matches("up Left").count();
     let (same, reply) = unmoved(&["drag", "60,250", "300,330"]);
     r.check("drag needs no mouse in a classic window", same && reply.starts_with("ok message") && form.text().matches("up Left").count() > lifted, &reply);
-    let (ok, reply) = dc(a, &["drag", "60,250", "300,330", "--mouse"]);
-    r.check("--mouse walks the real mouse", ok && reply.starts_with("ok mouse") && form.wait_for("moves="), &reply);
-    let moves: u32 = form.text().lines().rev().find(|l| l.contains("moves=")).and_then(|l| l.split("moves=").nth(1)).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
-    r.check("through many points, not a jump", moves > 20, format!("{moves} moves"));
     let (ok, reply) = dc(a, &["draw", "60,250 200,300 300,250; 60,330 300,330", "--smooth"]);
     r.check("draw does several strokes", ok && form.text().matches("up Left").count() >= 4, &reply);
     let (ok, reply) = dc(a, &["type", "#Field", "typed", "--real"]);
     r.check("--real types with the real keyboard", ok && form.wait_for("typed"), &reply);
     let (ok, reply) = dc(a, &["key", "ctrl+a", "--real"]);
     r.check("--real can press a shortcut", ok, &reply);
-    let before = pointer_and_focus();
     let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
-    thread::sleep(Duration::from_millis(100));
-    let after = pointer_and_focus();
-    r.check("--mouse puts the pointer and focus back", ok && after == before, format!("{before:?} became {after:?}: {reply}"));
+    r.check("--mouse is gone, so nothing can move the cursor", !ok && reply.contains("gone"), &reply);
 
     // The overlay.
     let windows = overlay_windows();
     r.check("each agent has a drawn cursor", !windows.is_empty(), format!("{} layers", windows.len()));
+    let topmost = windows.iter().filter(|h| unsafe { windows_sys::Win32::UI::WindowsAndMessaging::GetWindowLongPtrW(**h as _, windows_sys::Win32::UI::WindowsAndMessaging::GWL_EXSTYLE) as u32 & windows_sys::Win32::UI::WindowsAndMessaging::WS_EX_TOPMOST != 0 }).count();
+    r.check("cursors are not always on top, so other windows can cover them", topmost == 0, format!("{topmost} on top"));
     let excluded = windows.iter().filter(|h| {
         let mut affinity = 0;
         unsafe { GetWindowDisplayAffinity(**h as HWND, &mut affinity) != 0 && affinity != 0 }
@@ -412,7 +407,7 @@ fn everything_on_a_real_desktop() {
     let synthetic = SYNTHETIC.load(Ordering::SeqCst);
     let (ok, reply) = dc("Cursor", &["click", "Popped"]);
     thread::sleep(Duration::from_millis(100));
-    r.check("the shield refuses a control that would take the mouse", !ok && reply.contains("--mouse"), &reply);
+    r.check("the shield refuses a control that would take the mouse", !ok && reply.contains("real mouse"), &reply);
     r.check("and the cursor was not touched", SYNTHETIC.load(Ordering::SeqCst) == synthetic, format!("{}", SYNTHETIC.load(Ordering::SeqCst) - synthetic));
 
     // Windows closing, and the service.

@@ -18,8 +18,8 @@ use windows_sys::Win32::{
 };
 
 pub const NEEDS_REAL: &str = "no background way to do this here: add --real";
-pub const NEEDS_MOUSE: &str = "this control only answers the real mouse: add --mouse, which moves the person's cursor";
-pub const NO_PEN: &str = "Windows would not take pen input here: add --mouse, which moves the person's cursor";
+pub const NEEDS_MOUSE: &str = "this control only answers the real mouse, which deskcrew never touches: try click x,y on it";
+pub const NO_PEN: &str = "Windows would not take pen input here, and deskcrew never touches the real mouse";
 const WHEEL_DELTA: i32 = 120;
 const TYPE_GAP: Duration = Duration::from_millis(12);
 const ACCESS_DENIED: u32 = 5;
@@ -145,7 +145,7 @@ pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Resu
 }
 
 /// A middle click or a triple click, which have no accessibility equivalent.
-pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32) -> Result<String, String> {
+pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: usize) -> Result<String, String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP};
     const MK_MBUTTON: usize = 0x10;
     const MK_XBUTTON1: usize = 0x20;
@@ -164,8 +164,8 @@ pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32) -> Res
     };
     post(hwnd, WM_MOUSEMOVE, 0, at)?;
     for time in 0..times {
-        post(hwnd, if time == 1 { again } else { down }, held | which, at)?;
-        post(hwnd, up, which, at)?;
+        post(hwnd, if time == 1 { again } else { down }, held | which | keys, at)?;
+        post(hwnd, up, which | keys, at)?;
     }
     Ok("message".into())
 }
@@ -178,6 +178,13 @@ pub fn post_hover(root: Hwnd, x: i32, y: i32) -> Result<String, String> {
     }
     post(hwnd, WM_MOUSEMOVE, 0, win::lparam(cx, cy))?;
     Ok("message".into())
+}
+
+/// Ask a text box to paste, which needs no keyboard and no focus.
+pub fn post_paste(hwnd: Hwnd) -> Result<String, String> {
+    const WM_PASTE: u32 = 0x0302;
+    post(hwnd, WM_PASTE, 0, 0)?;
+    Ok("paste message".into())
 }
 
 pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32) -> Result<String, String> {
