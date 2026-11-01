@@ -13,6 +13,7 @@ mod pen;
 mod pipe;
 mod real;
 mod service;
+mod setup;
 mod shot;
 mod uia;
 mod win;
@@ -21,6 +22,7 @@ fn main() {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     match args.first().map(String::as_str) {
         Some("service") => service::run(),
+        Some("setup") => std::process::exit(setup::run()),
         Some("demo") => {
             let number = |flag: &str, default: u64| {
                 args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(default)

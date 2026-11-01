@@ -4,7 +4,7 @@
 
 Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.
 
-It is a single command, so any agent that can run a shell command can use it. There is no MCP server and no tool schema loaded into every conversation.
+It is a single command, so any agent that can run a shell command on this computer can use it: Claude Code, Cursor, Codex, Gemini CLI, Copilot, Windsurf, OpenCode, Aider and the rest. There is no MCP server and no tool schema loaded into every conversation.
 
 ## Try it
 
@@ -17,6 +17,14 @@ target/release/deskcrew demo --seconds 12
 ```
 
 The demo moves three pretend agents around the screen and clicks nothing.
+
+To make it available to your agents:
+
+```bash
+target/release/deskcrew setup
+```
+
+That puts `deskcrew` on PATH and gives the skill to each agent it finds. For any other agent, add one line to its rules: `To operate Windows apps on this computer, run the deskcrew command. Start with: deskcrew help`. Agents running in the cloud, or in a sandbox without access to your desktop, cannot reach it.
 
 ```text
 $ deskcrew see Calculator

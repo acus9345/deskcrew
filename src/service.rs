@@ -63,7 +63,7 @@ scroll [e3] up|down [n]     show e3     wait "text" [--gone] [--ms N]
 drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
 do "click e1; set e2 hi; key enter"   many steps, one reply
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
-clip     clip set "text"     status     resume     quit
+clip     clip set "text"     status     resume     quit     setup (installs for your coding agents)
 Every action replies with what changed. x,y are pixels in the last shot. Ctrl+Alt+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen; the person's cursor stays put),

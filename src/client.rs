@@ -35,6 +35,10 @@ fn agent(args: &mut Vec<String>) -> String {
         "Cursor".into()
     } else if has("CODEX_HOME") || has("CODEX_SANDBOX") {
         "Codex".into()
+    } else if has("GEMINI_CLI") {
+        "Gemini".into()
+    } else if has("COPILOT_CLI") {
+        "Copilot".into()
     } else {
         "agent".into()
     }
