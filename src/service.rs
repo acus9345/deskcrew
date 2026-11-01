@@ -31,6 +31,9 @@ const SETTLE_MOST: Duration = Duration::from_millis(800);
 const BETWEEN_STEPS: Duration = Duration::from_millis(40);
 const NAME_WAIT: Duration = Duration::from_millis(600);
 const FIELD_SETTLE: Duration = Duration::from_millis(60);
+const SHARED_PIECE: usize = 10;
+const SHARED_OVERLAP: usize = 4;
+const SHARED_GAP: Duration = Duration::from_millis(3);
 const TYPE_CHECK: Duration = Duration::from_millis(350);
 const FOCUS_WATCH: Duration = Duration::from_millis(10);
 const FOCUS_LINGER: Duration = Duration::from_millis(500);
@@ -138,6 +141,7 @@ struct Tracked {
     id: u32,
     hwnd: Hwnd,
     view: Mutex<View>,
+    pointer: Mutex<()>,
 }
 
 struct LastShot {
@@ -277,7 +281,7 @@ impl Service {
             return found.clone();
         }
         windows.0 += 1;
-        let tracked = Arc::new(Tracked { id: windows.0, hwnd, view: Mutex::new(View::default()) });
+        let tracked = Arc::new(Tracked { id: windows.0, hwnd, view: Mutex::new(View::default()), pointer: Mutex::new(()) });
         windows.1.insert(hwnd, tracked.clone());
         tracked
     }
@@ -803,6 +807,70 @@ impl Service {
     }
 
     fn draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+        let strokes = self.plan_draw(who, flags, tracked, view, words)?;
+        let first = strokes[0][0];
+        self.overlay.move_to(who, first.0 as i32, first.1 as i32);
+        self.walk(who, flags, tracked, view, strokes)
+    }
+
+    /// Several agents drawing in one browser or Electron window. An app has one pointer, so strokes
+    /// are cut into pieces short enough that turns between agents look like drawing at once.
+    fn draw_together(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
+        if self.stop.load(Ordering::Relaxed) {
+            return Err(STOPPED.into());
+        }
+        let tracked = self.pick(who, flags.window.as_deref())?;
+        let (strokes, pids) = {
+            let mut guard = tracked.view.lock().unwrap();
+            let view = &mut *guard;
+            if !view.read_once {
+                self.first_read(&tracked, view, false)?;
+            }
+            let strokes = self.plan_draw(who, flags, &tracked, view, words)?;
+            if strokes.iter().flatten().any(|p| !win::inside(tracked.hwnd, p.0 as i32, p.1 as i32)) {
+                return Err("refused: that stroke leaves the window".into());
+            }
+            if strokes.iter().flatten().any(|p| self.covered(&tracked, view, p.0 as i32, p.1 as i32)) {
+                return Err("this browser window is covered and would drop the strokes: uncover it or add --real".into());
+            }
+            (strokes, view.pids.clone())
+        };
+        let first = strokes[0][0];
+        self.overlay.move_to(who, first.0 as i32, first.1 as i32);
+        self.focus_in(&pids);
+        let mut result = Ok(true);
+        'strokes: for stroke in &strokes {
+            let mut start = 0;
+            while start + 1 < stroke.len() {
+                let end = (start + SHARED_PIECE).min(stroke.len() - 1);
+                let done = {
+                    let _turn = tracked.pointer.lock().unwrap();
+                    act::post_stroke(tracked.hwnd, &stroke[start..=end], &self.stop, |x, y| self.overlay.jump(who, x, y))
+                };
+                match done {
+                    Ok(true) => {}
+                    other => {
+                        result = other;
+                        break 'strokes;
+                    }
+                }
+                if end + 1 == stroke.len() {
+                    break;
+                }
+                // Brushes lose the first few pixels of a press, so each piece starts back over the last.
+                start = end - SHARED_OVERLAP;
+                // Leave the pointer free long enough for the next agent to get a turn.
+                thread::sleep(SHARED_GAP);
+            }
+        }
+        self.focus_out();
+        match result? {
+            true => Ok("ok message".into()),
+            false => Err(STOPPED.into()),
+        }
+    }
+
+    fn plan_draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Result<Vec<Vec<(f32, f32)>>, String> {
         let (word, script) = match words {
             [script] => (None, script),
             [word, script] => (Some(word), script),
@@ -835,9 +903,7 @@ impl Service {
         if strokes.iter().map(Vec::len).sum::<usize>() == 0 {
             return Err("nothing to draw".into());
         }
-        let first = strokes[0][0];
-        self.overlay.move_to(who, first.0 as i32, first.1 as i32);
-        self.walk(who, flags, tracked, view, strokes)
+        Ok(strokes)
     }
 
     fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
@@ -1167,6 +1233,7 @@ impl Service {
                 let steps: Vec<Vec<String>> = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
                 self.act(who, &flags, &steps)
             }
+            "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => self.draw_together(who, &flags, args),
             "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" => self.act(who, &flags, std::slice::from_ref(&rest)),
             "" | "help" => Ok(HELP.to_string()),
             _ => Err(format!("unknown command '{verb}': deskcrew help")),
