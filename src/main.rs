@@ -12,6 +12,7 @@ mod overlay;
 mod pen;
 mod pipe;
 mod real;
+mod borrow;
 mod service;
 mod setup;
 mod shot;

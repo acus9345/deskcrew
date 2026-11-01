@@ -18,8 +18,10 @@ use windows_sys::Win32::{
 };
 
 pub const NEEDS_REAL: &str = "no background way to do this here: add --real";
-pub const NEEDS_MOUSE: &str = "this control only answers the real mouse, which deskcrew never touches: try click x,y on it";
-pub const NO_PEN: &str = "Windows would not take pen input here, and deskcrew never touches the real mouse";
+pub const NEEDS_MOUSE: &str = "this control only answers the real mouse: try click x,y on it, or --mouse to ask the person to borrow their cursor";
+/// Closing one of these takes the person's desktop with it.
+const SHELL_WINDOWS: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+pub const NO_PEN: &str = "Windows would not take pen input here: --mouse asks the person to borrow their cursor";
 const WHEEL_DELTA: i32 = 120;
 const TYPE_GAP: Duration = Duration::from_millis(12);
 const ACCESS_DENIED: u32 = 5;
@@ -272,6 +274,9 @@ pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
 }
 
 pub fn close_window(hwnd: Hwnd) -> Result<(), String> {
+    if SHELL_WINDOWS.contains(&win::class(hwnd).as_str()) {
+        return Err("refused: that window is the Windows desktop or taskbar".into());
+    }
     post(hwnd, WM_CLOSE, 0, 0)
 }
 

@@ -285,6 +285,32 @@ pub fn stack_above(layer: Hwnd, root: Hwnd, force: bool) {
     }
 }
 
+/// Which process owns this window, and when that process started. A handle can be given to a new
+/// window after the old one closes, so a handle alone does not prove it is the same window.
+pub fn identity(hwnd: Hwnd) -> (u32, u64) {
+    use windows_sys::Win32::{
+        Foundation::FILETIME,
+        System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    let owner = pid(hwnd);
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, owner);
+        if process.is_null() {
+            return (owner, 0);
+        }
+        let (mut made, mut ended, mut kernel, mut user): (FILETIME, FILETIME, FILETIME, FILETIME) = (zeroed(), zeroed(), zeroed(), zeroed());
+        let read = GetProcessTimes(process, &mut made, &mut ended, &mut kernel, &mut user);
+        CloseHandle(process);
+        (owner, if read != 0 { (made.dwHighDateTime as u64) << 32 | made.dwLowDateTime as u64 } else { 0 })
+    }
+}
+
+/// Whether the window in front is this one, or another of its app's, such as its own dialog.
+pub fn front_is(root: Hwnd, pids: &[u32]) -> bool {
+    let front = foreground();
+    front == root || pids.contains(&pid(front)) || pids.contains(&content_pid(front))
+}
+
 /// Every monitor as x, y, width, height, and whether it is the primary one.
 pub fn screens() -> Vec<(i32, i32, i32, i32, bool)> {
     unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> i32 {

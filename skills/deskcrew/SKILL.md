@@ -21,7 +21,7 @@ Background first. A failure saying `add --real` means the action needs the windo
 
 Work in your own window: agents in different apps run at the same time, and agents sharing a window take turns. In browsers and Electron apps, `type e3 "text"`, `click` and `draw` run in the background while the window is showing.
 
-deskcrew never moves the person's cursor. A control that only answers the real mouse is refused: use the keyboard or `click x,y` instead. Use `--real` only when a reply asks for it, because it takes focus.
+Leave the person's cursor alone. A control that only answers the real mouse is refused: use the keyboard or `click x,y` instead. `--mouse` is the last resort: it asks the person to borrow their cursor, and is refused unless they allowed asking. Never try to get around a refusal, and never run `deskcrew cursor` except `off`, unless the person asks you to. Use `--real` only when a reply asks for it, because it takes focus.
 
 Check before overwriting: `launch` can reopen an app's saved session, so read what is open before `set`, and never assume a new window is empty.
 

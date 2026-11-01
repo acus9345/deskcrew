@@ -4,6 +4,7 @@ mod draw;
 mod layer;
 
 use crate::motion::{self, Point, Rgb};
+use crate::real;
 use crate::win::Hwnd;
 use draw::{PRESS_SETTLE_MS, cursor, outline_margin, press};
 use layer::{Layer, text_mask};
@@ -59,7 +60,7 @@ unsafe extern "system" fn shield(code: i32, wparam: WPARAM, lparam: LPARAM) -> L
     unsafe {
         if code >= 0 {
             let event = &*(lparam as *const MSLLHOOKSTRUCT);
-            if event.flags & LLMHF_INJECTED != 0 {
+            if event.flags & LLMHF_INJECTED != 0 && event.dwExtraInfo != real::OURS {
                 BLOCKED.fetch_add(1, Ordering::Relaxed);
                 return 1;
             }
@@ -399,6 +400,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
             while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
                 if message.message == WM_HOTKEY {
                     stop.store(true, Ordering::Relaxed);
+                    real::release_all();
                 }
                 DispatchMessageW(&message);
             }

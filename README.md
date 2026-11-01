@@ -62,18 +62,18 @@ For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 chara
 
 ## Compared with agent-desktop
 
-[agent-desktop](https://github.com/vercel-labs/agent-desktop) inspired this project and reaches further. The reading figures above were measured; the rest of its column comes from the agent-desktop 1.0.2 README.
+[agent-desktop](https://github.com/vercel-labs/agent-desktop) inspired this project and reaches further. The reading figures above were measured; the rest of its column comes from the agent-desktop 1.0.2 documentation.
 
 | | agent-desktop | deskcrew |
 | --- | --- | --- |
 | Platforms | macOS, Windows, Linux | Windows only |
 | Used from | command line, or a library called in process | command line and an agent skill |
 | Reading a window | 3,603 to 39,595 characters in the tests above | 260 to 3,375 characters, about 10 times less |
-| Drawn cursors | `cursor-overlay` | always on, one per agent, each with its own name and colour, and covered by whatever covers their window |
+| Drawn cursors | `cursor-overlay`, with `--multi-agent` for one per agent; always on top of other windows | always on, one per agent with no setup, and covered by whatever covers their window |
 | Clicks, typing, toggles, menus, scrolling, drag | yes | yes |
 | Holding a key | listed, but refuses to run for now | `down` and `up`, released by itself after 30 s |
-| Holding a mouse button | listed, but refuses to run for now | no: deskcrew never uses the real mouse |
-| Your cursor | moved by its mouse commands | never moved |
+| Holding a mouse button | listed, but refuses to run for now | `down left x,y --mouse`, with your permission |
+| Your cursor | moved by `--headed` mouse commands | moved only if you allow it |
 | Clipboard, windows, launching apps | yes | yes |
 | Notifications | yes | `notifications`, which opens the panel and takes focus until `notifications close` |
 | System surfaces | `open-system-surface` | `launch` with a Windows link such as `ms-settings:` |
@@ -90,8 +90,20 @@ Each reply names the route it took.
 | `command`, `message` | classic Windows controls and menus, plus clicks, typing, `drag` and `draw` in browsers and Electron apps, by window message | untouched | untouched in classic apps, and a Chromium window can take it for a moment |
 | `pen` | `drag`, `draw` and `--real` in apps that draw themselves and ignore messages, such as Paint | untouched | borrowed for the action |
 | `keyboard` | `key`, `type` and `set` with `--real` | untouched | borrowed for the action |
+| `mouse` | only `--mouse`, and only if you allow it | moved, then put back | borrowed for the action |
 
-**Nothing moves your cursor.** deskcrew has no real-mouse route at all. Some classic controls answer an accessibility request by quietly clicking with the real mouse, so a shield blocks every synthetic mouse event while those requests run. A control that needs that is refused with a message instead. In tests, Paint drawing and Edge presses caused no synthetic mouse events at all.
+**Nothing moves your cursor unless you say so.** Borrowing it is off by default. Run `deskcrew cursor ask` to let agents ask, and an agent that needs it gets a prompt on screen: **Just this once**, **This session**, **Always** or **No**. No answer in a minute counts as no, and the prompt never takes focus, so your typing cannot answer it.
+
+| `deskcrew cursor` | Effect |
+| --- | --- |
+| `off` | the default: no agent can borrow it, and any earlier permission is cleared |
+| `ask` | agents may ask each time |
+| `session` | every agent may borrow it until deskcrew stops |
+| `always` | every agent may borrow it when needed, until you run `off` |
+
+Anything except `off` opens a prompt you have to accept. This stops an agent from turning it on by accident or by habit, but it is not a security boundary: anything running as you can edit `%LOCALAPPDATA%\deskcrew\cursor.txt` or click the prompt.
+
+Some classic controls answer an accessibility request by quietly clicking with the real mouse, so a shield blocks every synthetic mouse event while those requests run. A control that needs that is refused with a message instead. In tests, Paint drawing and Edge presses caused no synthetic mouse events at all.
 
 **Cursors and press effects can be covered.** They sit directly above the window they work on, and above its menus and popups, not on top of everything. Put another window over that app and it covers the cursor and the effect too. `deskcrew demo` has no window to follow, so it stays on top.
 
@@ -115,12 +127,13 @@ cargo test
 cargo test --release --test desktop -- --ignored --nocapture
 ```
 
-The second one drives throwaway windows it opens itself, including the real keyboard for a few seconds, so leave the machine alone while it runs. It has 64 checks, and it counts synthetic mouse events to prove when the cursor was left alone.
+The second one drives throwaway windows it opens itself, including the real keyboard and mouse for a few seconds, so leave the machine alone while it runs. It has 65 checks, and it counts synthetic mouse events to prove when the cursor was left alone.
 
 ## Limits
 
 - Windows only. macOS and Linux are not written, and could not be tested on the machine this was built on.
-- `notifications`, `down` and `--real` take focus, so they can interrupt what you are doing, and so does `type --paste` outside a classic text box. A key held with `down` reaches whichever window has focus.
+- `notifications`, `down` and `--real` take focus, so they can interrupt what you are doing, and so does `type --paste` outside a classic text box. A key held with `down` reaches whichever window has focus, and is let go after 30 s, on `quit` and on Ctrl+Alt+Esc. If deskcrew is killed outright it stays down until you press that key.
+- `--real` typing stops if focus leaves the window, and reports how much it had typed.
 - `click --with ctrl` sends the modifier with the click. Apps that read the keyboard instead, such as WinForms, need `--real` as well.
 - `expand` needs a control that offers it: a WinForms combo box does not, so use `select` there.
 - The newest commands, such as `hover`, `down`, `check`, `is` and `notifications`, were tested by hand on throwaway windows and are not in the 65-check suite yet.
@@ -130,8 +143,8 @@ The second one drives throwaway windows it opens itself, including the real keyb
 - Windows of the same browser share one process, and activate each other when worked at the same time, which loses input. Parallel agents need separate apps or separate browser profiles.
 - Rich text boxes, such as Notepad's, need `--real`.
 - The pen needs the window in front, so a `draw` borrows your focus for as long as it runs.
-- WinForms and some other classic apps ignore posted mouse clicks while another window covers them, so use `--real` there. WinForms canvases do not see a posted drag as a drag, and deskcrew has no other way to do it.
-- Classic popup menus, and some other classic controls, only answer the real mouse. deskcrew refuses those rather than touch your cursor, so an agent has to find another way, such as `click x,y` or the keyboard.
+- WinForms and some other classic apps ignore posted mouse clicks while another window covers them, so use `--real` there. WinForms canvases do not see a posted drag as a drag, so that needs `--mouse`.
+- Classic popup menus, and some other classic controls, only answer the real mouse. Without your permission they are refused, and an agent has to find another way, such as `click x,y` or the keyboard.
 - Checkboxes in WinForms, modern menus and `set` in Chromium take focus for a moment before it is given back. A modern menu left open across commands closes when focus returns, so open it and pick from it in one command.
 - Right click by pen has only been tried through its code path, not confirmed in an app.
 - A cursor working in a covered or fullscreen-covered window stays hidden until that window shows, even though the work carries on.

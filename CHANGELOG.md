@@ -6,6 +6,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Add `deskcrew cursor`: `--mouse` is back, off by default, and an agent can only borrow the cursor if the person allows it once, for the session or always.
+- Stop `--real` typing if focus leaves the window, and let Ctrl+Alt+Esc stop it.
+- Refuse risky shortcuts with extra modifiers, such as `shift+alt+f4`.
+- Release held keys on `quit`, on idle exit and on Ctrl+Alt+Esc.
+- Hide password fields from `get`.
+- Notice when a window handle has been reused by a different process.
+- Refuse to close the Windows desktop and taskbar.
+
 ## [0.1.2] - 2026-11-01
 
 - Remove `--mouse` and every real-mouse route, so nothing moves the person's cursor.

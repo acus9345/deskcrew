@@ -334,8 +334,20 @@ fn everything_on_a_real_desktop() {
     r.check("--real types with the real keyboard", ok && form.wait_for("typed"), &reply);
     let (ok, reply) = dc(a, &["key", "ctrl+a", "--real"]);
     r.check("--real can press a shortcut", ok, &reply);
+    let before = pointer_and_focus();
     let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
-    r.check("--mouse is gone, so nothing can move the cursor", !ok && reply.contains("gone"), &reply);
+    r.check("the cursor cannot be borrowed until the person allows it", !ok && reply.contains("borrow") && pointer_and_focus() == before, &reply);
+    let settings = std::path::Path::new(&std::env::var("LOCALAPPDATA").unwrap()).join("deskcrew").join("cursor.txt");
+    let saved = std::fs::read_to_string(&settings).ok();
+    std::fs::write(&settings, format!("always {a}")).unwrap();
+    let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
+    thread::sleep(Duration::from_millis(100));
+    let after = pointer_and_focus();
+    match saved {
+        Some(text) => std::fs::write(&settings, text).unwrap(),
+        None => std::fs::remove_file(&settings).unwrap(),
+    }
+    r.check("an allowed agent borrows the cursor and puts it back", ok && reply.starts_with("ok mouse") && after == before, format!("{before:?} became {after:?}: {reply}"));
 
     // The overlay.
     let windows = overlay_windows();

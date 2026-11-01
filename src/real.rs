@@ -1,5 +1,5 @@
-// The real keyboard. One agent at a time, it waits for a pause in the person's own typing, and it
-// puts focus back afterwards. Nothing here, or anywhere in deskcrew, moves the person's cursor.
+// The real keyboard, and the real mouse for an agent the person has let borrow it. One agent at a
+// time, it waits for a pause in the person's own typing, and it puts focus and the pointer back.
 use crate::win::{self, Hwnd};
 use std::{
     mem::zeroed,
@@ -11,17 +11,23 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
+    Foundation::POINT,
     System::SystemInformation::GetTickCount,
     UI::{
         Input::KeyboardAndMouse::{
-            GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
-            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LASTINPUTINFO, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
+            GetLastInputInfo, INPUT, INPUT_0, INPUT_KEYBOARD, INPUT_MOUSE, KEYBD_EVENT_FLAGS, KEYBDINPUT, KEYEVENTF_EXTENDEDKEY,
+            KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LASTINPUTINFO, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
+            MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
+            MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
             VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
             VK_TAB, VK_UP, VkKeyScanW,
         },
+        WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN},
     },
 };
 
+/// Canvases sample the pointer on their own clock, so a press has to last and arrive after the move.
+const ARRIVE: Duration = Duration::from_millis(25);
 const PRESS: Duration = Duration::from_millis(40);
 const HOLD_LIMIT: Duration = Duration::from_secs(30);
 const KEY_GAP: Duration = Duration::from_millis(6);
@@ -29,22 +35,67 @@ const KEY_GAP: Duration = Duration::from_millis(6);
 const FOCUS_SETTLE: Duration = Duration::from_millis(350);
 /// Input already sent still has to reach the app before focus can move away from it.
 const DRAIN: Duration = Duration::from_millis(120);
+const FOCUS_MOVED: &str = "stopped: focus moved away from that window, so nothing more was typed";
 const QUIET_FOR: Duration = Duration::from_millis(350);
 const QUIET_TIMEOUT: Duration = Duration::from_secs(3);
 const STEP_PIXELS: f32 = 6.0;
 const PIXELS_PER_SECOND: f32 = 1000.0;
 
 /// Shortcuts that end a session or reach the shell: refused unless asked for with --force.
+/// Marks our own mouse events, so the shield against hidden ones lets them through.
+pub const OURS: usize = 0x6465_736B;
+
 const RISKY: [&str; 8] = ["alt+f4", "win+l", "win+r", "win+d", "win+x", "alt+tab", "ctrl+shift+esc", "win+e"];
 
 fn send(inputs: &[INPUT]) {
     unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
 }
 
+fn mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
+    INPUT {
+        r#type: INPUT_MOUSE,
+        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: OURS } },
+    }
+}
+
 fn key(vk: VIRTUAL_KEY, scan: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
     INPUT {
         r#type: INPUT_KEYBOARD,
         Anonymous: INPUT_0 { ki: KEYBDINPUT { wVk: vk, wScan: scan, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+    }
+}
+
+/// A real pointer move, which XAML and raw-input apps see and SetCursorPos does not reach.
+pub fn move_to(x: i32, y: i32) {
+    unsafe {
+        let left = GetSystemMetrics(SM_XVIRTUALSCREEN);
+        let top = GetSystemMetrics(SM_YVIRTUALSCREEN);
+        let width = GetSystemMetrics(SM_CXVIRTUALSCREEN).max(1) as i64;
+        let height = GetSystemMetrics(SM_CYVIRTUALSCREEN).max(1) as i64;
+        let dx = ((x - left) as i64 * 65536 + width - 1) / width;
+        let dy = ((y - top) as i64 * 65536 + height - 1) / height;
+        send(&[mouse(MOUSEEVENTF_MOVE | MOUSEEVENTF_VIRTUALDESK | MOUSEEVENTF_ABSOLUTE, dx as i32, dy as i32, 0)]);
+    }
+}
+
+fn press(right: bool, down: bool) {
+    let flags = match (right, down) {
+        (false, true) => MOUSEEVENTF_LEFTDOWN,
+        (false, false) => MOUSEEVENTF_LEFTUP,
+        (true, true) => MOUSEEVENTF_RIGHTDOWN,
+        (true, false) => MOUSEEVENTF_RIGHTUP,
+    };
+    send(&[mouse(flags, 0, 0, 0)]);
+}
+
+pub fn click(x: i32, y: i32, right: bool, double: bool) {
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    for _ in 0..if double { 2 } else { 1 } {
+        press(right, true);
+        thread::sleep(PRESS);
+        press(right, false);
+        thread::sleep(PRESS);
     }
 }
 
@@ -57,13 +108,53 @@ pub enum Button {
     Forward,
 }
 
-static HELD: Mutex<Vec<Vec<(VIRTUAL_KEY, bool)>>> = Mutex::new(Vec::new());
+impl Button {
+    pub fn named(word: &str) -> Option<Button> {
+        match word {
+            "left" => Some(Button::Left),
+            "right" => Some(Button::Right),
+            "middle" => Some(Button::Middle),
+            "back" => Some(Button::Back),
+            "forward" => Some(Button::Forward),
+            _ => None,
+        }
+    }
+}
+
+fn press_button(button: Button, down: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP};
+    let extra = if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP };
+    match button {
+        Button::Left => press(false, down),
+        Button::Right => press(true, down),
+        Button::Middle => send(&[mouse(if down { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }, 0, 0, 0)]),
+        Button::Back => send(&[mouse(extra, 0, 0, 1)]),
+        Button::Forward => send(&[mouse(extra, 0, 0, 2)]),
+    }
+}
+
+pub fn press_times(x: i32, y: i32, button: Button, times: u32) {
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    for _ in 0..times {
+        press_button(button, true);
+        thread::sleep(PRESS);
+        press_button(button, false);
+        thread::sleep(PRESS);
+    }
+}
+
+#[derive(Clone)]
+enum Held {
+    Keys(Vec<(VIRTUAL_KEY, bool)>),
+    Mouse(Button),
+}
+
+static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
 static HOLDS: AtomicU64 = AtomicU64::new(0);
 
-/// Keys stay down across commands, so they let go by themselves if the agent forgets.
-pub fn hold_keys(chord: &Chord) {
-    set_keys(chord, true);
-    HELD.lock().unwrap().push(chord.keys.clone());
+fn hold(held: Held) {
+    HELD.lock().unwrap().push(held);
     let this = HOLDS.fetch_add(1, Ordering::Relaxed) + 1;
     thread::spawn(move || {
         thread::sleep(HOLD_LIMIT);
@@ -73,12 +164,34 @@ pub fn hold_keys(chord: &Chord) {
     });
 }
 
+/// Keys stay down across commands, so they let go by themselves if the agent forgets.
+pub fn hold_keys(chord: &Chord) {
+    set_keys(chord, true);
+    hold(Held::Keys(chord.keys.clone()));
+}
+
+pub fn hold_button(x: i32, y: i32, button: Button) {
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    press_button(button, true);
+    hold(Held::Mouse(button));
+}
+
 pub fn release_all() -> usize {
-    let held: Vec<_> = HELD.lock().unwrap().drain(..).collect();
-    for keys in held.iter().rev() {
-        set_keys(&Chord { keys: keys.clone(), modified: false }, false);
+    let held: Vec<Held> = HELD.lock().unwrap().drain(..).collect();
+    for item in held.iter().rev() {
+        match item {
+            Held::Keys(keys) => set_keys(&Chord { keys: keys.clone(), modified: false }, false),
+            Held::Mouse(button) => press_button(*button, false),
+        }
     }
     held.len()
+}
+
+pub fn wheel(x: i32, y: i32, notches: i32) {
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    send(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, (notches * 120) as u32)]);
 }
 
 /// Points every few pixels along a stroke, through a smooth curve if asked for.
@@ -127,6 +240,24 @@ pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, mut visit: impl FnMut(usize,
         visit(at, point.0.round() as i32, point.1.round() as i32);
     }
     true
+}
+
+/// Press, follow the path, and always let go.
+pub fn stroke(path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> bool {
+    let Some(first) = path.first() else { return true };
+    move_to(first.0 as i32, first.1 as i32);
+    thread::sleep(ARRIVE);
+    press(false, true);
+    thread::sleep(PRESS);
+    let finished = pace(path, stop, |at, x, y| {
+        move_to(x, y);
+        if at % 3 == 0 {
+            moved(x, y);
+        }
+    });
+    thread::sleep(PRESS);
+    press(false, false);
+    finished
 }
 
 fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
@@ -198,9 +329,21 @@ pub fn chord(spec: &str) -> Result<Chord, String> {
     Ok(Chord { modified: keys.len() > 1, keys })
 }
 
+/// Extra modifiers do not make a shortcut safe, so ctrl+alt+f4 counts as alt+f4.
 pub fn is_risky(spec: &str) -> bool {
-    let wanted = spec.to_lowercase().replace("escape", "esc").replace("control", "ctrl");
-    RISKY.contains(&wanted.as_str())
+    let name = |key: &str| match key.trim().to_lowercase().as_str() {
+        "escape" => "esc".to_string(),
+        "control" => "ctrl".to_string(),
+        "cmd" | "meta" | "windows" | "super" => "win".to_string(),
+        other => other.to_string(),
+    };
+    let pressed: Vec<String> = spec.split('+').map(name).collect();
+    RISKY.iter().any(|risky| risky.split('+').all(|key| pressed.iter().any(|down| down == key)))
+}
+
+/// Real keys go to whatever has focus, so they are only sent while the target still has it.
+pub fn check_front(root: Hwnd, pids: &[u32]) -> Result<(), String> {
+    if win::front_is(root, pids) { Ok(()) } else { Err(FOCUS_MOVED.into()) }
 }
 
 pub fn press_chord(chord: &Chord) {
@@ -227,8 +370,15 @@ pub fn hold_chord(chord: &Chord, hold: Duration) {
     set_keys(chord, false);
 }
 
-pub fn type_text(text: &str) {
-    for unit in text.encode_utf16() {
+/// False if stopped on the way. Fails, having sent what it reports, if focus moves away.
+pub fn type_text(text: &str, root: Hwnd, pids: &[u32], stop: &AtomicBool) -> Result<bool, String> {
+    for (sent, unit) in text.encode_utf16().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            return Ok(false);
+        }
+        if !win::front_is(root, pids) {
+            return Err(format!("{FOCUS_MOVED}: {sent} characters had been typed"));
+        }
         if unit == 10 {
             send(&[key(VK_RETURN, 0, 0)]);
             send(&[key(VK_RETURN, 0, KEYEVENTF_KEYUP)]);
@@ -238,6 +388,7 @@ pub fn type_text(text: &str) {
         }
         thread::sleep(KEY_GAP);
     }
+    Ok(true)
 }
 
 fn idle_for() -> Duration {
@@ -257,14 +408,19 @@ pub fn wait_for_quiet() {
     }
 }
 
-/// Everything a front action borrows, handed back when it ends.
+/// Everything a front action borrows, handed back when it ends. The pointer is only ever
+/// borrowed for --mouse.
 pub struct Borrowed {
+    pointer: Option<POINT>,
     guard: win::FocusGuard,
     root_pids: Vec<u32>,
 }
 
-pub fn borrow(root: Hwnd, pids: &[u32]) -> Result<Borrowed, String> {
+pub fn borrow(root: Hwnd, pids: &[u32], mouse: bool) -> Result<Borrowed, String> {
     wait_for_quiet();
+    let mut pointer = POINT { x: 0, y: 0 };
+    unsafe { GetCursorPos(&mut pointer) };
+    let pointer = mouse.then_some(pointer);
     let guard = win::FocusGuard::take();
     let already_front = win::foreground() == root;
     if !win::bring_forward(root) {
@@ -273,12 +429,15 @@ pub fn borrow(root: Hwnd, pids: &[u32]) -> Result<Borrowed, String> {
     if !already_front {
         thread::sleep(FOCUS_SETTLE);
     }
-    Ok(Borrowed { guard, root_pids: pids.to_vec() })
+    Ok(Borrowed { pointer, guard, root_pids: pids.to_vec() })
 }
 
 impl Drop for Borrowed {
     fn drop(&mut self) {
         thread::sleep(DRAIN);
+        if let Some(pointer) = self.pointer {
+            move_to(pointer.x, pointer.y);
+        }
         self.guard.restore(&self.root_pids);
     }
 }
@@ -300,6 +459,10 @@ mod tests {
         assert!(is_risky("Alt+F4"));
         assert!(is_risky("ctrl+shift+escape"));
         assert!(!is_risky("ctrl+s"));
+        assert!(is_risky("shift+alt+f4"));
+        assert!(is_risky("ctrl+win+l"));
+        assert!(is_risky("cmd+r"));
+        assert!(!is_risky("alt+f5"));
     }
 
     #[test]
