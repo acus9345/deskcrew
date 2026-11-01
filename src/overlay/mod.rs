@@ -4,6 +4,7 @@ mod draw;
 mod layer;
 
 use crate::motion::{self, Point, Rgb};
+use crate::real;
 use draw::{cursor, outline, outline_margin};
 use layer::{Layer, text_mask};
 use std::{
@@ -11,20 +12,23 @@ use std::{
     ptr::null_mut,
     sync::{
         Arc,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc::{self, Receiver, Sender},
     },
     thread::{self, JoinHandle},
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
+    Foundation::{LPARAM, LRESULT, WPARAM},
     Graphics::Dwm::DwmFlush,
+    System::LibraryLoader::GetModuleHandleW,
     System::Threading::{GetCurrentThreadId, INFINITE},
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext},
         Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, VK_ESCAPE},
         WindowsAndMessaging::{
-            DispatchMessageW, GetSystemMetrics, MSG, MsgWaitForMultipleObjects, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
+            CallNextHookEx, DispatchMessageW, GetSystemMetrics, HHOOK, MSG, MSLLHOOKSTRUCT, MsgWaitForMultipleObjects, SetWindowsHookExW,
+            UnhookWindowsHookEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
             PostThreadMessageW, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, WM_APP, WM_HOTKEY,
         },
     },
@@ -39,7 +43,27 @@ const REST_AFTER: Duration = Duration::from_secs(6);
 const REST_FADE_MS: f32 = 160.0;
 const ARRIVE_FROM: f32 = 90.0;
 const APPEAR_MS: f32 = 140.0;
+const SHIELD_LINGER: Duration = Duration::from_millis(30);
 const LABEL_PIXELS: f32 = 12.5;
+const WH_MOUSE_LL: i32 = 14;
+const LLMHF_INJECTED: u32 = 1;
+
+/// Mouse events the shield has stopped. Some classic controls answer an accessibility request by
+/// quietly clicking with the real mouse, so nothing synthetic gets through while one runs.
+static BLOCKED: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn shield(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code >= 0 {
+            let event = &*(lparam as *const MSLLHOOKSTRUCT);
+            if event.flags & LLMHF_INJECTED != 0 && event.dwExtraInfo != real::OURS {
+                BLOCKED.fetch_add(1, Ordering::Relaxed);
+                return 1;
+            }
+        }
+        CallNextHookEx(null_mut(), code, wparam, lparam)
+    }
+}
 
 #[derive(Clone, Copy)]
 pub struct Rect {
@@ -54,6 +78,7 @@ enum Command {
     Jump { agent: String, to: Point },
     Press { agent: String, target: Rect },
     Aside { on: bool, cleared: Sender<()> },
+    Shield { on: bool, ready: Sender<()> },
     Quit,
 }
 
@@ -109,6 +134,24 @@ impl Overlay {
         let (cleared, wait) = mpsc::channel();
         self.send(Command::Aside { on, cleared });
         let _ = wait.recv_timeout(ARRIVAL_TIMEOUT);
+    }
+
+    fn shield_up(&self, on: bool) {
+        let (ready, wait) = mpsc::channel();
+        self.send(Command::Shield { on, ready });
+        let _ = wait.recv_timeout(ARRIVAL_TIMEOUT);
+    }
+
+    /// Run something that must not touch the real mouse. True if it tried to.
+    pub fn shielded<T>(&self, work: impl FnOnce() -> T) -> (T, bool) {
+        self.shield_up(true);
+        let before = BLOCKED.load(Ordering::Relaxed);
+        let out = work();
+        // Hidden clicks can follow the call by a moment.
+        thread::sleep(SHIELD_LINGER);
+        let tried = BLOCKED.load(Ordering::Relaxed) != before;
+        self.shield_up(false);
+        (out, tried)
     }
 
     /// Light up the control this agent just pressed.
@@ -294,6 +337,8 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
     let mut flashes: Vec<Flash> = Vec::new();
     let mut last_frame: Option<Instant> = None;
     let mut aside = false;
+    let mut shields = 0;
+    let mut hook: HHOOK = null_mut();
     unsafe {
         make_aware();
         // Windows only gives a thread a message queue once it asks for a message.
@@ -343,6 +388,18 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
                         flashes.extend(Flash::new(found.colour, target, scale));
                         found.layer.raise();
                     }
+                }
+                Command::Shield { on, ready } => {
+                    shields = if on { shields + 1 } else { shields - 1 };
+                    unsafe {
+                        if shields == 1 && hook.is_null() {
+                            hook = SetWindowsHookExW(WH_MOUSE_LL, Some(shield), GetModuleHandleW(std::ptr::null()), 0);
+                        } else if shields == 0 && !hook.is_null() {
+                            UnhookWindowsHookEx(hook);
+                            hook = null_mut();
+                        }
+                    }
+                    let _ = ready.send(());
                 }
                 Command::Aside { on, cleared } => {
                     aside = on;

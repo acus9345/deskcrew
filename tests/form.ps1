@@ -20,6 +20,15 @@ $save.Add_Click({ Note 'menu Save' })
 $form.Controls.Add($strip)
 $form.MainMenuStrip = $strip
 
+# A classic menu bar, which Windows only clicks through accessibility with the real mouse.
+$bar = New-Object System.Windows.Forms.MainMenu
+$top = New-Object System.Windows.Forms.MenuItem('Classic')
+$pick = New-Object System.Windows.Forms.MenuItem('Pick')
+$pick.Add_Click({ Note 'menu Pick' })
+$off = New-Object System.Windows.Forms.MenuItem('Unavailable'); $off.Enabled = $false
+[void]$top.MenuItems.Add($pick); [void]$top.MenuItems.Add($off); [void]$bar.MenuItems.Add($top)
+$form.Menu = $bar
+
 $status = New-Object System.Windows.Forms.Label
 $status.Name = 'Status'; $status.Text = 'Ready'; $status.Location = New-Object System.Drawing.Point(10, 32); $status.AutoSize = $true
 $form.Controls.Add($status)
@@ -73,6 +82,11 @@ $pad.Add_MouseDown({ $script:moves = 0; Note "down $($_.Button) $($_.X),$($_.Y)"
 $pad.Add_MouseMove({ if ($_.Button -ne 'None') { $script:moves++ } })
 $pad.Add_MouseUp({ Note "up $($_.Button) $($_.X),$($_.Y) moves=$($script:moves)" })
 $pad.Add_MouseDoubleClick({ Note "double $($_.X),$($_.Y)" })
+$popup = New-Object System.Windows.Forms.ContextMenu
+$popped = New-Object System.Windows.Forms.MenuItem('Popped')
+$popped.Add_Click({ Note 'popped' })
+[void]$popup.MenuItems.Add($popped)
+$pad.ContextMenu = $popup
 $form.Controls.Add($pad)
 
 $form.Add_Shown({ Note 'ready' })

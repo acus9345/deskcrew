@@ -1,5 +1,5 @@
-// The real mouse and keyboard, for what accessibility cannot reach. One agent at a time, it waits
-// for a pause in the person's own typing, and it puts the pointer and focus back afterwards.
+// The real keyboard, and the real mouse when an agent insists on it. One agent at a time, it waits
+// for a pause in the person's own typing, and it puts focus and the pointer back afterwards.
 use crate::win::{self, Hwnd};
 use std::{
     mem::zeroed,
@@ -37,6 +37,9 @@ const STEP_PIXELS: f32 = 6.0;
 const PIXELS_PER_SECOND: f32 = 1000.0;
 
 /// Shortcuts that end a session or reach the shell: refused unless asked for with --force.
+/// Marks our own mouse events, so the shield against hidden ones lets them through.
+pub const OURS: usize = 0x6465_736B;
+
 const RISKY: [&str; 8] = ["alt+f4", "win+l", "win+r", "win+d", "win+x", "alt+tab", "ctrl+shift+esc", "win+e"];
 
 fn send(inputs: &[INPUT]) {
@@ -46,7 +49,7 @@ fn send(inputs: &[INPUT]) {
 fn mouse(flags: MOUSE_EVENT_FLAGS, dx: i32, dy: i32, data: u32) -> INPUT {
     INPUT {
         r#type: INPUT_MOUSE,
-        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: 0 } },
+        Anonymous: INPUT_0 { mi: MOUSEINPUT { dx, dy, mouseData: data, dwFlags: flags, time: 0, dwExtraInfo: OURS } },
     }
 }
 
@@ -125,19 +128,12 @@ pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
     out
 }
 
-/// Press, follow the path at a steady speed, and always let go.
-pub fn stroke(path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> bool {
-    let Some(first) = path.first() else { return true };
-    move_to(first.0 as i32, first.1 as i32);
-    thread::sleep(ARRIVE);
-    press(false, true);
-    thread::sleep(PRESS);
+/// Visit each point of a stroke on schedule, at a steady speed. False if stopped on the way.
+pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, mut visit: impl FnMut(usize, i32, i32)) -> bool {
     let started = Instant::now();
-    let mut finished = true;
     for (at, point) in path.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
-            finished = false;
-            break;
+            return false;
         }
         let due = Duration::from_secs_f32(at as f32 * STEP_PIXELS / PIXELS_PER_SECOND);
         while let Some(left) = due.checked_sub(started.elapsed()) {
@@ -147,11 +143,24 @@ pub fn stroke(path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32,
                 std::hint::spin_loop();
             }
         }
-        move_to(point.0.round() as i32, point.1.round() as i32);
-        if at % 3 == 0 {
-            moved(point.0.round() as i32, point.1.round() as i32);
-        }
+        visit(at, point.0.round() as i32, point.1.round() as i32);
     }
+    true
+}
+
+/// Press, follow the path, and always let go.
+pub fn stroke(path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> bool {
+    let Some(first) = path.first() else { return true };
+    move_to(first.0 as i32, first.1 as i32);
+    thread::sleep(ARRIVE);
+    press(false, true);
+    thread::sleep(PRESS);
+    let finished = pace(path, stop, |at, x, y| {
+        move_to(x, y);
+        if at % 3 == 0 {
+            moved(x, y);
+        }
+    });
     thread::sleep(PRESS);
     press(false, false);
     finished
@@ -259,17 +268,19 @@ pub fn wait_for_quiet() {
     }
 }
 
-/// Everything a real action borrows, handed back when it ends.
+/// Everything a front action borrows, handed back when it ends. The pointer is only ever
+/// borrowed for --mouse.
 pub struct Borrowed {
-    pointer: POINT,
+    pointer: Option<POINT>,
     guard: win::FocusGuard,
     root_pids: Vec<u32>,
 }
 
-pub fn borrow(root: Hwnd, pids: &[u32]) -> Result<Borrowed, String> {
+pub fn borrow(root: Hwnd, pids: &[u32], mouse: bool) -> Result<Borrowed, String> {
     wait_for_quiet();
     let mut pointer = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pointer) };
+    let pointer = mouse.then_some(pointer);
     let guard = win::FocusGuard::take();
     let already_front = win::foreground() == root;
     if !win::bring_forward(root) {
@@ -284,7 +295,9 @@ pub fn borrow(root: Hwnd, pids: &[u32]) -> Result<Borrowed, String> {
 impl Drop for Borrowed {
     fn drop(&mut self) {
         thread::sleep(DRAIN);
-        move_to(self.pointer.x, self.pointer.y);
+        if let Some(pointer) = self.pointer {
+            move_to(pointer.x, pointer.y);
+        }
         self.guard.restore(&self.root_pids);
     }
 }

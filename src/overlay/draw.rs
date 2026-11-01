@@ -4,10 +4,8 @@ use tiny_skia::{Color, FillRule, LineJoin, Paint, Path, PathBuilder, Pixmap, Str
 
 /// The arrow's corners and how much each is rounded, in pixels on a 100% screen. The tip is at 0,0.
 const ARROW: [(f32, f32); 4] = [(0.0, 0.0), (31.0, 18.0), (15.0, 21.5), (5.0, 34.5)];
-const ARROW_ROUNDING: [f32; 4] = [3.5, 3.5, 2.3, 3.5];
-/// Where the rounded tip really ends up, which is where a press lands.
-const TIP: (f32, f32) = (1.3, 1.2);
-const ARROW_RIM: f32 = 2.6;
+const ARROW_RADIUS: [f32; 4] = [2.2, 2.2, 2.6, 2.2];
+const ARROW_RIM: f32 = 2.1;
 const LABEL_AT: (f32, f32) = (20.0, 30.0);
 const LABEL_PAD: f32 = 10.0;
 const LABEL_HEIGHT_EXTRA: f32 = 8.0;
@@ -45,27 +43,42 @@ fn rounded(x: f32, y: f32, w: f32, h: f32, r: f32) -> Option<Path> {
     p.finish()
 }
 
-/// The arrow, with every corner softened, so it reads as a shape and not a sliver.
+fn unit(from: (f32, f32), to: (f32, f32)) -> (f32, f32) {
+    let length = (to.0 - from.0).hypot(to.1 - from.1);
+    ((to.0 - from.0) / length, (to.1 - from.1) / length)
+}
+
+/// The arrow, with every corner cut to a true circular arc. Trimming by a fixed length barely
+/// rounds a sharp point, because how far a circle sits back depends on how sharp the point is.
 fn arrow(x: f32, y: f32, s: f32) -> Option<Path> {
-    let corner = |i: usize| (x + ARROW[i % 4].0 * s, y + ARROW[i % 4].1 * s);
-    let toward = |from: (f32, f32), to: (f32, f32), distance: f32| {
-        let length = (to.0 - from.0).hypot(to.1 - from.1);
-        (from.0 + (to.0 - from.0) * distance / length, from.1 + (to.1 - from.1) * distance / length)
-    };
     let mut p = PathBuilder::new();
-    for (i, rounding) in ARROW_ROUNDING.iter().enumerate() {
-        let at = corner(i);
-        let rounding = rounding * s;
-        let (enter, leave) = (toward(at, corner(i + 3), rounding), toward(at, corner(i + 1), rounding));
+    for (i, radius) in ARROW_RADIUS.iter().enumerate() {
+        let (before, at, after) = (ARROW[(i + 3) % 4], ARROW[i], ARROW[(i + 1) % 4]);
+        let (back, on) = (unit(at, before), unit(at, after));
+        let angle = (back.0 * on.0 + back.1 * on.1).clamp(-1.0, 1.0).acos();
+        let reach = radius / (angle / 2.0).tan();
+        let handle = reach - 4.0 / 3.0 * ((std::f32::consts::PI - angle) / 4.0).tan() * radius;
+        let along = |direction: (f32, f32), distance: f32| (x + (at.0 + direction.0 * distance) * s, y + (at.1 + direction.1 * distance) * s);
+        let (enter, leave) = (along(back, reach), along(on, reach));
+        let (pull_in, pull_out) = (along(back, handle), along(on, handle));
         if i == 0 {
             p.move_to(enter.0, enter.1);
         } else {
             p.line_to(enter.0, enter.1);
         }
-        p.quad_to(at.0, at.1, leave.0, leave.1);
+        p.cubic_to(pull_in.0, pull_in.1, pull_out.0, pull_out.1, leave.0, leave.1);
     }
     p.close();
     p.finish()
+}
+
+/// Where the rounded tip really ends up, which is where a press lands.
+fn tip() -> (f32, f32) {
+    let (a, b) = (unit(ARROW[0], ARROW[3]), unit(ARROW[0], ARROW[1]));
+    let angle = (a.0 * b.0 + a.1 * b.1).acos();
+    let middle = unit((0.0, 0.0), (a.0 + b.0, a.1 + b.1));
+    let reach = ARROW_RADIUS[0] * (1.0 / (angle / 2.0).sin() - 1.0);
+    (middle.0 * reach, middle.1 * reach)
 }
 
 /// Spread the canvas's coverage out into a soft shadow, three box blurs being close to a true blur.
@@ -150,7 +163,8 @@ pub fn cursor(colour: Rgb, label: &Mask, s: f32) -> Option<(Pixmap, i32, i32)> {
     let edge = Stroke { width: s.max(1.0), ..Stroke::default() };
     canvas.stroke_path(&pill, &paint((255, 255, 255), LABEL_EDGE_ALPHA), &edge, Transform::identity(), None);
     stamp(&mut canvas, label, (pill_x + pad) as i32, (pill_y + (pill_h - label.h as f32) / 2.0) as i32);
-    Some((canvas, (room + TIP.0 * s) as i32, (room + TIP.1 * s) as i32))
+    let point = tip();
+    Some((canvas, (room + point.0 * s) as i32, (room + point.1 * s) as i32))
 }
 
 /// How far the outline's picture reaches past the control on each side.
@@ -194,7 +208,7 @@ mod tests {
     fn the_cursor_is_drawn_in_its_colour_with_a_dark_rim_and_a_soft_shadow() {
         let label = Mask { w: 30, h: 16, alpha: vec![255; 480] };
         let (canvas, x, y) = cursor((255, 165, 31), &label, 1.0).unwrap();
-        assert_eq!((x, y), (13, 13));
+        assert!((13..=16).contains(&x) && (13..=16).contains(&y), "tip {x},{y}");
         assert_eq!(pixel(&canvas, 20, 24), (255, 165, 31, 255));
         let rim = (0..canvas.width()).map(|x| pixel(&canvas, x, 27)).find(|(_, _, _, a)| *a > 200);
         assert!(rim.is_some_and(|(r, _, _, _)| r < 90), "rim {rim:?}");

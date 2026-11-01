@@ -14,7 +14,9 @@ Run `deskcrew help` once for the commands. Windows only.
 - Pictures only when text is not enough: `deskcrew shot` prints a PNG path to open. `unchanged` means you already have it. `click x,y` uses pixels in the last shot.
 - Name yourself once per session, so parallel agents get separate cursors: `--agent name` or `DESKCREW_AGENT`.
 
-Background first. A failure saying `add --real` means the app needs the real mouse or keyboard: `--real` borrows them briefly, so use it only when needed. `drag` and `draw` are always real. Agents take turns on real input, and it is refused if a point is not on the target window.
+Background first. A failure saying `add --real` means the action needs the window in front: `--real` borrows the person's focus briefly, and uses the keyboard or a pen, so their cursor stays put. `drag` and `draw` pick the quietest way themselves. Agents take turns on this, and it is refused if a point is not on the target window.
+
+`--mouse` is the last resort: it moves the person's cursor. Use it only when a reply asks for it.
 
 Check before overwriting: `launch` can reopen an app's saved session, so read what is open before `set`, and never assume a new window is empty.
 

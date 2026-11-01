@@ -9,6 +9,7 @@ mod demo;
 mod lines;
 mod motion;
 mod overlay;
+mod pen;
 mod pipe;
 mod real;
 mod service;

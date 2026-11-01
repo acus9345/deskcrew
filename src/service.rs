@@ -5,6 +5,7 @@ use crate::{
     apps,
     lines::{self, Seen},
     overlay::{Overlay, Rect},
+    pen::Pen,
     pipe::Pipe,
     real,
     shot::{self, Frame, Frames},
@@ -29,6 +30,11 @@ const SETTLE_LEAST: Duration = Duration::from_millis(150);
 const SETTLE_MOST: Duration = Duration::from_millis(800);
 const BETWEEN_STEPS: Duration = Duration::from_millis(40);
 const NAME_WAIT: Duration = Duration::from_millis(600);
+/// Chromium fills in its page some time after the first request, in bursts.
+const CHROMIUM_STEP: Duration = Duration::from_millis(250);
+const CHROMIUM_READS: usize = 16;
+const CHROMIUM_STEADY: usize = 3;
+const CHROMIUM_NAME_WAIT: Duration = Duration::from_millis(3000);
 const WAIT_DEFAULT_MS: u64 = 10_000;
 const WAIT_MOST_MS: u64 = 60_000;
 const WAIT_STEP: Duration = Duration::from_millis(200);
@@ -47,13 +53,39 @@ shot [window|e3] [-f] [--screen] [--changed] [--edge N]
 click e3 [e4 ...] | "Name" | x,y [--right] [--double]
 set e3 "value"     type [e3] "text"     key enter     select e3 "Item"
 scroll [e3] up|down [n]     show e3     wait "text" [--gone] [--ms N]
-drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]     (real mouse)
+drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
 do "click e1; set e2 hi; key enter"   many steps, one reply
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
 clip     clip set "text"     status     resume     quit
-Every action replies with what changed. Flags: -w window, --agent name, --real (real mouse
-and keyboard), --fast (no glide), --force (allow risky keys). x,y are pixels in the last shot.
-Ctrl+Alt+Esc stops every agent."#;
+Every action replies with what changed. x,y are pixels in the last shot. Ctrl+Alt+Esc stops every agent.
+Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
+--real (brings the window forward for a moment and uses the keyboard or a pen; the person's cursor stays put),
+--mouse (the real mouse, which moves the person's cursor: only if nothing else works)."#;
+
+/// A press that needs the window in front, by the quietest way this spot of the app accepts.
+fn press_at(root: Hwnd, x: i32, y: i32, flags: &Flags) -> Reply {
+    if flags.mouse {
+        real::click(x, y, flags.right, flags.double);
+        return Ok("mouse".into());
+    }
+    if !act::draws_at(root, x, y) {
+        return act::post_click(root, x, y, flags.right, flags.double);
+    }
+    let pen = Pen::new().ok_or(act::NO_PEN)?;
+    if pen.tap(x, y, flags.right, flags.double) { Ok("pen".into()) } else { Err(act::NO_PEN.into()) }
+}
+
+/// Run a classic menu entry without opening the menu, or list what is under it.
+fn run_menu_entry(root: Hwnd, entry: &win::MenuEntry) -> Reply {
+    if entry.greyed {
+        return Err(format!("'{}' is disabled", entry.label));
+    }
+    if entry.submenu != 0 {
+        let labels: Vec<String> = win::menu_entries(entry.submenu).into_iter().map(|e| e.label).collect();
+        return Ok(format!("menu: {}", labels.join(", ")));
+    }
+    act::post_command(root, entry.command)
+}
 
 type Reply = Result<String, String>;
 type Bounds = (i32, i32, i32, i32);
@@ -123,6 +155,7 @@ unsafe impl Send for AgentState {}
 #[derive(Default)]
 struct Flags {
     real: bool,
+    mouse: bool,
     fast: bool,
     force: bool,
     full: bool,
@@ -156,6 +189,7 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
             match word {
                 "--" => literal = true,
                 "--real" => flags.real = true,
+                "--mouse" => flags.mouse = true,
                 "--fast" => flags.fast = true,
                 "--force" => flags.force = true,
                 "-f" | "--full" => flags.full = true,
@@ -198,6 +232,7 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
 enum Target {
     Control(u32),
     Point(i32, i32),
+    Menu(win::MenuEntry),
 }
 
 fn is_ref(word: &str) -> Option<u32> {
@@ -325,11 +360,13 @@ impl Service {
     fn first_read(&self, tracked: &Tracked, view: &mut View, all: bool) -> Result<(), String> {
         self.read(tracked, view, all)?;
         if !view.read_once && win::class(tracked.hwnd).starts_with("Chrome_") {
-            for _ in 0..6 {
+            let mut steady = 0;
+            for _ in 0..CHROMIUM_READS {
                 let count = view.lines.len();
-                thread::sleep(Duration::from_millis(300));
+                thread::sleep(CHROMIUM_STEP);
                 self.read(tracked, view, all)?;
-                if view.lines.len() == count {
+                steady = if view.lines.len() == count { steady + 1 } else { 0 };
+                if steady == CHROMIUM_STEADY {
                     break;
                 }
             }
@@ -409,8 +446,16 @@ impl Service {
             }
             match hits.as_slice() {
                 [only] => return Ok(Target::Control(*only)),
-                [] if started.elapsed() < NAME_WAIT => thread::sleep(SETTLE_STEP),
-                [] => return Err(format!("no control named '{word}': see")),
+                [] => {
+                    if let Some(entry) = win::find_menu(win::menu_bar(tracked.hwnd), word) {
+                        return Ok(Target::Menu(entry));
+                    }
+                    let patience = if win::class(tracked.hwnd).starts_with("Chrome_") { CHROMIUM_NAME_WAIT } else { NAME_WAIT };
+                    if started.elapsed() >= patience {
+                        return Err(format!("no control named '{word}': see"));
+                    }
+                    thread::sleep(SETTLE_STEP);
+                }
                 many => {
                     // A label and the control it names share a name: the one that acts is meant.
                     let acting: Vec<u32> = many.iter().copied().filter(|id| !view.nodes[id].parts.role.is_empty()).collect();
@@ -437,11 +482,12 @@ impl Service {
         Ok((node, rect))
     }
 
-    /// Take the real mouse and keyboard. Every point has to land on this window: a real press
-    /// anywhere else would hit whatever the person has open there.
-    fn with_real<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], work: impl FnOnce() -> T) -> Result<T, String> {
+    /// Bring the window forward for work that needs it, and give focus back after. Every point has
+    /// to land on this window: a press anywhere else would hit whatever the person has open there.
+    /// The person's cursor is only borrowed for --mouse.
+    fn with_front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], mouse: bool, work: impl FnOnce() -> T) -> Result<T, String> {
         let _turn = self.real_input.lock().unwrap();
-        let _borrowed = real::borrow(tracked.hwnd, &view.pids)?;
+        let _borrowed = real::borrow(tracked.hwnd, &view.pids, mouse)?;
         let mut family = view.surfaces.clone();
         family.push(tracked.hwnd);
         if let Some((x, y)) = points.iter().find(|(x, y)| !win::owns_point(&family, *x, *y)) {
@@ -453,6 +499,7 @@ impl Service {
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let plain = !flags.right && !flags.double;
         let (node, (x, y)) = match self.resolve(word, who, tracked, view)? {
+            Target::Menu(entry) => return run_menu_entry(tracked.hwnd, &entry),
             Target::Point(x, y) => {
                 self.cursor_on(who, flags, (x, y, 0, 0));
                 (None, (x, y))
@@ -463,9 +510,8 @@ impl Service {
                 (Some(node), act::centre(rect))
             }
         };
-        if flags.real {
-            self.with_real(tracked, view, &[(x, y)], || real::click(x, y, flags.right, flags.double))?;
-            return Ok("real".into());
+        if flags.real || flags.mouse {
+            return self.with_front(tracked, view, &[(x, y)], flags.mouse, || press_at(tracked.hwnd, x, y, flags))?;
         }
         if let Some(node) = &node {
             if node.parts.states.contains(&"disabled") {
@@ -474,10 +520,18 @@ impl Service {
             if plain && let Some(result) = act::post_button(node, tracked.hwnd) {
                 return result;
             }
+            if plain && node.parts.role == "menuitem" && let Some(entry) = win::find_menu(win::menu_bar(tracked.hwnd), &node.parts.name) {
+                return run_menu_entry(tracked.hwnd, &entry);
+            }
         }
         let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd));
         if let (Some(node), true) = (&node, plain) {
-            match act::press(node) {
+            let classic = !act::draws_at(tracked.hwnd, x, y);
+            let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press(node), false) };
+            if tried_mouse {
+                return Err(act::NEEDS_MOUSE.into());
+            }
+            match pressed {
                 Some(Ok(route)) => return Ok(route),
                 Some(Err(error)) if error.contains("administrator") => return Err(error),
                 _ => {}
@@ -490,15 +544,15 @@ impl Service {
         let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("set needs a control".into()) };
         let (node, rect) = self.locate(id, tracked, view)?;
         self.cursor_on(who, flags, rect);
-        if flags.real {
+        if flags.real || flags.mouse {
             let (x, y) = act::centre(rect);
             let all = real::chord("ctrl+a")?;
-            self.with_real(tracked, view, &[(x, y)], || {
-                real::click(x, y, false, false);
+            return self.with_front(tracked, view, &[(x, y)], flags.mouse, || {
+                press_at(tracked.hwnd, x, y, flags)?;
                 real::press_chord(&all);
                 real::type_text(value);
+                Ok("keyboard".to_string())
             })?;
-            return Ok("real".into());
         }
         act::set(&node, tracked.hwnd, value)
     }
@@ -518,15 +572,15 @@ impl Service {
             place = Some(act::centre(rect));
             hwnd = act::native_window(&node, tracked.hwnd);
         }
-        if flags.real {
+        if flags.real || flags.mouse {
             let points: Vec<(i32, i32)> = place.into_iter().collect();
-            self.with_real(tracked, view, &points, || {
+            return self.with_front(tracked, view, &points, flags.mouse, || {
                 if let Some((x, y)) = place {
-                    real::click(x, y, false, false);
+                    press_at(tracked.hwnd, x, y, flags)?;
                 }
                 real::type_text(text);
+                Ok("keyboard".to_string())
             })?;
-            return Ok("real".into());
         }
         match (target, hwnd) {
             (Some(_), None) => Err(NEEDS_REAL.into()),
@@ -540,9 +594,9 @@ impl Service {
             return Err(format!("{spec} is refused: it can end the session or open the shell (--force to allow)"));
         }
         let chord = real::chord(spec)?;
-        if flags.real {
-            self.with_real(tracked, view, &[], || real::press_chord(&chord))?;
-            return Ok("real".into());
+        if flags.real || flags.mouse {
+            self.with_front(tracked, view, &[], false, || real::press_chord(&chord))?;
+            return Ok("keyboard".into());
         }
         act::post_key(tracked.hwnd, &chord, spec)
     }
@@ -551,7 +605,8 @@ impl Service {
         let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("select needs a control".into()) };
         let (node, rect) = self.locate(id, tracked, view)?;
         self.cursor_on(who, flags, rect);
-        act::select_item(&node, item, &self.uia, tracked.hwnd)
+        let (result, tried_mouse) = self.overlay.shielded(|| act::select_item(&node, item, &self.uia, tracked.hwnd));
+        if tried_mouse { Err(act::NEEDS_MOUSE.into()) } else { result }
     }
 
     fn scroll(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
@@ -562,7 +617,7 @@ impl Service {
         let id = match words[..at].first() {
             Some(word) => match self.resolve(word, who, tracked, view)? {
                 Target::Control(id) => Some(id),
-                Target::Point(..) => return Err("scroll needs a control".into()),
+                _ => return Err("scroll needs a control".into()),
             },
             None => view.nodes.iter().find(|(_, node)| node.parts.states.contains(&"scroll")).map(|(id, _)| *id),
         };
@@ -571,9 +626,18 @@ impl Service {
         self.cursor_on(who, flags, rect);
         let (x, y) = act::centre(rect);
         let notches = if down { -times } else { times };
+        if flags.mouse {
+            self.with_front(tracked, view, &[(x, y)], true, || real::wheel(x, y, notches))?;
+            return Ok("mouse".into());
+        }
         if flags.real {
-            self.with_real(tracked, view, &[(x, y)], || real::wheel(x, y, notches))?;
-            return Ok("real".into());
+            let page = real::chord(if down { "pagedown" } else { "pageup" })?;
+            self.with_front(tracked, view, &[(x, y)], false, || {
+                for _ in 0..times.max(1) {
+                    real::press_chord(&page);
+                }
+            })?;
+            return Ok("keyboard".into());
         }
         if node.can.scroll {
             for _ in 0..times.max(1) {
@@ -588,22 +652,41 @@ impl Service {
         match self.resolve(word, who, tracked, view)? {
             Target::Point(x, y) => Ok((x, y)),
             Target::Control(id) => Ok(act::centre(self.locate(id, tracked, view)?.1)),
+            Target::Menu(_) => Err("that is a menu entry, not a place".into()),
         }
     }
 
-    fn walk(&self, who: &str, tracked: &Tracked, view: &View, strokes: Vec<Vec<(f32, f32)>>) -> Reply {
+    /// Strokes by the quietest way the app accepts: messages to a classic window, the pen for one
+    /// that draws itself, and the real mouse only when asked for.
+    fn walk(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &View, strokes: Vec<Vec<(f32, f32)>>) -> Reply {
         let points: Vec<(i32, i32)> = strokes.iter().flatten().map(|p| (p.0.round() as i32, p.1.round() as i32)).collect();
-        let finished = self.with_real(tracked, view, &points, || {
-            strokes.iter().all(|path| real::stroke(path, &self.stop, |x, y| self.overlay.jump(who, x, y)))
-        })?;
-        if finished { Ok("real".into()) } else { Err(STOPPED.into()) }
+        let (x, y) = *points.first().ok_or("nothing to draw")?;
+        let jump = |x: i32, y: i32| self.overlay.jump(who, x, y);
+        let (route, finished) = if flags.mouse {
+            let done = self.with_front(tracked, view, &points, true, || strokes.iter().all(|path| real::stroke(path, &self.stop, jump)))?;
+            ("mouse", done)
+        } else if act::draws_at(tracked.hwnd, x, y) {
+            let pen = Pen::new().ok_or(act::NO_PEN)?;
+            let done = self.with_front(tracked, view, &points, false, || {
+                strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && pen.stroke(path, &self.stop, jump)?))
+            })??;
+            ("pen", done)
+        } else {
+            if let Some((x, y)) = points.iter().find(|(x, y)| !win::inside(tracked.hwnd, *x, *y)) {
+                return Err(format!("refused: {x},{y} on screen is not on this window"));
+            }
+            let send = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, &self.stop, jump)?));
+            let done = if flags.real { self.with_front(tracked, view, &points, false, send)?? } else { send()? };
+            ("message", done)
+        };
+        if finished { Ok(route.into()) } else { Err(STOPPED.into()) }
     }
 
-    fn drag(&self, who: &str, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
+    fn drag(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
         let start = self.point_of(from, who, tracked, view)?;
         let end = self.point_of(to, who, tracked, view)?;
         self.overlay.move_to(who, start.0, start.1);
-        self.walk(who, tracked, view, vec![real::trace(&[start, end], false)])
+        self.walk(who, flags, tracked, view, vec![real::trace(&[start, end], false)])
     }
 
     fn draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
@@ -615,7 +698,7 @@ impl Service {
         let origin = match word {
             Some(word) => match self.resolve(word, who, tracked, view)? {
                 Target::Control(id) => Some(self.locate(id, tracked, view)?.1),
-                Target::Point(..) => return Err("draw needs a control".into()),
+                _ => return Err("draw needs a control".into()),
             },
             None => None,
         };
@@ -641,7 +724,7 @@ impl Service {
         }
         let first = strokes[0][0];
         self.overlay.move_to(who, first.0 as i32, first.1 as i32);
-        self.walk(who, tracked, view, strokes)
+        self.walk(who, flags, tracked, view, strokes)
     }
 
     fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
@@ -671,6 +754,7 @@ impl Service {
         let (own, words) = parse(words);
         let flags = Flags {
             real: flags.real || own.real,
+            mouse: flags.mouse || own.mouse,
             fast: flags.fast || own.fast,
             force: flags.force || own.force,
             right: flags.right || own.right,
@@ -692,9 +776,9 @@ impl Service {
             ("show", [word]) => match self.resolve(word, who, tracked, view)? {
                 Target::Control(id) if view.nodes[&id].can.scroll_item => view.nodes[&id].element.bring_into_view().map(|_| "show".to_string()),
                 Target::Control(_) => Err("that control cannot scroll into view".into()),
-                Target::Point(..) => Err("show needs a control".into()),
+                _ => Err("show needs a control".into()),
             },
-            ("drag", [from, to]) => self.drag(who, tracked, view, from, to),
+            ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
             ("draw", _) => self.draw(who, &flags, tracked, view, rest),
             ("wait", [text]) => self.wait(&flags, tracked, view, text),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
@@ -748,7 +832,7 @@ impl Service {
                 }
                 if nothing && routes.iter().any(|r| r == "message") {
                     out.push("nothing changed: try --real if it should have".into());
-                } else if nothing && routes.iter().any(|r| r == "real") {
+                } else if nothing && routes.iter().any(|r| r == "pen" || r == "mouse" || r == "keyboard") {
                     out.push("nothing changed: check with shot".into());
                 }
             }

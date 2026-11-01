@@ -20,7 +20,8 @@ use windows_sys::{
         UI::WindowsAndMessaging::{
             BringWindowToTop, ChildWindowFromPointEx, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, EnumChildWindows,
             EnumWindows, GUITHREADINFO, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
-            GA_ROOT, GW_OWNER, GetAncestor, GetDlgCtrlID, GetParent, GetWindow, GetWindowLongPtrW, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
+            GA_ROOT, GW_OWNER, GetAncestor, GetDlgCtrlID, GetMenu, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
+            GetParent, GetSubMenu, GetWindow, GetWindowLongPtrW, HMENU, MF_BYPOSITION, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic,
             IsWindow, IsWindowVisible, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
             ShowWindow, SwitchToThisWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
@@ -151,6 +152,65 @@ pub fn list() -> Vec<Win> {
 /// Every visible window of these processes, popups included.
 pub fn of_processes(pids: &[u32]) -> Vec<Hwnd> {
     top_level().into_iter().filter(|&hwnd| shown(hwnd) && pids.contains(&pid(hwnd)) && class(hwnd) != "deskcrew").collect()
+}
+
+/// A screen point in a window's own client coordinates.
+pub fn to_client(hwnd: Hwnd, x: i32, y: i32) -> (i32, i32) {
+    let mut point = POINT { x, y };
+    unsafe { ScreenToClient(raw(hwnd), &mut point) };
+    (point.x, point.y)
+}
+
+pub fn inside(hwnd: Hwnd, x: i32, y: i32) -> bool {
+    let (left, top, w, h) = outer_rect(hwnd);
+    x >= left && y >= top && x < left + w && y < top + h
+}
+
+/// One entry of a classic menu bar, which can be run without ever opening the menu.
+pub struct MenuEntry {
+    pub label: String,
+    pub command: usize,
+    pub submenu: isize,
+    pub greyed: bool,
+}
+
+pub fn menu_bar(hwnd: Hwnd) -> isize {
+    unsafe { GetMenu(raw(hwnd)) as isize }
+}
+
+pub fn menu_entries(menu: isize) -> Vec<MenuEntry> {
+    let handle = menu as HMENU;
+    let mut out = Vec::new();
+    unsafe {
+        for at in 0..GetMenuItemCount(handle).max(0) {
+            let state = GetMenuState(handle, at as u32, MF_BYPOSITION);
+            if state & MF_SEPARATOR != 0 {
+                continue;
+            }
+            let mut text = [0u16; 128];
+            let got = GetMenuStringW(handle, at as u32, text.as_mut_ptr(), text.len() as i32, MF_BYPOSITION);
+            let label = utf16(&text[..got.max(0) as usize]);
+            let label = label.split('\t').next().unwrap_or("").replace('&', "");
+            out.push(MenuEntry {
+                label,
+                command: GetMenuItemID(handle, at) as usize,
+                submenu: GetSubMenu(handle, at) as isize,
+                greyed: state & (MF_GRAYED | MF_DISABLED) != 0,
+            });
+        }
+    }
+    out
+}
+
+/// The entry with this label anywhere in a menu.
+pub fn find_menu(menu: isize, wanted: &str) -> Option<MenuEntry> {
+    if menu == 0 {
+        return None;
+    }
+    let wanted = wanted.to_lowercase();
+    let entries = menu_entries(menu);
+    let submenus: Vec<isize> = entries.iter().map(|e| e.submenu).filter(|s| *s != 0).collect();
+    entries.into_iter().find(|e| e.label.to_lowercase() == wanted).or_else(|| submenus.into_iter().find_map(|s| find_menu(s, &wanted)))
 }
 
 /// True if a real click at this point would reach one of these windows and nothing else.

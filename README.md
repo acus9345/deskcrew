@@ -2,7 +2,7 @@
 
 **Windows only for now.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
 
-Agents act through Windows accessibility, so your real mouse and keyboard stay yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.
+Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.
 
 It is a single command, so any agent that can run a shell command can use it. There is no MCP server and no tool schema loaded into every conversation.
 
@@ -52,13 +52,17 @@ For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 chara
 
 Each reply names the route it took.
 
-| Route | Used for | Touches your mouse or focus |
-| --- | --- | --- |
-| `invoke`, `toggle`, `select`, `expand`, `value`, `range`, `scroll` | the app's own accessibility actions | no, though some apps take focus: it is given back and the reply says `focus returned` |
-| `command`, `message` | classic Windows controls, by window message | no |
-| `real` | anything else, with `--real`, plus `drag` and `draw` | yes, briefly |
+| Route | Used for | Your cursor | Your focus |
+| --- | --- | --- | --- |
+| `invoke`, `toggle`, `select`, `expand`, `value`, `range`, `scroll` | the app's own accessibility actions | untouched | some apps take it for a moment: it is given back and the reply says `focus returned` |
+| `command`, `message` | classic Windows controls and menus, by window message | untouched | untouched |
+| `pen` | `drag`, `draw` and `--real` in apps that draw themselves, such as Paint and browsers | untouched | borrowed for the action |
+| `keyboard` | `key`, `type` and `set` with `--real` | untouched | borrowed for the action |
+| `mouse` | only with `--mouse`, when nothing else works | moved, then put back | borrowed for the action |
 
-Real input waits for a pause in your own typing, is one agent at a time, and puts your pointer and focus back afterwards. It is refused if a point is not on the target window, so it cannot land on something else you have open.
+**Only `--mouse` moves your cursor.** Some classic controls answer an accessibility request by quietly clicking with the real mouse, so a shield blocks every synthetic mouse event while those requests run. A control that needs that is refused with a message instead. In tests, Paint drawing and Edge presses caused no synthetic mouse events at all.
+
+Anything that borrows focus waits for a pause in your own typing, is one agent at a time, and gives focus back afterwards. It is refused if a point is not on the target window, so it cannot land on something else you have open.
 
 Agents in different windows run at the same time. Agents in one window take turns.
 
@@ -74,16 +78,19 @@ cargo test
 cargo test --release --test desktop -- --ignored --nocapture
 ```
 
-The second one drives throwaway windows it opens itself, including a real mouse and keyboard for a few seconds, so leave the machine alone while it runs. It has 58 checks.
+The second one drives throwaway windows it opens itself, including a real mouse and keyboard for a few seconds, so leave the machine alone while it runs. It has 65 checks, and it counts synthetic mouse events to prove when the cursor was left alone.
 
 ## Limits
 
 - Windows only. macOS and Linux are not written, and could not be tested on the machine this was built on.
-- Canvas apps such as Paint need the real mouse. So do keyboard shortcuts, which have to go to the window in front.
+- Keyboard shortcuts need `--real`, because they have to go to the window in front. While a `--real` action runs, anything you type goes to that window.
 - Text boxes drawn by XAML or Chromium take `set`, but `type` needs `--real`.
 - Rich text boxes, such as Notepad's, need `--real`.
-- WinForms and some other classic apps ignore posted mouse clicks while another window covers them.
-- Checkboxes in WinForms, menus and Edge take focus for a moment before it is given back. A menu that is opened and left open across commands closes when focus returns, so open it and pick from it in one command.
+- The pen needs the window in front, so a `draw` borrows your focus for as long as it runs.
+- WinForms and some other classic apps ignore posted mouse clicks while another window covers them, and WinForms canvases do not see a posted drag as a drag. Use `--real` for the first and `--mouse` for the second.
+- Classic popup menus, and some other classic controls, are refused without `--mouse`.
+- Checkboxes in WinForms, modern menus and Edge take focus for a moment before it is given back. A modern menu left open across commands closes when focus returns, so open it and pick from it in one command.
+- Right click by pen has only been tried through its code path, not confirmed in an app.
 - A drawn cursor floats above whatever covers its target window.
 - `launch` can reopen an app's saved session, so a new window is not always empty.
 - Tested on one monitor at 150% scaling. A second monitor has not been tried.

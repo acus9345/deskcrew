@@ -5,6 +5,7 @@
 
 use std::{
     env, fs,
+    sync::atomic::{AtomicUsize, Ordering},
     io::Read,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -15,11 +16,37 @@ use windows_sys::Win32::{
     Foundation::{HWND, LPARAM, POINT},
     UI::{
         Input::KeyboardAndMouse::{KEYEVENTF_KEYUP, VK_CONTROL, VK_ESCAPE, VK_MENU, keybd_event},
-        WindowsAndMessaging::{EnumWindows, GetClassNameW, GetCursorPos, GetWindowDisplayAffinity, GetForegroundWindow, GetWindowRect, IsWindowVisible},
+        WindowsAndMessaging::{
+            CallNextHookEx, DispatchMessageW, EnumWindows, GetClassNameW, GetCursorPos, GetForegroundWindow, GetMessageW, GetWindowDisplayAffinity, GetWindowRect,
+            IsWindowVisible, MSG, MSLLHOOKSTRUCT, SetWindowsHookExW,
+        },
     },
 };
 
 const EXE: &str = env!("CARGO_BIN_EXE_deskcrew");
+
+/// Every synthetic mouse event on the machine: the proof that nobody took the person's cursor.
+static SYNTHETIC: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn watch_mouse(code: i32, wparam: usize, lparam: isize) -> isize {
+    unsafe {
+        if code >= 0 && (*(lparam as *const MSLLHOOKSTRUCT)).flags & 1 != 0 {
+            SYNTHETIC.fetch_add(1, Ordering::SeqCst);
+        }
+        CallNextHookEx(std::ptr::null_mut(), code, wparam, lparam)
+    }
+}
+
+fn watch_for_synthetic_mouse() {
+    thread::spawn(|| unsafe {
+        SetWindowsHookExW(14, Some(watch_mouse), std::ptr::null_mut(), 0);
+        let mut message: MSG = std::mem::zeroed();
+        while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
+            DispatchMessageW(&message);
+        }
+    });
+    thread::sleep(Duration::from_millis(200));
+}
 
 struct Report {
     passed: usize,
@@ -172,6 +199,7 @@ fn everything_on_a_real_desktop() {
     let mut r = Report { passed: 0, failed: Vec::new() };
     let _ = dc("t", &["quit"]);
     thread::sleep(Duration::from_millis(300));
+    watch_for_synthetic_mouse();
 
     let title = format!("deskcrew-a-{stamp}");
     let form = Form::open(&work, &title, 200, 120);
@@ -182,12 +210,15 @@ fn everything_on_a_real_desktop() {
         let mut last = String::new();
         for _ in 0..6 {
             let before = pointer_and_focus();
+            let injected = SYNTHETIC.load(Ordering::SeqCst);
             let reply = dc(a, action);
+            thread::sleep(Duration::from_millis(60));
             let after = pointer_and_focus();
-            if after == before || !reply.0 {
-                return (after == before, reply.1);
+            let clean = SYNTHETIC.load(Ordering::SeqCst) == injected;
+            if (after == before && clean) || !reply.0 {
+                return (after == before && clean, reply.1);
             }
-            last = format!("{before:?} became {after:?}: {}", reply.1);
+            last = format!("{before:?} became {after:?}, synthetic {}: {}", SYNTHETIC.load(Ordering::SeqCst) - injected, reply.1);
             thread::sleep(Duration::from_millis(700));
         }
         (false, last)
@@ -235,6 +266,12 @@ fn everything_on_a_real_desktop() {
     r.check("a risky shortcut is refused", !ok && reply.contains("refused"), &reply);
     let (same, reply) = unmoved(&["click", "Alpha"]);
     r.check("background work leaves the pointer and focus alone", same, &reply);
+    let (same, reply) = unmoved(&["click", "Classic"]);
+    r.check("a classic menu lists its entries without opening or a mouse", same && reply.contains("Pick"), &reply);
+    let (same, reply) = unmoved(&["click", "Pick"]);
+    r.check("and its entry runs with no mouse at all", same && form.wait_for("menu Pick"), &reply);
+    let (ok, reply) = dc(a, &["click", "Unavailable"]);
+    r.check("a greyed menu entry is refused", !ok && reply.contains("disabled"), &reply);
 
     // Stable refs.
     let (_, reply) = dc(a, &["click", "Rebuild"]);
@@ -279,8 +316,8 @@ fn everything_on_a_real_desktop() {
     r.check("a message click moves nothing either", same, &reply);
 
     // Real input, which has to borrow the pointer and give it back.
-    let (ok, reply) = dc(a, &["click", "120,320", "--real"]);
-    r.check("--real clicks with the real mouse", ok && reply.starts_with("ok real"), &reply);
+    let (same, reply) = unmoved(&["click", "120,320", "--real"]);
+    r.check("--real presses without the mouse", same && reply.starts_with("ok message"), &reply);
     let (ok, reply) = dc(a, &["click", "120,320", "--real", "--double"]);
     r.check("--real can double-click", ok && form.wait_for("double"), &reply);
     let (ok, reply) = dc(a, &["click", "4000,4000", "--real"]);
@@ -288,8 +325,11 @@ fn everything_on_a_real_desktop() {
     let before_outside = form.text().matches("down").count();
     let (ok, reply) = dc(a, &["draw", "60,250 4000,250"]);
     r.check("a stroke leaving the window is refused before it starts", !ok && reply.contains("refused") && form.text().matches("down").count() == before_outside, &reply);
-    let (ok, reply) = dc(a, &["drag", "60,250", "300,330"]);
-    r.check("drag walks the real mouse", ok && form.wait_for("moves="), &reply);
+    let lifted = form.text().matches("up Left").count();
+    let (same, reply) = unmoved(&["drag", "60,250", "300,330"]);
+    r.check("drag needs no mouse in a classic window", same && reply.starts_with("ok message") && form.text().matches("up Left").count() > lifted, &reply);
+    let (ok, reply) = dc(a, &["drag", "60,250", "300,330", "--mouse"]);
+    r.check("--mouse walks the real mouse", ok && reply.starts_with("ok mouse") && form.wait_for("moves="), &reply);
     let moves: u32 = form.text().lines().rev().find(|l| l.contains("moves=")).and_then(|l| l.split("moves=").nth(1)).and_then(|n| n.trim().parse().ok()).unwrap_or(0);
     r.check("through many points, not a jump", moves > 20, format!("{moves} moves"));
     let (ok, reply) = dc(a, &["draw", "60,250 200,300 300,250; 60,330 300,330", "--smooth"]);
@@ -298,8 +338,10 @@ fn everything_on_a_real_desktop() {
     r.check("--real types with the real keyboard", ok && form.wait_for("typed"), &reply);
     let (ok, reply) = dc(a, &["key", "ctrl+a", "--real"]);
     r.check("--real can press a shortcut", ok, &reply);
-    let (same, reply) = unmoved(&["click", "120,320", "--real"]);
-    r.check("real input puts the pointer and focus back", same, &reply);
+    let before = pointer_and_focus();
+    let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
+    thread::sleep(Duration::from_millis(100));
+    r.check("--mouse puts the pointer and focus back", ok && pointer_and_focus() == before, &reply);
 
     // The overlay.
     let windows = overlay_windows();
@@ -360,6 +402,17 @@ fn everything_on_a_real_desktop() {
     let _ = dc(a, &["resume"]);
     let (ok, reply) = dc(a, &["click", "Alpha"]);
     r.check("resume lets work go on", ok, &reply);
+
+    // A control that can only be clicked by the real mouse is refused, not clicked with it.
+    let _ = dc("Cursor", &["see", "-w", &second]);
+    let _ = dc("Cursor", &["shot", "-f"]);
+    let (ok, reply) = dc("Cursor", &["click", "100,300", "--right"]);
+    r.check("a right click opens a classic popup", ok && reply.contains("Popped"), &reply);
+    let synthetic = SYNTHETIC.load(Ordering::SeqCst);
+    let (ok, reply) = dc("Cursor", &["click", "Popped"]);
+    thread::sleep(Duration::from_millis(100));
+    r.check("the shield refuses a control that would take the mouse", !ok && reply.contains("--mouse"), &reply);
+    r.check("and the cursor was not touched", SYNTHETIC.load(Ordering::SeqCst) == synthetic, format!("{}", SYNTHETIC.load(Ordering::SeqCst) - synthetic));
 
     // Windows closing, and the service.
     form_c.close();

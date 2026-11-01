@@ -1,8 +1,9 @@
 // Acting on a control without touching the real mouse or keyboard: the app's own accessibility
 // actions first, then Windows messages for classic controls. Each result names the route taken.
-use crate::real::Chord;
+use crate::real::{self, Chord};
 use crate::uia::{Done, Element, Node, Uia};
 use crate::win::{self, Hwnd};
+use std::sync::atomic::AtomicBool;
 use windows_sys::Win32::{
     Foundation::{GetLastError, HWND},
     UI::{
@@ -16,6 +17,8 @@ use windows_sys::Win32::{
 };
 
 pub const NEEDS_REAL: &str = "no background way to do this here: add --real";
+pub const NEEDS_MOUSE: &str = "this control only answers the real mouse: add --mouse, which moves the person's cursor";
+pub const NO_PEN: &str = "Windows would not take pen input here: add --mouse, which moves the person's cursor";
 const WHEEL_DELTA: i32 = 120;
 const ACCESS_DENIED: u32 = 5;
 const MK_LBUTTON: usize = 1;
@@ -88,6 +91,33 @@ pub fn is_classic_row(node: &Node, root: Hwnd) -> bool {
     let (hwnd, _, _) = win::child_at(root, x, y);
     let class = win::class(hwnd).to_uppercase();
     node.parts.role == "item" && ["LISTBOX", "SYSLISTVIEW32", "SYSTREEVIEW32"].iter().any(|name| class.contains(name))
+}
+
+/// True for a point drawn by an engine of the app's own, where only pen input can reach.
+pub fn draws_at(root: Hwnd, x: i32, y: i32) -> bool {
+    win::draws_itself(win::child_at(root, x, y).0) || win::draws_itself(root)
+}
+
+pub fn post_command(root: Hwnd, id: usize) -> Result<String, String> {
+    post(root, WM_COMMAND, id & 0xFFFF, 0).map(|_| "command".to_string())
+}
+
+/// A whole press, drag and release as window messages, into the window under the first point.
+pub fn post_stroke(root: Hwnd, path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> Result<bool, String> {
+    let Some(first) = path.first() else { return Ok(true) };
+    let (hwnd, x, y) = win::child_at(root, first.0 as i32, first.1 as i32);
+    post(hwnd, WM_MOUSEMOVE, 0, win::lparam(x, y))?;
+    post(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, win::lparam(x, y))?;
+    let mut last = (x, y);
+    let finished = real::pace(path, stop, |at, x, y| {
+        last = win::to_client(hwnd, x, y);
+        let _ = post(hwnd, WM_MOUSEMOVE, MK_LBUTTON, win::lparam(last.0, last.1));
+        if at % 3 == 0 {
+            moved(x, y);
+        }
+    });
+    post(hwnd, WM_LBUTTONUP, 0, win::lparam(last.0, last.1))?;
+    Ok(finished)
 }
 
 /// A click as window messages, into the innermost window under the point.
