@@ -56,7 +56,25 @@ Measured on 2026-11-01 against agent-desktop 1.0.2, in characters an agent has t
 | Calculator | 37 | 9,350 | 689 | 175 ms | 25 ms |
 | File Explorer | 121 | 39,595 | 3,375 | 296 ms | 62 ms |
 
-For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 characters with agent-desktop, reading after each press, and 811 with deskcrew. The tool's help is 1,169 characters.
+For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 characters with agent-desktop, reading after each press, and 811 with deskcrew. The tool's help is 1,903 characters.
+
+## Compared with agent-desktop
+
+[agent-desktop](https://github.com/vercel-labs/agent-desktop) inspired this project and reaches further. The reading figures above were measured; the rest of its column comes from the agent-desktop 1.0.2 README.
+
+| | agent-desktop | deskcrew |
+| --- | --- | --- |
+| Platforms | macOS, Windows, Linux | Windows only |
+| Used from | command line, or a library called in process | command line and an agent skill |
+| Reading a window | 3,603 to 39,595 characters in the tests above | 260 to 3,375 characters, about 10 times less |
+| Drawn cursors | `cursor-overlay` | always on, one per agent, each with its own name and colour |
+| Clicks, typing, toggles, menus, scrolling, drag | yes | yes |
+| Holding a key or mouse button | listed, but refuses to run for now | `down` and `up`, released by itself after 30 s |
+| Clipboard, windows, launching apps | yes | yes |
+| Notifications | yes | `notifications`, which opens the panel and takes focus until `notifications close` |
+| System surfaces | `open-system-surface` | `launch` with a Windows link such as `ms-settings:` |
+
+Pick agent-desktop if you need macOS or Linux, or want it as a library. Pick deskcrew on Windows if you want several agents on screen for fewer tokens.
 
 ## How actions reach an app
 
@@ -95,6 +113,9 @@ The second one drives throwaway windows it opens itself, including a real mouse 
 ## Limits
 
 - Windows only. macOS and Linux are not written, and could not be tested on the machine this was built on.
+- `notifications`, `down`, `type --paste` and `--with` use the real keyboard or take focus, so they can interrupt what you are doing. A key held with `down` reaches whichever window has focus.
+- `expand` needs a control that offers it: a WinForms combo box does not, so use `select` there.
+- The newest commands, such as `hover`, `down`, `check`, `is` and `notifications`, were tested by hand on throwaway windows and are not in the 65-check suite yet.
 - Keyboard shortcuts need `--real`, because they have to go to the window in front. While a `--real` action runs, anything you type goes to that window.
 - Text boxes drawn by XAML take `set`, but `type` needs `--real`.
 - Browser and Electron windows need to be showing for the parallel route. A covered one drops window messages, so clicks and `type` fall back to accessibility, which can take focus for a moment, and `draw` is refused without `--real`. A covered browser also stops repainting, so `shot` can show an old picture of it.
