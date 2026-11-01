@@ -94,6 +94,24 @@ pub fn click(x: i32, y: i32, right: bool, double: bool) {
     }
 }
 
+pub fn press_times(x: i32, y: i32, middle: bool, times: u32) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP};
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    for _ in 0..times {
+        if middle {
+            send(&[mouse(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0)]);
+            thread::sleep(PRESS);
+            send(&[mouse(MOUSEEVENTF_MIDDLEUP, 0, 0, 0)]);
+        } else {
+            press(false, true);
+            thread::sleep(PRESS);
+            press(false, false);
+        }
+        thread::sleep(PRESS);
+    }
+}
+
 pub fn wheel(x: i32, y: i32, notches: i32) {
     move_to(x, y);
     thread::sleep(ARRIVE);
@@ -228,11 +246,16 @@ pub fn is_risky(spec: &str) -> bool {
 }
 
 pub fn press_chord(chord: &Chord) {
+    hold_chord(chord, PRESS);
+}
+
+/// Keep the keys down for this long, then let go in reverse order.
+pub fn hold_chord(chord: &Chord, hold: Duration) {
     let extended = |e: bool| if e { KEYEVENTF_EXTENDEDKEY } else { 0 };
     for (vk, e) in &chord.keys {
         send(&[key(*vk, 0, extended(*e))]);
     }
-    thread::sleep(PRESS);
+    thread::sleep(hold);
     for (vk, e) in chord.keys.iter().rev() {
         send(&[key(*vk, 0, extended(*e) | KEYEVENTF_KEYUP)]);
     }

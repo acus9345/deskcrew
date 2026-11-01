@@ -30,6 +30,7 @@ const SETTLE_LEAST: Duration = Duration::from_millis(150);
 const SETTLE_MOST: Duration = Duration::from_millis(800);
 const BETWEEN_STEPS: Duration = Duration::from_millis(40);
 const NAME_WAIT: Duration = Duration::from_millis(600);
+const HOLD_MOST_MS: u64 = 10_000;
 const FIELD_SETTLE: Duration = Duration::from_millis(60);
 const SHARED_PIECE: usize = 10;
 const SHARED_OVERLAP: usize = 4;
@@ -55,15 +56,16 @@ windows [filter]                      list windows
 see [window] [-f] [-a] [--find word] [--from N]
                                       controls; later reads show only changes (-f for all, -a off-screen too)
 get e3                                a control's full text
-shot [window|e3] [-f] [--screen] [--changed] [--edge N]
+shot [window|e3] [-f] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
                                       PNG path; "unchanged" if it matches the last one
-click e3 [e4 ...] | "Name" | x,y [--right] [--double]
-set e3 "value"     type [e3] "text"     key enter     select e3 "Item"
+click e3 [e4 ...] | "Name" | x,y [--right] [--double] [--triple] [--middle]
+hover e3 | x,y
+set e3 "value"     type [e3] "text"     key enter [--hold ms --real]     select e3 "Item"
 scroll [e3] up|down [n]     show e3     wait "text" [--gone] [--ms N]
 drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
 do "click e1; set e2 hi; key enter"   many steps, one reply
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
-clip     clip set "text"     status     resume     quit     setup (installs for your coding agents)
+screens     clip     clip set "text"     status     resume     quit     setup (installs for your coding agents)
 Every action replies with what changed. x,y are pixels in the last shot. Ctrl+Alt+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen; the person's cursor stays put),
@@ -170,6 +172,8 @@ struct Flags {
     all: bool,
     right: bool,
     double: bool,
+    triple: bool,
+    middle: bool,
     gone: bool,
     changed: bool,
     screen: bool,
@@ -180,6 +184,8 @@ struct Flags {
     from: usize,
     ms: Option<u64>,
     edge: Option<u32>,
+    hold: Option<u64>,
+    region: Option<String>,
 }
 
 fn parse(words: &[String]) -> (Flags, Vec<String>) {
@@ -204,6 +210,8 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                 "-a" | "--all" => flags.all = true,
                 "--right" => flags.right = true,
                 "--double" => flags.double = true,
+                "--triple" => flags.triple = true,
+                "--middle" => flags.middle = true,
                 "--gone" => flags.gone = true,
                 "--changed" => flags.changed = true,
                 "--screen" => flags.screen = true,
@@ -223,6 +231,14 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                 }
                 "--ms" => {
                     flags.ms = next.and_then(|n| n.parse().ok());
+                    took_next = true;
+                }
+                "--hold" => {
+                    flags.hold = next.and_then(|n| n.parse().ok());
+                    took_next = true;
+                }
+                "--region" => {
+                    flags.region = next;
                     took_next = true;
                 }
                 "--edge" => {
@@ -578,7 +594,7 @@ impl Service {
     }
 
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
-        let plain = !flags.right && !flags.double;
+        let plain = !flags.right && !flags.double && !flags.triple && !flags.middle;
         let (node, (x, y)) = match self.resolve(word, who, tracked, view)? {
             Target::Menu(entry) => return run_menu_entry(tracked.hwnd, &entry),
             Target::Point(x, y) => {
@@ -591,6 +607,18 @@ impl Service {
                 (Some(node), act::centre(rect))
             }
         };
+        if flags.triple || flags.middle {
+            let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
+            let post = || act::post_press(tracked.hwnd, x, y, flags.middle, times);
+            return match (flags.mouse, flags.real) {
+                (true, _) => self.with_front(tracked, view, &[(x, y)], true, || {
+                    real::press_times(x, y, flags.middle, times);
+                    Ok("mouse".to_string())
+                })?,
+                (_, true) => self.with_front(tracked, view, &[(x, y)], false, post)?,
+                _ => post(),
+            };
+        }
         if flags.real || flags.mouse {
             return self.with_front(tracked, view, &[(x, y)], flags.mouse, || press_at(tracked.hwnd, x, y, flags))?;
         }
@@ -622,6 +650,22 @@ impl Service {
             }
         }
         act::post_click(tracked.hwnd, x, y, flags.right, flags.double)
+    }
+
+    fn hover(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
+        let (x, y) = match self.resolve(word, who, tracked, view)? {
+            Target::Point(x, y) => (x, y),
+            Target::Control(id) => act::centre(self.locate(id, tracked, view)?.1),
+            Target::Menu(_) => return Err("hover needs a control or x,y".into()),
+        };
+        self.cursor_on(who, flags, (x, y, 0, 0));
+        if flags.mouse {
+            return self.with_front(tracked, view, &[(x, y)], true, || {
+                real::move_to(x, y);
+                Ok("mouse".to_string())
+            })?;
+        }
+        act::post_hover(tracked.hwnd, x, y)
     }
 
     fn set(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
@@ -708,6 +752,13 @@ impl Service {
             return Err(format!("{spec} is refused: it can end the session or open the shell (--force to allow)"));
         }
         let chord = real::chord(spec)?;
+        if let Some(ms) = flags.hold {
+            if !flags.real {
+                return Err("--hold needs --real: only the keyboard can keep a key down".into());
+            }
+            self.with_front(tracked, view, &[], false, || real::hold_chord(&chord, Duration::from_millis(ms.min(HOLD_MOST_MS))))?;
+            return Ok("keyboard".into());
+        }
         if flags.real || flags.mouse {
             self.with_front(tracked, view, &[], false, || real::press_chord(&chord))?;
             return Ok("keyboard".into());
@@ -938,6 +989,9 @@ impl Service {
             force: flags.force || own.force,
             right: flags.right || own.right,
             double: flags.double || own.double,
+            triple: flags.triple || own.triple,
+            middle: flags.middle || own.middle,
+            hold: own.hold.or(flags.hold),
             gone: flags.gone || own.gone,
             smooth: flags.smooth || own.smooth,
             ms: own.ms.or(flags.ms),
@@ -947,6 +1001,7 @@ impl Service {
         let rest = words.get(1..).unwrap_or(&[]);
         match (verb, rest) {
             ("click", [word]) => self.click(who, &flags, tracked, view, word),
+            ("hover", [word]) => self.hover(who, &flags, tracked, view, word),
             ("set", [word, value]) => self.set(who, &flags, tracked, view, word, value),
             ("type", _) => self.type_text(who, &flags, tracked, view, rest),
             ("key", [spec]) => self.key(&flags, tracked, view, spec),
@@ -1088,9 +1143,27 @@ impl Service {
 
     fn shot(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let edge = flags.edge.unwrap_or(shot::DEFAULT_EDGE);
+        if let Some(region) = &flags.region {
+            let parts: Vec<i32> = region.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+            let [x, y, w, h] = parts[..] else { return Err("--region x,y,w,h".into()) };
+            if w < 1 || h < 1 {
+                return Err("--region needs a width and height".into());
+            }
+            let (small, scale) = self.capture_screen(x, y, w, h)?.shrink(edge);
+            let path = shot::path_for(who, 0);
+            small.save(&path)?;
+            return Ok(format!("{} {}x{} scale {scale:.2}", path.display(), small.w, small.h));
+        }
         if flags.screen {
-            let (width, height) = crate::overlay::screen_size();
-            let frame = self.capture_screen(0, 0, width, height)?;
+            let (mut left, mut top, (mut width, mut height)) = (0, 0, crate::overlay::screen_size());
+            if flags.all {
+                let all = win::screens();
+                left = all.iter().map(|s| s.0).min().unwrap_or(0);
+                top = all.iter().map(|s| s.1).min().unwrap_or(0);
+                width = all.iter().map(|s| s.0 + s.2).max().unwrap_or(width) - left;
+                height = all.iter().map(|s| s.1 + s.3).max().unwrap_or(height) - top;
+            }
+            let frame = self.capture_screen(left, top, width, height)?;
             let (small, scale) = frame.shrink(edge);
             let path = shot::path_for(who, 0);
             small.save(&path)?;
@@ -1220,6 +1293,7 @@ impl Service {
                 [set, text] if set == "set" => apps::set_clipboard(text).map(|_| "ok".to_string()),
                 _ => Err("clip, or clip set \"text\"".into()),
             },
+            "screens" => Ok(win::screens().iter().enumerate().map(|(at, s)| format!("{at}: {},{} {}x{}{}", s.0, s.1, s.2, s.3, if s.4 { " primary" } else { "" })).collect::<Vec<_>>().join("\n")),
             "status" => self.status(),
             "resume" => {
                 self.stop.store(false, Ordering::Relaxed);
@@ -1234,7 +1308,7 @@ impl Service {
                 self.act(who, &flags, &steps)
             }
             "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => self.draw_together(who, &flags, args),
-            "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" => self.act(who, &flags, std::slice::from_ref(&rest)),
+            "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" => self.act(who, &flags, std::slice::from_ref(&rest)),
             "" | "help" => Ok(HELP.to_string()),
             _ => Err(format!("unknown command '{verb}': deskcrew help")),
         }

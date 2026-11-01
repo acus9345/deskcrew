@@ -11,7 +11,7 @@ use windows_sys::{
         Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT},
         Graphics::{
             Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
-            Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow, ScreenToClient},
+            Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, ScreenToClient},
         },
         System::Threading::{
             AttachThreadInput, GetCurrentThreadId, OpenProcess, PROCESS_NAME_WIN32, PROCESS_QUERY_LIMITED_INFORMATION,
@@ -238,6 +238,24 @@ pub fn belongs(hwnd: Hwnd, family: &[Hwnd]) -> bool {
     let owner = unsafe { GetWindow(raw(hwnd), GW_OWNER) } as Hwnd;
     let name = class(hwnd);
     family.contains(&owner) || name == "#32768" || name == "#32770" || name.contains("Popup") || name.contains("DropDown")
+}
+
+/// Every monitor as x, y, width, height, and whether it is the primary one.
+pub fn screens() -> Vec<(i32, i32, i32, i32, bool)> {
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> i32 {
+        unsafe {
+            let mut info: MONITORINFO = zeroed();
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) != 0 {
+                let r = info.rcMonitor;
+                (*(found as *mut Vec<(i32, i32, i32, i32, bool)>)).push((r.left, r.top, r.right - r.left, r.bottom - r.top, info.dwFlags & 1 != 0));
+            }
+        }
+        1
+    }
+    let mut found = Vec::new();
+    unsafe { EnumDisplayMonitors(null_mut(), std::ptr::null(), Some(each), &mut found as *mut _ as LPARAM) };
+    found
 }
 
 pub fn rect(hwnd: Hwnd) -> (i32, i32, i32, i32) {
