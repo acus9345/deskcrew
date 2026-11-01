@@ -341,7 +341,8 @@ fn everything_on_a_real_desktop() {
     let before = pointer_and_focus();
     let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
     thread::sleep(Duration::from_millis(100));
-    r.check("--mouse puts the pointer and focus back", ok && pointer_and_focus() == before, &reply);
+    let after = pointer_and_focus();
+    r.check("--mouse puts the pointer and focus back", ok && after == before, format!("{before:?} became {after:?}: {reply}"));
 
     // The overlay.
     let windows = overlay_windows();
