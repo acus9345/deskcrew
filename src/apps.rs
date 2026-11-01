@@ -25,6 +25,8 @@ use windows_sys::Win32::{
 const CF_UNICODETEXT: u32 = 13;
 const MAX_CLIPBOARD_CHARS: usize = 8000;
 const WINDOW_TIMEOUT: Duration = Duration::from_secs(6);
+const LAUNCH_WATCH: Duration = Duration::from_millis(20);
+const LAUNCH_SETTLE: Duration = Duration::from_millis(2500);
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -92,18 +94,35 @@ fn start(app: &str, args: &str) -> Result<(), String> {
     }
 }
 
-/// Start an app and return its first new window, if one appears in time.
-pub fn launch(app: &str, args: &str) -> Result<Option<Hwnd>, String> {
-    let before: HashSet<Hwnd> = win::list().into_iter().map(|w| w.hwnd).collect();
+/// Start an app and return its first new window, if one appears in time. Unless `front` is set,
+/// the person keeps their window: the new one goes behind it, however often it tries to come up.
+pub fn launch(app: &str, args: &str, front: bool) -> Result<Option<Hwnd>, String> {
+    let before: HashSet<Hwnd> = win::top_level().into_iter().collect();
+    let person = win::FocusGuard::take();
     start(app, args)?;
     let started = Instant::now();
+    let mut opened = None;
     while started.elapsed() < WINDOW_TIMEOUT {
-        thread::sleep(Duration::from_millis(100));
-        if let Some(new) = win::list().into_iter().find(|w| !before.contains(&w.hwnd)) {
-            return Ok(Some(new.hwnd));
+        thread::sleep(LAUNCH_WATCH);
+        if !front {
+            person.hold_against(&before);
+        }
+        opened = win::list().into_iter().find(|w| !before.contains(&w.hwnd)).map(|w| w.hwnd);
+        if opened.is_some() {
+            break;
         }
     }
-    Ok(None)
+    let Some(hwnd) = opened else { return Ok(None) };
+    if !front {
+        // Apps keep reaching for the front for a while after their window appears.
+        let appeared = Instant::now();
+        while appeared.elapsed() < LAUNCH_SETTLE {
+            person.hold_against(&before);
+            person.keep_behind(hwnd);
+            thread::sleep(LAUNCH_WATCH);
+        }
+    }
+    Ok(Some(hwnd))
 }
 
 fn open_clipboard() -> Result<(), String> {

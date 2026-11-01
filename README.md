@@ -97,6 +97,7 @@ The second one drives throwaway windows it opens itself, including a real mouse 
 - Right click by pen has only been tried through its code path, not confirmed in an app.
 - A drawn cursor floats above whatever covers its target window.
 - `launch` can reopen an app's saved session, so a new window is not always empty.
+- A launched window opens behind yours, and may show on top for an instant first. `launch --front` leaves it in front. Because it starts behind you, a browser opened this way is covered until you move something.
 - Tested on one monitor at 150% scaling. A second monitor has not been tried.
 - Apps running as administrator can be read but not driven, unless deskcrew also runs as administrator.
 - Pictures are saved in `%LOCALAPPDATA%\deskcrew\shots` and can show private content.

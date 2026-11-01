@@ -1,5 +1,6 @@
 // Top-level windows: finding them, naming them, and leaving focus where the person had it.
 use std::{
+    collections::HashSet,
     mem::zeroed,
     ptr::null_mut,
     thread,
@@ -20,10 +21,10 @@ use windows_sys::{
         UI::WindowsAndMessaging::{
             BringWindowToTop, ChildWindowFromPointEx, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, EnumChildWindows,
             EnumWindows, GUITHREADINFO, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
-            GA_ROOT, GW_OWNER, GetAncestor, GetDlgCtrlID, GetMenu, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
+            GA_ROOT, GW_HWNDPREV, GW_OWNER, GetAncestor, GetDlgCtrlID, GetMenu, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
             GetParent, GetSubMenu, GetWindow, GetWindowLongPtrW, HMENU, MF_BYPOSITION, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic,
-            IsWindow, IsWindowVisible, SW_RESTORE, SWP_NOACTIVATE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+            IsWindow, IsWindowVisible, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
             ShowWindow, SwitchToThisWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
         },
     },
@@ -106,7 +107,7 @@ fn children(hwnd: Hwnd) -> Vec<Hwnd> {
     list
 }
 
-fn top_level() -> Vec<Hwnd> {
+pub fn top_level() -> Vec<Hwnd> {
     let mut list: Vec<Hwnd> = Vec::new();
     unsafe { EnumWindows(Some(collect), &mut list as *mut _ as LPARAM) };
     list
@@ -383,6 +384,33 @@ impl FocusGuard {
         let front = foreground();
         let outer = unsafe { GetAncestor(raw(front), GA_ROOT) } as Hwnd;
         FocusGuard { front: if outer != 0 { outer } else { front } }
+    }
+
+    /// While an app starts: a window that did not exist before taking the front is that app, so
+    /// the person gets it back. Going to a window that already existed was their own doing.
+    pub fn hold_against(&self, existing: &HashSet<Hwnd>) {
+        let now = foreground();
+        let outer = unsafe { GetAncestor(raw(now), GA_ROOT) } as Hwnd;
+        if now != 0 && now != self.front && outer != self.front && !existing.contains(&now) && !existing.contains(&outer) && exists(self.front) {
+            bring_forward(self.front);
+        }
+    }
+
+    /// Put a window directly behind the person's, if it has landed in front of it.
+    pub fn keep_behind(&self, hwnd: Hwnd) {
+        if self.front == 0 || !exists(self.front) {
+            return;
+        }
+        unsafe {
+            let mut above = GetWindow(raw(self.front), GW_HWNDPREV);
+            while !above.is_null() {
+                if above as Hwnd == hwnd {
+                    SetWindowPos(raw(hwnd), raw(self.front), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+                    return;
+                }
+                above = GetWindow(above, GW_HWNDPREV);
+            }
+        }
     }
 
     /// True if focus had to be taken back. A switch to any other app was the person's, so it stays.

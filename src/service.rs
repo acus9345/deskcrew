@@ -1097,18 +1097,10 @@ impl Service {
         }
         let app = words.first().ok_or("launch needs an app")?;
         let args = words[1..].join(" ");
-        let focus = FocusGuard::take();
-        let opened = apps::launch(app, &args)?;
+        let opened = apps::launch(app, &args, flags.front)?;
         let Some(hwnd) = opened else { return Ok(format!("started {app}; no new window yet")) };
         let tracked = self.track(hwnd);
         self.set_current(who, hwnd);
-        if !flags.front {
-            let mut pids = vec![win::pid(hwnd), win::content_pid(hwnd)];
-            pids.dedup();
-            // New windows can take the front a moment after they appear.
-            thread::sleep(Duration::from_millis(250));
-            focus.restore(&pids);
-        }
         Ok(format!("opened w{} \"{}\"", tracked.id, lines::clip(&win::title(hwnd), 50)))
     }
 
