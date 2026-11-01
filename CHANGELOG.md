@@ -8,4 +8,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [0.1.1] - 2026-11-01
 
-- Add hover, triple and middle clicks, held keys, region and all-monitor shots, and a screens command. Keep a drawing cursor above always-on-top windows.
+- Add hover, triple, middle, back and forward clicks, modifier clicks, and held keys and mouse buttons.
+- Add check, uncheck, toggle, expand, collapse, clear and is.
+- Add region, all-monitor, marked and ruled shots, plus screens, apps, notifications and clip clear.
+- Add paste typing, --expect on any action, and --dry and --risk on do.
+- Keep a drawing cursor above always-on-top windows.

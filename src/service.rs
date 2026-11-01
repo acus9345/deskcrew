@@ -1,5 +1,6 @@
 // The background service. It keeps the cursors on screen between commands, remembers each
 // window's refs, and runs agents side by side: one queue per window, one for the real mouse.
+use crate::real::Button;
 use crate::{
     act::{self, NEEDS_REAL},
     apps,
@@ -31,6 +32,10 @@ const SETTLE_MOST: Duration = Duration::from_millis(800);
 const BETWEEN_STEPS: Duration = Duration::from_millis(40);
 const NAME_WAIT: Duration = Duration::from_millis(600);
 const HOLD_MOST_MS: u64 = 10_000;
+const MODIFIER_SETTLE: Duration = Duration::from_millis(80);
+const PASTE_SETTLE: Duration = Duration::from_millis(120);
+const NOTIFICATIONS_OPEN: Duration = Duration::from_secs(2);
+const NOTIFICATIONS_SETTLE: Duration = Duration::from_millis(500);
 const FIELD_SETTLE: Duration = Duration::from_millis(60);
 const SHARED_PIECE: usize = 10;
 const SHARED_OVERLAP: usize = 4;
@@ -56,16 +61,19 @@ windows [filter]                      list windows
 see [window] [-f] [-a] [--find word] [--from N]
                                       controls; later reads show only changes (-f for all, -a off-screen too)
 get e3                                a control's full text
-shot [window|e3] [-f] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
+shot [window|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
                                       PNG path; "unchanged" if it matches the last one
-click e3 [e4 ...] | "Name" | x,y [--right] [--double] [--triple] [--middle]
-hover e3 | x,y
-set e3 "value"     type [e3] "text"     key enter [--hold ms --real]     select e3 "Item"
+click e3 [e4 ...] | "Name" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift]
+hover e3 | x,y     check e3     uncheck e3     toggle e3     expand e3     collapse e3     clear e3
+is e3 on|off|open|closed|selected|enabled|disabled
+down shift --real | down left x,y --mouse     up (lets go; 30 s limit)
+set e3 "value"     type [e3] "text" [--paste]     key enter [--hold ms --real]     select e3 "Item"
 scroll [e3] up|down [n]     show e3     wait "text" [--gone] [--ms N]
 drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
-do "click e1; set e2 hi; key enter"   many steps, one reply
+do "click e1; set e2 hi; key enter" [--dry] [--risk low|medium|high]   many steps, one reply
+Any action: --expect "text" fails unless the text shows afterwards.
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
-screens     clip     clip set "text"     status     resume     quit     setup (installs for your coding agents)
+apps     screens     notifications [close]     clip     clip set "text"     clip clear     status     resume     quit     setup (installs for your coding agents)
 Every action replies with what changed. x,y are pixels in the last shot. Ctrl+Alt+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen; the person's cursor stays put),
@@ -174,6 +182,12 @@ struct Flags {
     double: bool,
     triple: bool,
     middle: bool,
+    back: bool,
+    forward: bool,
+    paste: bool,
+    dry: bool,
+    marks: bool,
+    rulers: bool,
     gone: bool,
     changed: bool,
     screen: bool,
@@ -186,6 +200,21 @@ struct Flags {
     edge: Option<u32>,
     hold: Option<u64>,
     region: Option<String>,
+    with: Option<String>,
+    expect: Option<String>,
+    risk: Option<String>,
+}
+
+impl Flags {
+    fn button(&self) -> Button {
+        match (self.middle, self.back, self.forward, self.right) {
+            (true, ..) => Button::Middle,
+            (_, true, ..) => Button::Back,
+            (_, _, true, _) => Button::Forward,
+            (.., true) => Button::Right,
+            _ => Button::Left,
+        }
+    }
 }
 
 fn parse(words: &[String]) -> (Flags, Vec<String>) {
@@ -212,6 +241,24 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                 "--double" => flags.double = true,
                 "--triple" => flags.triple = true,
                 "--middle" => flags.middle = true,
+                "--back" => flags.back = true,
+                "--forward" => flags.forward = true,
+                "--paste" => flags.paste = true,
+                "--dry" => flags.dry = true,
+                "--marks" => flags.marks = true,
+                "--rulers" => flags.rulers = true,
+                "--with" => {
+                    flags.with = next;
+                    took_next = true;
+                }
+                "--expect" => {
+                    flags.expect = next;
+                    took_next = true;
+                }
+                "--risk" => {
+                    flags.risk = next;
+                    took_next = true;
+                }
                 "--gone" => flags.gone = true,
                 "--changed" => flags.changed = true,
                 "--screen" => flags.screen = true,
@@ -251,6 +298,13 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
         at += if took_next { 2 } else { 1 };
     }
     (flags, rest)
+}
+
+/// The roles worth numbering on a picture: things an agent would act on.
+const MARKED: [&str; 11] = ["button", "edit", "menuitem", "checkbox", "radio", "combobox", "tab", "item", "link", "slider", "spinner"];
+
+fn expected(flags: &Flags) -> Option<Vec<String>> {
+    flags.expect.as_ref().map(|text| vec!["wait".to_string(), text.clone()])
 }
 
 enum Target {
@@ -594,7 +648,8 @@ impl Service {
     }
 
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
-        let plain = !flags.right && !flags.double && !flags.triple && !flags.middle;
+        let extra = flags.triple || flags.middle || flags.back || flags.forward;
+        let plain = !flags.right && !flags.double && !extra && flags.with.is_none();
         let (node, (x, y)) = match self.resolve(word, who, tracked, view)? {
             Target::Menu(entry) => return run_menu_entry(tracked.hwnd, &entry),
             Target::Point(x, y) => {
@@ -607,12 +662,33 @@ impl Service {
                 (Some(node), act::centre(rect))
             }
         };
-        if flags.triple || flags.middle {
+        if let Some(with) = &flags.with {
+            if !flags.real && !flags.mouse {
+                return Err("--with needs --real: only the real keyboard can hold a modifier".into());
+            }
+            let chord = real::chord(with)?;
             let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
-            let post = || act::post_press(tracked.hwnd, x, y, flags.middle, times);
+            return self.with_front(tracked, view, &[(x, y)], flags.mouse, || {
+                real::set_keys(&chord, true);
+                // Posted messages overtake real input, so the app has to see the modifier first.
+                thread::sleep(MODIFIER_SETTLE);
+                let result = if flags.mouse {
+                    real::press_times(x, y, flags.button(), times);
+                    Ok("mouse".to_string())
+                } else {
+                    act::post_press(tracked.hwnd, x, y, flags.button(), times)
+                };
+                thread::sleep(MODIFIER_SETTLE);
+                real::set_keys(&chord, false);
+                result
+            })?;
+        }
+        if extra {
+            let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
+            let post = || act::post_press(tracked.hwnd, x, y, flags.button(), times);
             return match (flags.mouse, flags.real) {
                 (true, _) => self.with_front(tracked, view, &[(x, y)], true, || {
-                    real::press_times(x, y, flags.middle, times);
+                    real::press_times(x, y, flags.button(), times);
                     Ok("mouse".to_string())
                 })?,
                 (_, true) => self.with_front(tracked, view, &[(x, y)], false, post)?,
@@ -650,6 +726,136 @@ impl Service {
             }
         }
         act::post_click(tracked.hwnd, x, y, flags.right, flags.double)
+    }
+
+    /// Check, uncheck, expand or collapse, leaving a control that is already that way alone.
+    fn ensure(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, (wanted, opposite): (&str, &str)) -> Reply {
+        let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("that needs a control".into()) };
+        self.read(tracked, view, false)?;
+        let states = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?.parts.states.clone();
+        if states.contains(&wanted) {
+            return Ok(format!("already {wanted}"));
+        }
+        if !states.contains(&opposite) {
+            return Err(format!("that control cannot be {wanted}"));
+        }
+        if matches!(wanted, "open" | "closed") {
+            let (node, rect) = self.locate(id, tracked, view)?;
+            self.cursor_on(who, flags, rect);
+            return node.element.open_or_close().map(|_| "expand".to_string());
+        }
+        self.click(who, flags, tracked, view, word)
+    }
+
+    /// Text put in through the clipboard, which is faster for a lot of it. The clipboard is put back.
+    fn paste(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+        let (target, text) = match words {
+            [text] => (None, text),
+            [target, text] => (Some(target), text),
+            _ => return Err("type [control] \"text\" --paste".into()),
+        };
+        if let Some(target) = target {
+            self.click(who, flags, tracked, view, target)?;
+        }
+        let saved = apps::clipboard_text()?;
+        apps::set_clipboard(text)?;
+        let chord = real::chord("ctrl+v")?;
+        self.with_front(tracked, view, &[], false, || {
+            real::press_chord(&chord);
+            thread::sleep(PASTE_SETTLE);
+        })?;
+        if saved != apps::NO_CLIPBOARD_TEXT {
+            apps::set_clipboard(&saved)?;
+        }
+        Ok("paste".into())
+    }
+
+    fn press_down(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+        let what = words.first().ok_or("down shift --real, or down left x,y --mouse")?;
+        if let Some(button) = Button::named(what) {
+            if !flags.mouse {
+                return Err("holding a mouse button needs --mouse, which moves the person's cursor".into());
+            }
+            let word = words.get(1).ok_or("down left x,y --mouse")?;
+            let (x, y) = match self.resolve(word, who, tracked, view)? {
+                Target::Point(x, y) => (x, y),
+                Target::Control(id) => act::centre(self.locate(id, tracked, view)?.1),
+                Target::Menu(_) => return Err("that needs a control or x,y".into()),
+            };
+            self.cursor_on(who, flags, (x, y, 0, 0));
+            // Handing focus back would end the press, so the window keeps it until up.
+            if !win::inside(tracked.hwnd, x, y) {
+                return Err("refused: that point is not on the window".into());
+            }
+            win::bring_forward(tracked.hwnd);
+            real::hold_button(x, y, button);
+            return Ok("held: run up within 30 s".into());
+        }
+        if !flags.real {
+            return Err("holding a key needs --real".into());
+        }
+        let chord = real::chord(what)?;
+        self.with_front(tracked, view, &[], false, || real::hold_keys(&chord))?;
+        Ok("held, and it reaches whatever has focus: run up within 30 s".into())
+    }
+
+    /// What a do script would touch, without touching it.
+    fn dry_run(&self, tracked: &Tracked, view: &View, steps: &[Vec<String>]) -> String {
+        let name = |word: &str| is_ref(word).and_then(|id| view.nodes.get(&id)).map(|node| lines::line(&node.parts));
+        steps
+            .iter()
+            .enumerate()
+            .map(|(at, step)| {
+                let (_, words) = parse(step);
+                let named: Vec<String> = words.iter().map(|word| name(word).map_or(word.clone(), |line| format!("{word} ({line})"))).collect();
+                format!("{}. {}", at + 1, named.join(" "))
+            })
+            .chain(Some(format!("nothing done in w{}", tracked.id)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Open the notification panel and list it: it is a window of its own, so its refs work as usual.
+    fn notifications(&self, who: &str, words: &[String]) -> Reply {
+        let chord = real::chord("win+n")?;
+        if words.first().is_some_and(|word| word == "close") {
+            real::press_chord(&chord);
+            self.home.lock().unwrap().on_loan = false;
+            return Ok("ok".into());
+        }
+        // The panel closes the moment it loses focus, so the focus keeper stands aside until close.
+        self.home.lock().unwrap().on_loan = true;
+        let before = win::foreground();
+        real::press_chord(&chord);
+        let until = Instant::now() + NOTIFICATIONS_OPEN;
+        while win::foreground() == before && Instant::now() < until {
+            thread::sleep(FIELD_SETTLE);
+        }
+        let front = win::foreground();
+        if front == before {
+            self.home.lock().unwrap().on_loan = false;
+            return Err("the notification panel did not open".into());
+        }
+        thread::sleep(NOTIFICATIONS_SETTLE);
+        let tracked = self.track(front);
+        self.set_current(who, front);
+        let mut view = tracked.view.lock().unwrap();
+        self.first_read(&tracked, &mut view, false)?;
+        Ok(view.nodes.iter().map(|(id, node)| format!("e{id} {}", lines::line(&node.parts))).collect::<Vec<_>>().join("\n"))
+    }
+
+    fn is(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
+        let [word, state] = words else { return Err("is e3 on|off|open|closed|selected|enabled|disabled".into()) };
+        let tracked = self.pick(who, flags.window.as_deref())?;
+        let mut view = tracked.view.lock().unwrap();
+        self.first_read(&tracked, &mut view, false)?;
+        let Target::Control(id) = self.resolve(word, who, &tracked, &mut view)? else { return Err("is needs a control".into()) };
+        let states = &view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?.parts.states;
+        let yes = match state.as_str() {
+            "enabled" => !states.contains(&"disabled"),
+            other => states.contains(&other),
+        };
+        Ok(if yes { "yes" } else { "no" }.into())
     }
 
     fn hover(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
@@ -991,6 +1197,10 @@ impl Service {
             double: flags.double || own.double,
             triple: flags.triple || own.triple,
             middle: flags.middle || own.middle,
+            back: flags.back || own.back,
+            forward: flags.forward || own.forward,
+            paste: flags.paste || own.paste,
+            with: own.with.or(flags.with.clone()),
             hold: own.hold.or(flags.hold),
             gone: flags.gone || own.gone,
             smooth: flags.smooth || own.smooth,
@@ -1003,7 +1213,15 @@ impl Service {
             ("click", [word]) => self.click(who, &flags, tracked, view, word),
             ("hover", [word]) => self.hover(who, &flags, tracked, view, word),
             ("set", [word, value]) => self.set(who, &flags, tracked, view, word, value),
+            ("type", _) if flags.paste => self.paste(who, &flags, tracked, view, rest),
             ("type", _) => self.type_text(who, &flags, tracked, view, rest),
+            ("clear", [word]) => self.set(who, &flags, tracked, view, word, ""),
+            ("toggle", [word]) => self.click(who, &flags, tracked, view, word),
+            ("check", [word]) => self.ensure(who, &flags, tracked, view, word, ("on", "off")),
+            ("uncheck", [word]) => self.ensure(who, &flags, tracked, view, word, ("off", "on")),
+            ("expand", [word]) => self.ensure(who, &flags, tracked, view, word, ("open", "closed")),
+            ("collapse", [word]) => self.ensure(who, &flags, tracked, view, word, ("closed", "open")),
+            ("down", _) => self.press_down(who, &flags, tracked, view, rest),
             ("key", [spec]) => self.key(&flags, tracked, view, spec),
             ("select", [word, item]) => self.select(who, &flags, tracked, view, word, item),
             ("scroll", _) => self.scroll(who, &flags, tracked, view, rest),
@@ -1201,7 +1419,7 @@ impl Service {
         let mut agents = self.agents.lock().unwrap();
         let state = agents.entry(who.to_string()).or_default();
         let last = state.shots.get(&tracked.hwnd);
-        if control.is_none() && !flags.full && last.is_some_and(|l| l.hash == hash) {
+        if control.is_none() && !flags.full && !flags.marks && !flags.rulers && last.is_some_and(|l| l.hash == hash) {
             return Ok("unchanged".into());
         }
         let mut crop = None;
@@ -1215,7 +1433,18 @@ impl Service {
             }
             None => frame.crop(0, 0, frame.w, frame.h),
         };
-        let (small, scale) = picture.shrink(edge);
+        let (mut small, scale) = picture.shrink(edge);
+        if flags.marks {
+            let to_image = |value: i32, from: i32| ((value - from) as f32 / (scale * units)) as i32;
+            let view = tracked.view.lock().unwrap();
+            for (id, node) in view.nodes.iter().filter(|(_, node)| MARKED.contains(&node.parts.role.as_str())) {
+                let (x, y, w, h) = node.rect;
+                small.mark(to_image(x, origin.0), to_image(y, origin.1), ((w as f32) / (scale * units)) as i32, ((h as f32) / (scale * units)) as i32, *id);
+            }
+        }
+        if flags.rulers {
+            small.rulers();
+        }
         let path = shot::path_for(who, tracked.id);
         small.save(&path)?;
         let frames = Frames { x: origin.0, y: origin.1, scale: scale * units };
@@ -1291,8 +1520,19 @@ impl Service {
             "clip" => match args {
                 [] => apps::clipboard_text(),
                 [set, text] if set == "set" => apps::set_clipboard(text).map(|_| "ok".to_string()),
-                _ => Err("clip, or clip set \"text\"".into()),
+                [clear] if clear == "clear" => apps::set_clipboard("").map(|_| "ok".to_string()),
+                _ => Err("clip, clip set \"text\", or clip clear".into()),
             },
+            "is" => self.is(who, &flags, args),
+            "up" => Ok(format!("let go of {}", real::release_all())),
+            "notifications" => self.notifications(who, args),
+            "apps" => {
+                let list = self.windows_list(who, None)?;
+                let mut names: Vec<&str> = list.lines().filter_map(|line| line.rsplit_once("\" ").map(|(_, name)| name.trim())).collect();
+                names.sort_unstable();
+                names.dedup();
+                Ok(names.join("\n"))
+            }
             "screens" => Ok(win::screens().iter().enumerate().map(|(at, s)| format!("{at}: {},{} {}x{}{}", s.0, s.1, s.2, s.3, if s.4 { " primary" } else { "" })).collect::<Vec<_>>().join("\n")),
             "status" => self.status(),
             "resume" => {
@@ -1301,14 +1541,32 @@ impl Service {
             }
             "do" => {
                 let script = args.first().ok_or("do \"click e1; key enter\"")?;
-                self.act(who, &flags, &lines::split_steps(script))
+                let mut steps = lines::split_steps(script);
+                if flags.dry {
+                    let tracked = self.pick(who, flags.window.as_deref())?;
+                    let mut view = tracked.view.lock().unwrap();
+                    if !view.read_once {
+                        self.first_read(&tracked, &mut view, false)?;
+                    }
+                    return Ok(self.dry_run(&tracked, &view, &steps));
+                }
+                if matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
+                    return Err("declared risky: ask the person, then add --force".into());
+                }
+                steps.extend(expected(&flags));
+                self.act(who, &flags, &steps)
             }
             "click" if !args.is_empty() => {
-                let steps: Vec<Vec<String>> = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
+                let mut steps: Vec<Vec<String>> = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
+                steps.extend(expected(&flags));
                 self.act(who, &flags, &steps)
             }
             "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => self.draw_together(who, &flags, args),
-            "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" => self.act(who, &flags, std::slice::from_ref(&rest)),
+            "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" => {
+                let mut steps = vec![rest.clone()];
+                steps.extend(expected(&flags));
+                self.act(who, &flags, &steps)
+            }
             "" | "help" => Ok(HELP.to_string()),
             _ => Err(format!("unknown command '{verb}': deskcrew help")),
         }

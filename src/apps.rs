@@ -139,10 +139,12 @@ fn open_clipboard() -> Result<(), String> {
     Err("another program is holding the clipboard".into())
 }
 
+pub const NO_CLIPBOARD_TEXT: &str = "(no text on the clipboard)";
+
 pub fn clipboard_text() -> Result<String, String> {
     unsafe {
         if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
-            return Ok("(no text on the clipboard)".into());
+            return Ok(NO_CLIPBOARD_TEXT.into());
         }
         open_clipboard()?;
         let data = GetClipboardData(CF_UNICODETEXT);

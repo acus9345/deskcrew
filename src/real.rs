@@ -3,7 +3,10 @@
 use crate::win::{self, Hwnd};
 use std::{
     mem::zeroed,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+    },
     thread,
     time::{Duration, Instant},
 };
@@ -26,6 +29,7 @@ use windows_sys::Win32::{
 /// Canvases sample the pointer on their own clock, so a press has to last and arrive after the move.
 const ARRIVE: Duration = Duration::from_millis(25);
 const PRESS: Duration = Duration::from_millis(40);
+const HOLD_LIMIT: Duration = Duration::from_secs(30);
 const KEY_GAP: Duration = Duration::from_millis(6);
 /// A window just brought forward drops the first press if it comes too soon.
 const FOCUS_SETTLE: Duration = Duration::from_millis(350);
@@ -94,22 +98,93 @@ pub fn click(x: i32, y: i32, right: bool, double: bool) {
     }
 }
 
-pub fn press_times(x: i32, y: i32, middle: bool, times: u32) {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP};
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Button {
+    Left,
+    Right,
+    Middle,
+    Back,
+    Forward,
+}
+
+impl Button {
+    pub fn named(word: &str) -> Option<Button> {
+        match word {
+            "left" => Some(Button::Left),
+            "right" => Some(Button::Right),
+            "middle" => Some(Button::Middle),
+            "back" => Some(Button::Back),
+            "forward" => Some(Button::Forward),
+            _ => None,
+        }
+    }
+}
+
+fn press_button(button: Button, down: bool) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{MOUSEEVENTF_MIDDLEDOWN, MOUSEEVENTF_MIDDLEUP, MOUSEEVENTF_XDOWN, MOUSEEVENTF_XUP};
+    let extra = if down { MOUSEEVENTF_XDOWN } else { MOUSEEVENTF_XUP };
+    match button {
+        Button::Left => press(false, down),
+        Button::Right => press(true, down),
+        Button::Middle => send(&[mouse(if down { MOUSEEVENTF_MIDDLEDOWN } else { MOUSEEVENTF_MIDDLEUP }, 0, 0, 0)]),
+        Button::Back => send(&[mouse(extra, 0, 0, 1)]),
+        Button::Forward => send(&[mouse(extra, 0, 0, 2)]),
+    }
+}
+
+pub fn press_times(x: i32, y: i32, button: Button, times: u32) {
     move_to(x, y);
     thread::sleep(ARRIVE);
     for _ in 0..times {
-        if middle {
-            send(&[mouse(MOUSEEVENTF_MIDDLEDOWN, 0, 0, 0)]);
-            thread::sleep(PRESS);
-            send(&[mouse(MOUSEEVENTF_MIDDLEUP, 0, 0, 0)]);
-        } else {
-            press(false, true);
-            thread::sleep(PRESS);
-            press(false, false);
-        }
+        press_button(button, true);
+        thread::sleep(PRESS);
+        press_button(button, false);
         thread::sleep(PRESS);
     }
+}
+
+#[derive(Clone)]
+enum Held {
+    Keys(Vec<(VIRTUAL_KEY, bool)>),
+    Mouse(Button),
+}
+
+static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+static HOLDS: AtomicU64 = AtomicU64::new(0);
+
+fn hold(held: Held) {
+    HELD.lock().unwrap().push(held);
+    let this = HOLDS.fetch_add(1, Ordering::Relaxed) + 1;
+    thread::spawn(move || {
+        thread::sleep(HOLD_LIMIT);
+        if HOLDS.load(Ordering::Relaxed) == this {
+            release_all();
+        }
+    });
+}
+
+/// Keys stay down across commands, so they let go by themselves if the agent forgets.
+pub fn hold_keys(chord: &Chord) {
+    set_keys(chord, true);
+    hold(Held::Keys(chord.keys.clone()));
+}
+
+pub fn hold_button(x: i32, y: i32, button: Button) {
+    move_to(x, y);
+    thread::sleep(ARRIVE);
+    press_button(button, true);
+    hold(Held::Mouse(button));
+}
+
+pub fn release_all() -> usize {
+    let held: Vec<Held> = HELD.lock().unwrap().drain(..).collect();
+    for item in held.iter().rev() {
+        match item {
+            Held::Keys(keys) => set_keys(&Chord { keys: keys.clone(), modified: false }, false),
+            Held::Mouse(button) => press_button(*button, false),
+        }
+    }
+    held.len()
 }
 
 pub fn wheel(x: i32, y: i32, notches: i32) {
@@ -249,16 +324,24 @@ pub fn press_chord(chord: &Chord) {
     hold_chord(chord, PRESS);
 }
 
+pub fn set_keys(chord: &Chord, down: bool) {
+    let extended = |e: bool| if e { KEYEVENTF_EXTENDEDKEY } else { 0 };
+    if down {
+        for (vk, e) in &chord.keys {
+            send(&[key(*vk, 0, extended(*e))]);
+        }
+    } else {
+        for (vk, e) in chord.keys.iter().rev() {
+            send(&[key(*vk, 0, extended(*e) | KEYEVENTF_KEYUP)]);
+        }
+    }
+}
+
 /// Keep the keys down for this long, then let go in reverse order.
 pub fn hold_chord(chord: &Chord, hold: Duration) {
-    let extended = |e: bool| if e { KEYEVENTF_EXTENDEDKEY } else { 0 };
-    for (vk, e) in &chord.keys {
-        send(&[key(*vk, 0, extended(*e))]);
-    }
+    set_keys(chord, true);
     thread::sleep(hold);
-    for (vk, e) in chord.keys.iter().rev() {
-        send(&[key(*vk, 0, extended(*e) | KEYEVENTF_KEYUP)]);
-    }
+    set_keys(chord, false);
 }
 
 pub fn type_text(text: &str) {

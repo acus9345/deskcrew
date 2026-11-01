@@ -1,6 +1,6 @@
 // Acting on a control without touching the real mouse or keyboard: the app's own accessibility
 // actions first, then Windows messages for classic controls. Each result names the route taken.
-use crate::real::{self, Chord};
+use crate::real::{self, Button, Chord};
 use crate::uia::{Done, Element, Node, Uia};
 use crate::win::{self, Hwnd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -145,20 +145,27 @@ pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Resu
 }
 
 /// A middle click or a triple click, which have no accessibility equivalent.
-pub fn post_press(root: Hwnd, x: i32, y: i32, middle: bool, times: u32) -> Result<String, String> {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP};
+pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32) -> Result<String, String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP};
     const MK_MBUTTON: usize = 0x10;
+    const MK_XBUTTON1: usize = 0x20;
+    const MK_XBUTTON2: usize = 0x40;
     let (hwnd, cx, cy) = win::child_at(root, x, y);
     if win::draws_itself(hwnd) || win::draws_itself(root) {
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);
-    let (down, up, again, held) =
-        if middle { (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, MK_MBUTTON) } else { (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON) };
+    let (down, up, again, held, which) = match button {
+        Button::Left => (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON, 0),
+        Button::Right => (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON, 0),
+        Button::Middle => (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, MK_MBUTTON, 0),
+        Button::Back => (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK, MK_XBUTTON1, 1usize << 16),
+        Button::Forward => (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK, MK_XBUTTON2, 2usize << 16),
+    };
     post(hwnd, WM_MOUSEMOVE, 0, at)?;
     for time in 0..times {
-        post(hwnd, if time == 1 { again } else { down }, held, at)?;
-        post(hwnd, up, 0, at)?;
+        post(hwnd, if time == 1 { again } else { down }, held | which, at)?;
+        post(hwnd, up, which, at)?;
     }
     Ok("message".into())
 }

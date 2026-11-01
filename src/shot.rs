@@ -12,6 +12,24 @@ use windows_sys::Win32::{
 
 const PW_RENDERFULLCONTENT: u32 = 2;
 pub const DEFAULT_EDGE: u32 = 1356;
+// Blue, green, red, as the pixels are stored.
+const MARK: [u8; 3] = [0, 0, 220];
+const RULER: [u8; 3] = [200, 90, 0];
+const DIGIT_W: i32 = 3;
+const DIGIT_H: i32 = 5;
+const DIGIT_SIZE: i32 = 2;
+const DIGITS: [[u8; 5]; 10] = [
+    [7, 5, 5, 5, 7],
+    [2, 6, 2, 2, 7],
+    [7, 1, 7, 4, 7],
+    [7, 1, 7, 1, 7],
+    [5, 5, 7, 1, 1],
+    [7, 4, 7, 1, 7],
+    [7, 4, 7, 5, 7],
+    [7, 1, 1, 1, 1],
+    [7, 5, 7, 5, 7],
+    [7, 5, 7, 1, 7],
+];
 
 /// Blue-green-red-alpha pixels, top row first.
 pub struct Frame {
@@ -157,6 +175,65 @@ impl Frame {
         (Frame { w, h, pixels }, scale)
     }
 
+    fn dot(&mut self, x: i32, y: i32, colour: [u8; 3]) {
+        if x >= 0 && y >= 0 && (x as u32) < self.w && (y as u32) < self.h {
+            let at = ((y as u32 * self.w + x as u32) * 4) as usize;
+            self.pixels[at..at + 3].copy_from_slice(&colour);
+        }
+    }
+
+    fn block(&mut self, x: i32, y: i32, w: i32, h: i32, colour: [u8; 3]) {
+        for dy in 0..h {
+            for dx in 0..w {
+                self.dot(x + dx, y + dy, colour);
+            }
+        }
+    }
+
+    /// A box around a control, numbered with its ref.
+    pub fn mark(&mut self, x: i32, y: i32, w: i32, h: i32, number: u32) {
+        for line in 0..2 {
+            self.block(x, y + line, w, 1, MARK);
+            self.block(x, y + h - 1 - line, w, 1, MARK);
+            self.block(x + line, y, 1, h, MARK);
+            self.block(x + w - 1 - line, y, 1, h, MARK);
+        }
+        self.number(x + 2, y + 2, number, MARK);
+    }
+
+    /// Digits on a white tag, big enough to survive being looked at by a model.
+    fn number(&mut self, x: i32, y: i32, value: u32, colour: [u8; 3]) {
+        let text = value.to_string();
+        self.block(x, y, text.len() as i32 * (DIGIT_W + 1) * DIGIT_SIZE + 3, DIGIT_H * DIGIT_SIZE + 4, [255, 255, 255]);
+        for (at, digit) in text.bytes().enumerate() {
+            let rows = DIGITS[(digit - b'0') as usize];
+            for (row, bits) in rows.iter().enumerate() {
+                for column in 0..DIGIT_W {
+                    if bits & (1 << (DIGIT_W - 1 - column)) != 0 {
+                        let left = x + 2 + at as i32 * (DIGIT_W + 1) * DIGIT_SIZE + column * DIGIT_SIZE;
+                        self.block(left, y + 2 + row as i32 * DIGIT_SIZE, DIGIT_SIZE, DIGIT_SIZE, colour);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Lines every 100 image pixels, labelled in the x,y a click on this picture takes.
+    pub fn rulers(&mut self) {
+        for x in (100..self.w as i32).step_by(100) {
+            for y in (0..self.h as i32).step_by(2) {
+                self.dot(x, y, RULER);
+            }
+            self.number(x + 2, 1, x as u32, RULER);
+        }
+        for y in (100..self.h as i32).step_by(100) {
+            for x in (0..self.w as i32).step_by(2) {
+                self.dot(x, y, RULER);
+            }
+            self.number(1, y + 2, y as u32, RULER);
+        }
+    }
+
     /// A cheap fingerprint, to tell an unchanged picture without sending it again.
     pub fn hash(&self) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325_u64 ^ ((self.w as u64) << 32 | self.h as u64);
@@ -250,6 +327,16 @@ mod tests {
         after.pixels[at] = 255;
         assert_eq!(after.changed_from(&before), Some((4, 3, 1, 1)));
         assert_ne!(after.hash(), before.hash());
+    }
+
+    #[test]
+    fn marks_and_rulers_draw_inside_the_picture() {
+        let mut picture = solid(250, 150, 0);
+        picture.mark(10, 10, 60, 40, 12);
+        picture.mark(240, 140, 60, 40, 3);
+        picture.rulers();
+        assert!(!picture.is_blank());
+        assert_eq!(picture.pixels.len(), 250 * 150 * 4);
     }
 
     #[test]
