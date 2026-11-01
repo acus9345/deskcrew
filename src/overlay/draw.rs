@@ -53,9 +53,9 @@ fn arrow(x: f32, y: f32, s: f32) -> Option<Path> {
         (from.0 + (to.0 - from.0) * distance / length, from.1 + (to.1 - from.1) * distance / length)
     };
     let mut p = PathBuilder::new();
-    for i in 0..4 {
+    for (i, rounding) in ARROW_ROUNDING.iter().enumerate() {
         let at = corner(i);
-        let rounding = ARROW_ROUNDING[i] * s;
+        let rounding = rounding * s;
         let (enter, leave) = (toward(at, corner(i + 3), rounding), toward(at, corner(i + 1), rounding));
         if i == 0 {
             p.move_to(enter.0, enter.1);
@@ -71,7 +71,7 @@ fn arrow(x: f32, y: f32, s: f32) -> Option<Path> {
 /// Spread the canvas's coverage out into a soft shadow, three box blurs being close to a true blur.
 fn soften(canvas: &mut Pixmap, radius: usize, opacity: f32) {
     let (w, h) = (canvas.width() as usize, canvas.height() as usize);
-    let mut alpha: Vec<u32> = canvas.data().chunks_exact(4).map(|p| p[3] as u32).collect();
+    let mut alpha: Vec<u32> = canvas.data().as_chunks::<4>().0.iter().map(|p| p[3] as u32).collect();
     let mut next = vec![0u32; alpha.len()];
     let span = (radius * 2 + 1) as u32;
     for _ in 0..3 {
@@ -90,7 +90,7 @@ fn soften(canvas: &mut Pixmap, radius: usize, opacity: f32) {
             std::mem::swap(&mut alpha, &mut next);
         }
     }
-    for (pixel, value) in canvas.data_mut().chunks_exact_mut(4).zip(alpha) {
+    for (pixel, value) in canvas.data_mut().as_chunks_mut::<4>().0.iter_mut().zip(alpha) {
         pixel[..3].fill(0);
         pixel[3] = (value as f32 * opacity) as u8;
     }
@@ -198,7 +198,7 @@ mod tests {
         assert_eq!(pixel(&canvas, 26, 30), (255, 165, 31, 255));
         let rim = (0..canvas.width()).map(|x| pixel(&canvas, x, 27)).find(|(_, _, _, a)| *a > 200);
         assert!(rim.is_some_and(|(r, _, _, _)| r < 90), "rim {rim:?}");
-        let (_, _, _, shadow) = pixel(&canvas, 22, 62);
+        let (_, _, _, shadow) = pixel(&canvas, 60, 78);
         assert!(shadow > 5 && shadow < 120, "shadow {shadow}");
     }
 
