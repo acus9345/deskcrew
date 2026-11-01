@@ -12,7 +12,7 @@ Run `deskcrew help` once for the commands. Windows only.
 - If you know the control's name, skip the read: `deskcrew click "Save" -w notepad`.
 - Batch steps: `deskcrew click e1 e2 e3`, or `deskcrew do "click e1; set e2 'hi'; key enter"`. Open a menu and pick from it in one command: `deskcrew click File Save`.
 - Pictures only when text is not enough: `deskcrew shot` prints a PNG path to open. `unchanged` means you already have it. `click x,y` uses pixels in the last shot.
-- Name yourself once per session, so parallel agents get separate cursors: `--agent name` or `DESKCREW_AGENT`.
+- Each coding agent is recognised and gets its own name and colour. Copies of one agent working in parallel need separate names for separate cursors: `--agent "Claude 2"` or `DESKCREW_AGENT`.
 
 Background first. A failure saying `add --real` means the action needs the window in front: `--real` borrows the person's focus briefly, and uses the keyboard or a pen, so their cursor stays put. `drag` and `draw` pick the quietest way themselves. Agents take turns on `--real`, and it is refused if a point is not on the target window.
 

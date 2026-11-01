@@ -34,24 +34,51 @@ pub fn along(from: Point, middle: Point, to: Point, t: f32) -> Point {
 
 pub type Rgb = (u8, u8, u8);
 
-const PALETTE: [Rgb; 6] = [
+const PALETTE: [Rgb; 14] = [
     (255, 165, 31),
     (240, 48, 110),
     (21, 101, 240),
     (45, 190, 96),
     (138, 92, 246),
     (20, 184, 196),
+    (132, 204, 22),
+    (217, 70, 239),
+    (220, 38, 38),
+    (56, 189, 248),
+    (250, 204, 21),
+    (161, 98, 60),
+    (148, 163, 184),
+    (67, 56, 202),
+];
+
+/// Each coding agent's own place in the palette, by the first word of its name, so
+/// "Claude Code" and "Claude" match and a second "Claude 2" starts from the same colour.
+const AGENT_COLOURS: [(&str, usize); 16] = [
+    ("claude", 0),
+    ("cursor", 1),
+    ("gemini", 2),
+    ("fx", 2),
+    ("codex", 3),
+    ("copilot", 4),
+    ("github", 4),
+    ("windsurf", 5),
+    ("aider", 6),
+    ("amp", 7),
+    ("roo", 8),
+    ("continue", 9),
+    ("cline", 10),
+    ("goose", 11),
+    ("opencode", 12),
+    ("kiro", 13),
 ];
 
 /// A colour from the agent's name, so it keeps its colour between runs, skipping
 /// colours already on screen so two agents never look alike.
 pub fn colour_for(name: &str, taken: &[Rgb]) -> Rgb {
-    let start = match name.to_lowercase().as_str() {
-        "claude code" | "claude" => 0,
-        "cursor" => 1,
-        "fx" => 2,
-        _ => name.bytes().fold(0x811C_9DC5_u32, |hash, byte| (hash ^ byte as u32).wrapping_mul(0x0100_0193)) as usize,
-    };
+    let lower = name.to_lowercase();
+    let first = lower.split_whitespace().next().unwrap_or("");
+    let known = AGENT_COLOURS.iter().find(|(agent, _)| *agent == first).map(|(_, at)| *at);
+    let start = known.unwrap_or_else(|| name.bytes().fold(0x811C_9DC5_u32, |hash, byte| (hash ^ byte as u32).wrapping_mul(0x0100_0193)) as usize);
     (0..PALETTE.len())
         .map(|step| PALETTE[(start + step) % PALETTE.len()])
         .find(|colour| !taken.contains(colour))
@@ -97,6 +124,22 @@ mod tests {
     fn well_known_agents_have_their_own_colours() {
         assert_eq!(colour_for("Claude Code", &[]), PALETTE[0]);
         assert_eq!(colour_for("cursor", &[]), PALETTE[1]);
+        assert_eq!(colour_for("Gemini CLI", &[]), PALETTE[2]);
+        assert_eq!(colour_for("GitHub Copilot", &[]), colour_for("Copilot", &[]));
+    }
+
+    #[test]
+    fn every_agent_differs_from_the_rest() {
+        let names = ["Claude Code", "Cursor", "Gemini", "Codex", "Copilot", "Windsurf", "Aider", "Amp", "Roo Code", "Continue", "Cline", "Goose", "OpenCode", "Kiro"];
+        let colours: Vec<Rgb> = names.iter().map(|name| colour_for(name, &[])).collect();
+        assert!(colours.iter().enumerate().all(|(at, colour)| !colours[..at].contains(colour)));
+    }
+
+    #[test]
+    fn a_second_copy_of_an_agent_gets_another_colour() {
+        let first = colour_for("Claude 1", &[]);
+        assert_eq!(first, PALETTE[0]);
+        assert_ne!(colour_for("Claude 2", &[first]), first);
     }
 
     #[test]

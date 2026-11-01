@@ -1,6 +1,7 @@
 // The command agents run: hand the words to the service, print what comes back.
 use crate::pipe::Pipe;
 use std::{
+    collections::HashMap,
     env,
     io::Write,
     mem::zeroed,
@@ -9,8 +10,11 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::CloseHandle,
-    System::Threading::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW},
+    Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
+    System::{
+        Diagnostics::ToolHelp::{CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS},
+        Threading::{CreateProcessW, PROCESS_INFORMATION, STARTUPINFOW},
+    },
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(4);
@@ -39,9 +43,63 @@ fn agent(args: &mut Vec<String>) -> String {
         "Gemini".into()
     } else if has("COPILOT_CLI") {
         "Copilot".into()
+    } else if has("OPENCODE") {
+        "OpenCode".into()
+    } else if has("CLINE_ACTIVE") {
+        "Cline".into()
+    } else if has("AMP_CURRENT_THREAD_ID") {
+        "Amp".into()
     } else {
-        "agent".into()
+        launched_by().unwrap_or("agent").into()
     }
+}
+
+/// Program names of the agents that set nothing in the environment.
+const AGENT_PROGRAMS: [(&str, &str); 13] = [
+    ("claude.exe", "Claude Code"),
+    ("cursor.exe", "Cursor"),
+    ("cursor-agent.exe", "Cursor"),
+    ("codex.exe", "Codex"),
+    ("gemini.exe", "Gemini"),
+    ("copilot.exe", "Copilot"),
+    ("windsurf.exe", "Windsurf"),
+    ("opencode.exe", "OpenCode"),
+    ("aider.exe", "Aider"),
+    ("goose.exe", "Goose"),
+    ("amp.exe", "Amp"),
+    ("kiro.exe", "Kiro"),
+    ("kiro-cli.exe", "Kiro"),
+];
+const MOST_ANCESTORS: usize = 16;
+
+/// The nearest agent among the processes that led to this one.
+fn launched_by() -> Option<&'static str> {
+    let mut parents = HashMap::new();
+    unsafe {
+        let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if snapshot == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        let mut entry: PROCESSENTRY32W = zeroed();
+        entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
+        let mut more = Process32FirstW(snapshot, &mut entry) != 0;
+        while more {
+            let end = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
+            parents.insert(entry.th32ProcessID, (entry.th32ParentProcessID, String::from_utf16_lossy(&entry.szExeFile[..end]).to_lowercase()));
+            more = Process32NextW(snapshot, &mut entry) != 0;
+        }
+        CloseHandle(snapshot);
+    }
+    let mut id = std::process::id();
+    for _ in 0..MOST_ANCESTORS {
+        let (parent, _) = parents.get(&id)?;
+        let (_, program) = parents.get(parent)?;
+        if let Some((_, name)) = AGENT_PROGRAMS.iter().find(|(known, _)| known == program) {
+            return Some(name);
+        }
+        id = *parent;
+    }
+    None
 }
 
 /// Nothing is inherited: a service holding the caller's output pipe would hang the agent's shell.
