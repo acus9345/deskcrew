@@ -24,7 +24,7 @@ use windows_sys::{
             GA_ROOT, GW_HWNDPREV, GW_OWNER, GetAncestor, GetDlgCtrlID, GetMenu, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
             GetParent, GetSubMenu, GetWindow, GetWindowLongPtrW, HMENU, MF_BYPOSITION, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
             GetWindowThreadProcessId, IsIconic,
-            IsWindow, IsWindowVisible, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
+            IsWindow, IsWindowVisible, LSFW_LOCK, LSFW_UNLOCK, LockSetForegroundWindow, SW_RESTORE, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SetForegroundWindow, SetWindowPos,
             ShowWindow, SwitchToThisWindow, WS_EX_TOOLWINDOW, WindowFromPoint,
         },
     },
@@ -370,6 +370,22 @@ pub fn bring_forward(hwnd: Hwnd) -> bool {
         SwitchToThisWindow(raw(hwnd), 1);
     }
     holds_front(hwnd, 350)
+}
+
+/// No app can take the foreground while this is held.
+pub struct ForegroundLock;
+
+impl ForegroundLock {
+    pub fn take() -> ForegroundLock {
+        unsafe { LockSetForegroundWindow(LSFW_LOCK) };
+        ForegroundLock
+    }
+}
+
+impl Drop for ForegroundLock {
+    fn drop(&mut self) {
+        unsafe { LockSetForegroundWindow(LSFW_UNLOCK) };
+    }
 }
 
 /// Remembers the person's window, and takes focus back if the app under control grabbed it.

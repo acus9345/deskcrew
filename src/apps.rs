@@ -99,6 +99,10 @@ fn start(app: &str, args: &str) -> Result<(), String> {
 pub fn launch(app: &str, args: &str, front: bool) -> Result<Option<Hwnd>, String> {
     let before: HashSet<Hwnd> = win::top_level().into_iter().collect();
     let person = win::FocusGuard::take();
+    // Agents run under the app in front, and Windows lets that app's descendants take focus once:
+    // the service would pass that on to the first app it opens. A lock stops it ever happening,
+    // and Windows lifts the lock by itself the moment the person switches windows.
+    let _lock = (!front).then(win::ForegroundLock::take);
     start(app, args)?;
     let started = Instant::now();
     let mut opened = None;
