@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.3] - 2026-11-01
+
 - Add `deskcrew cursor`: `--mouse` is back, off by default, and an agent can only borrow the cursor if the person allows it once, for the session or always.
 - Stop `--real` typing if focus leaves the window, and let Ctrl+Alt+Esc stop it.
 - Refuse risky shortcuts with extra modifiers, such as `shift+alt+f4`.
