@@ -472,6 +472,17 @@ pub fn bring_forward(hwnd: Hwnd) -> bool {
     holds_front(hwnd, 350)
 }
 
+/// Cancel the taskbar flash Windows starts when an app, woken by an agent's input, tries to come
+/// forward and is not allowed to. The person never asked for that window.
+pub fn stop_flashing(hwnd: Hwnd) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{FLASHW_STOP, FLASHWINFO, FlashWindowEx};
+    if foreground() == hwnd {
+        return;
+    }
+    let info = FLASHWINFO { cbSize: size_of::<FLASHWINFO>() as u32, hwnd: raw(hwnd), dwFlags: FLASHW_STOP, uCount: 0, dwTimeout: 0 };
+    unsafe { FlashWindowEx(&info) };
+}
+
 /// No app can take the foreground while this is held.
 pub struct ForegroundLock;
 
@@ -539,7 +550,9 @@ impl FocusGuard {
         if !target_pids.contains(&pid(now)) && !target_pids.contains(&content_pid(now)) {
             return false;
         }
-        bring_forward(self.front);
+        if !bring_forward(self.front) {
+            stop_flashing(self.front);
+        }
         true
     }
 }

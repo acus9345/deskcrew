@@ -158,6 +158,8 @@ struct Tracked {
     identity: (u32, u64),
     view: Mutex<View>,
     pointer: Mutex<()>,
+    // Agents drawing in this window right now. Strokes are cut into turns only when there are two.
+    drawers: AtomicUsize,
 }
 
 struct LastShot {
@@ -363,7 +365,7 @@ impl Service {
             return found.clone();
         }
         windows.0 += 1;
-        let tracked = Arc::new(Tracked { id: windows.0, hwnd, identity, view: Mutex::new(View::default()), pointer: Mutex::new(()) });
+        let tracked = Arc::new(Tracked { id: windows.0, hwnd, identity, view: Mutex::new(View::default()), pointer: Mutex::new(()), drawers: AtomicUsize::new(0) });
         windows.1.insert(hwnd, tracked.clone());
         tracked
     }
@@ -1083,9 +1085,6 @@ impl Service {
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::inside(tracked.hwnd, *x, *y)) {
                 return Err(format!("refused: {x},{y} on screen is not on this window"));
             }
-            if !flags.real && win::is_chromium(tracked.hwnd) && points.iter().any(|(x, y)| self.covered(tracked, view, *x, *y)) {
-                return Err("this browser window is covered and would drop the strokes: uncover it or add --real".into());
-            }
             let send = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, &self.stop, jump)?));
             let done = if flags.real { self.with_front(tracked, view, &points, send)?? } else { send()? };
             ("message", done)
@@ -1124,24 +1123,26 @@ impl Service {
             if strokes.iter().flatten().any(|p| !win::inside(tracked.hwnd, p.0 as i32, p.1 as i32)) {
                 return Err("refused: that stroke leaves the window".into());
             }
-            if strokes.iter().flatten().any(|p| self.covered(&tracked, view, p.0 as i32, p.1 as i32)) {
-                return Err("this browser window is covered and would drop the strokes: uncover it or add --real".into());
-            }
             (strokes, view.pids.clone())
         };
         let first = strokes[0][0];
         self.overlay.over(who, tracked.hwnd);
         self.overlay.move_to(who, first.0 as i32, first.1 as i32);
         self.focus_in(&pids);
+        tracked.drawers.fetch_add(1, Ordering::Relaxed);
         let mut result = Ok(true);
         'strokes: for stroke in &strokes {
             let mut start = 0;
             while start + 1 < stroke.len() {
-                let end = (start + SHARED_PIECE).min(stroke.len() - 1);
+                // Each press makes a browser ask to come forward, which flashes its taskbar button,
+                // so one agent alone draws each stroke in one press.
+                let piece = if tracked.drawers.load(Ordering::Relaxed) > 1 { SHARED_PIECE } else { stroke.len() };
+                let end = (start + piece).min(stroke.len() - 1);
                 let done = {
                     let _turn = tracked.pointer.lock().unwrap();
                     act::post_stroke(tracked.hwnd, &stroke[start..=end], &self.stop, |x, y| self.overlay.jump(who, x, y))
                 };
+                win::stop_flashing(tracked.hwnd);
                 match done {
                     Ok(true) => {}
                     other => {
@@ -1158,7 +1159,9 @@ impl Service {
                 thread::sleep(SHARED_GAP);
             }
         }
+        tracked.drawers.fetch_sub(1, Ordering::Relaxed);
         self.focus_out();
+        win::stop_flashing(tracked.hwnd);
         match result? {
             true => Ok("ok message".into()),
             false => Err(STOPPED.into()),
@@ -1312,6 +1315,7 @@ impl Service {
         let waited_only = routes.iter().all(|r| r == "found" || r == "waited") && !routes.is_empty();
         let settled = if waited_only { Ok(Vec::new()) } else { self.settle(&tracked, view) };
         self.focus_out();
+        win::stop_flashing(tracked.hwnd);
 
         let mut out = Vec::new();
         out.push(if routes.len() > 1 { format!("ok {} steps", routes.len()) } else { format!("ok {}", routes.first().map_or("", String::as_str)) });

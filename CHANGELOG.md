@@ -6,6 +6,11 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.5] - 2026-11-02
+
+- Draw in a covered browser or Electron window in the background, instead of refusing and leading agents to `--real`, which lifted the window over yours and made it flicker.
+- Draw each stroke in one press when one agent draws alone, and stop the taskbar flash a browser starts when it is pressed in the background: 26 flashes for three strokes became 2.
+
 ## [0.1.4] - 2026-11-02
 
 - Add a macOS version with the main commands: windows, see, get, click, set, type, key, scroll, drag, wait, shot, launch and do. It type-checks for Apple Silicon and Intel but has not been run on a Mac yet.
