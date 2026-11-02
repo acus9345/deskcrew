@@ -1,17 +1,18 @@
 ---
 name: deskcrew
-description: Operate native Windows apps in the background with the deskcrew command, without taking the person's mouse or focus. Use for looking at, clicking, typing into or drawing in a real Windows app.
+description: Operate native Windows and Mac apps in the background with the deskcrew command, without taking the person's mouse or focus. Use for looking at, clicking, typing into or drawing in a real Windows or Mac app.
 ---
 
 # deskcrew
 
-Run `deskcrew help` once for the commands. Windows only.
+Run `deskcrew help` once for the commands: the Mac version has fewer. Windows and macOS.
 
 - Pick a window, then work by ref: `deskcrew windows`, `deskcrew see Calculator`, `deskcrew click e12`. Refs stay valid across reads.
 - Every action replies with what changed, so do not read again after it. `see` also shows only changes; `see -f` lists everything, for when you no longer have the list.
 - If you know the control's name, skip the read: `deskcrew click "Save" -w notepad`.
 - Batch steps: `deskcrew click e1 e2 e3`, or `deskcrew do "click e1; set e2 'hi'; key enter"`. Open a menu and pick from it in one command: `deskcrew click File Save`.
-- Pictures only when text is not enough: `deskcrew shot` prints a PNG path to open. `unchanged` means you already have it. `click x,y` uses pixels in the last shot.
+- Pictures only when text is not enough. `see` says when part of a window has no controls, reads the text there with its x,y, and gives the `shot` command for just that part: take it only if you need the drawing itself. `deskcrew shot` prints a PNG path to open; `unchanged` means you already have it. `click x,y` uses the last shot or text `see` read.
+- When an action changes no control, its reply says whether the picture changed and where, so do not take a shot just to check.
 - Prefer `check`, `uncheck`, `expand` and `collapse` to `click`: they leave a control alone if it is already that way. `--expect "text"` on an action fails unless the text shows afterwards. `shot --marks --rulers` numbers the controls by ref and labels pixels.
 - Before a risky `do`, show the plan with `--dry`, and pass `--risk high`: it is refused until the person agrees and you add `--force`.
 - `notifications` opens the panel and takes focus: read it, use its refs, then always run `notifications close`. `down` needs `up` within 30 seconds.

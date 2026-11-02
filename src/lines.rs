@@ -22,6 +22,7 @@ pub fn clip(text: &str, max: usize) -> String {
 }
 
 /// UIA control types, by the numbers Windows gives them.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn role(kind: i32) -> Option<&'static str> {
     Some(match kind {
         50000 | 50031 => "button",
@@ -47,21 +48,25 @@ pub fn role(kind: i32) -> Option<&'static str> {
 }
 
 /// Parts of a window that never help an agent, along with everything inside them.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn skipped(kind: i32) -> bool {
     matches!(kind, 50014 | 50022 | 50027 | 50037 | 50038)
 }
 
 /// The buttons every window has. Store apps list them outside any title bar.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn is_window_chrome(automation_id: &str) -> bool {
     matches!(automation_id, "Minimize" | "Maximize" | "Restore" | "Close" | "TitleBar" | "SystemMenuBar" | "SystemMenuBarItem" | "view_0" | "view_1")
 }
 
 /// Rows read as one line: their plain text joins the row instead of adding lines.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn is_row(kind: i32) -> bool {
     matches!(kind, 50007 | 50024 | 50029)
 }
 
 /// A role for a container only worth listing because it can be acted on.
+#[cfg_attr(not(windows), allow(dead_code))]
 pub fn container_role(kind: i32) -> &'static str {
     match kind {
         50008 => "list",

@@ -6,6 +6,7 @@ use crate::{
     act::{self, NEEDS_REAL},
     apps,
     lines::{self, Seen},
+    look,
     overlay::{Overlay, Rect},
     pen::Pen,
     pipe::Pipe,
@@ -75,7 +76,7 @@ do "click e1; set e2 hi; key enter" [--dry] [--risk low|medium|high]   many step
 Any action: --expect "text" fails unless the text shows afterwards.
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
 apps     screens     notifications [close]     clip     clip set "text"     clip clear     status     resume     quit     setup (installs for your coding agents)
-Every action replies with what changed. x,y are pixels in the last shot. Ctrl+Alt+Esc stops every agent.
+Every action replies with what changed, in the picture too. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen: a last resort),
 --mouse (asks the person to borrow their cursor, if they allow asking: only if nothing else works).
@@ -147,6 +148,8 @@ struct View {
     known: Option<HashSet<Hwnd>>,
     surfaces: Vec<Hwnd>,
     read_once: bool,
+    // The last look at the part with no controls: its picture's fingerprint and what it said.
+    blind: Option<(u64, Vec<String>)>,
 }
 
 struct Tracked {
@@ -304,6 +307,10 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
 }
 
 /// The roles worth numbering on a picture: things an agent would act on.
+// Roles that hold other controls, and so may be a canvas rather than something covering its space.
+const CONTAINERS: [&str; 8] = ["list", "tree", "table", "menu", "tabs", "toolbar", "pane", "group"];
+// A change thinner than this is a blinking caret, not a result.
+const LEAST_CHANGE: u32 = 4;
 const MARKED: [&str; 11] = ["button", "edit", "menuitem", "checkbox", "radio", "combobox", "tab", "item", "link", "slider", "spinner"];
 
 fn expected(flags: &Flags) -> Option<Vec<String>> {
@@ -1284,6 +1291,7 @@ impl Service {
             self.first_read(&tracked, view, false)?;
         }
         let before = self.seen(who, tracked.hwnd).unwrap_or_else(|| view.lines.clone());
+        let picture_before = shot::window(tracked.hwnd).ok().filter(|(frame, _)| !frame.is_blank());
         self.focus_in(&view.pids);
         let mut routes = Vec::new();
         let mut failure = None;
@@ -1316,10 +1324,15 @@ impl Service {
                 if complete {
                     self.remember(who, tracked.hwnd, view.lines.clone());
                 }
-                if nothing && routes.iter().any(|r| r == "message") {
-                    out.push("nothing changed: try --real if it should have".into());
-                } else if nothing && routes.iter().any(|r| r == "pen" || r == "mouse" || r == "keyboard") {
-                    out.push("nothing changed: check with shot".into());
+                // The controls tell nothing: the picture still can, without sending one.
+                let picture = if nothing && !waited_only { picture_before.as_ref().map(|before| self.picture_change(&tracked, before)) } else { None };
+                match picture {
+                    Some(Some(note)) => out.push(note),
+                    Some(None) if routes.iter().any(|r| r == "message") => out.push("nothing changed, on screen either: try --real if it should have".into()),
+                    Some(None) => out.push("nothing changed, on screen either".into()),
+                    None if nothing && routes.iter().any(|r| r == "message") => out.push("nothing changed: try --real if it should have".into()),
+                    None if nothing && routes.iter().any(|r| r == "pen" || r == "mouse" || r == "keyboard") => out.push("nothing changed: check with shot".into()),
+                    None => {}
                 }
             }
             Err(error) => out.push(error),
@@ -1332,6 +1345,17 @@ impl Service {
             }
             None => Ok(out.join("\n")),
         }
+    }
+
+    /// Where the window's picture changed since `before`, in window pixels, ignoring a caret.
+    fn picture_change(&self, tracked: &Tracked, (before, units): &(Frame, f32)) -> Option<String> {
+        let (after, _) = shot::window(tracked.hwnd).ok()?;
+        let (x, y, w, h) = after.changed_from(before)?;
+        if w < LEAST_CHANGE || h < LEAST_CHANGE {
+            return None;
+        }
+        let at = |value: u32| (value as f32 * units).round() as i32;
+        Some(format!("controls unchanged; the picture changed at {},{} {}x{}", at(x), at(y), at(w), at(h)))
     }
 
     fn windows_list(&self, who: &str, filter: Option<&String>) -> Reply {
@@ -1372,7 +1396,68 @@ impl Service {
         let hidden = if view.hidden > 0 { format!(", {} off screen", view.hidden) } else { String::new() };
         let mut out = vec![format!("w{} \"{}\" {} controls{hidden}", tracked.id, lines::clip(&win::title(tracked.hwnd), 50), view.lines.len())];
         out.extend(lines::page(&view.lines, flags.find.as_deref(), flags.from));
+        if !filtered {
+            out.extend(self.blind_spot(who, &tracked, view));
+        }
         Ok(out.join("\n"))
+    }
+
+    /// Point out the largest part of the window with no controls in it, and read any text there,
+    /// so the agent knows when the list falls short and needs a picture of only that part.
+    fn blind_spot(&self, who: &str, tracked: &Tracked, view: &mut View) -> Vec<String> {
+        let window = win::rect(tracked.hwnd);
+        let rects: Vec<_> = view.nodes.values().map(|n| (n.rect, CONTAINERS.contains(&n.parts.role.as_str()))).collect();
+        let Some((x, y, w, h)) = look::empty_area(window, &rects) else { return Vec::new() };
+        let Ok((frame, units)) = shot::window(tracked.hwnd) else { return Vec::new() };
+        let inside = |value: i32| (value as f32 / units) as u32;
+        let part = frame.crop(inside(x - window.0), inside(y - window.1), inside(w).max(1), inside(h).max(1));
+        let blank = frame.is_blank();
+        if !blank && !part.busy() {
+            return Vec::new();
+        }
+        let hash = part.hash();
+        if let Some((seen, said)) = &view.blind
+            && *seen == hash
+        {
+            return said.clone();
+        }
+        // The smallest control holding the area, so a picture of it covers the area and little else.
+        let holder = view
+            .nodes
+            .iter()
+            .filter(|(_, n)| n.rect.0 <= x + w / 8 && n.rect.1 <= y + h / 8 && n.rect.0 + n.rect.2 >= x + w * 7 / 8 && n.rect.1 + n.rect.3 >= y + h * 7 / 8)
+            .min_by_key(|(_, n)| n.rect.2 as i64 * n.rect.3 as i64)
+            .map(|(id, _)| *id);
+        let picture = holder.map_or_else(|| format!("shot --region {x},{y},{w},{h}"), |id| format!("shot e{id}"));
+        let (left, top) = (x - window.0, y - window.1);
+        let texts = if blank { Vec::new() } else { look::read_text(&part).unwrap_or_default() };
+        let said = if texts.is_empty() {
+            vec![format!("no controls in {left},{top} {w}x{h}, only drawing: {picture}")]
+        } else {
+            let mut said = vec![format!("no controls in {left},{top} {w}x{h}; text read there (x,y for click):")];
+            for text in &texts {
+                let (tx, ty, tw, th) = text.rect;
+                let centre = |at: i32, size: i32, offset: i32| offset + ((at as f32 + size as f32 / 2.0) * units).round() as i32;
+                said.push(format!("\"{}\" {},{}", lines::clip(&text.text, 60), centre(tx, tw, left), centre(ty, th, top)));
+            }
+            said.push(format!("for drawings: {picture}"));
+            // These x,y are window pixels: clicks read them that way until the next shot.
+            let mut agents = self.agents.lock().unwrap();
+            let state = agents.entry(who.to_string()).or_default();
+            let frames = Frames { x: window.0, y: window.1, scale: 1.0 };
+            match state.shots.get_mut(&tracked.hwnd) {
+                Some(last) => {
+                    last.frames = frames;
+                    last.hash = 0;
+                }
+                None => {
+                    state.shots.insert(tracked.hwnd, LastShot { hash: 0, frame: Frame { w: 0, h: 0, pixels: Vec::new() }, frames });
+                }
+            }
+            said
+        };
+        view.blind = Some((hash, said.clone()));
+        said
     }
 
     fn get(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {

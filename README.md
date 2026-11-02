@@ -1,6 +1,6 @@
 # deskcrew
 
-**Windows only for now.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
+**Windows, with an untested macOS version.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
 <img width="1163" height="719" alt="image" src="https://github.com/user-attachments/assets/2cad4d13-546e-41d4-84b9-0406ff783b78" />
 
 
@@ -28,7 +28,23 @@ To make it available to your agents:
 target/release/deskcrew setup
 ```
 
-That puts `deskcrew` on PATH and gives the skill to each agent it finds. For any other agent, add one line to its rules: `To operate Windows apps on this computer, run the deskcrew command. Start with: deskcrew help`. Agents running in the cloud, or in a sandbox without access to your desktop, cannot reach it.
+That puts `deskcrew` on PATH and gives the skill to each agent it finds. For any other agent, add one line to its rules: `To operate Windows apps on this computer, run the deskcrew command. Start with: deskcrew help`. On a Mac the rule says Mac apps instead. Agents running in the cloud, or in a sandbox without access to your desktop, cannot reach it.
+
+## macOS
+
+**The macOS version has not been run yet.** It was written and type-checked for both Apple Silicon and Intel Macs on a Windows PC, which cannot link or run Mac programs. Treat it as a first draft until someone tries it on a Mac.
+
+It has the same commands and replies, built on Mac parts:
+
+- Controls are read through the accessibility API and pressed with their own actions, such as `AXPress`, so a click works behind other windows without taking focus.
+- Clicks on points, drags, scrolls and keys are posted to the one app being worked on, so your pointer does not move and your front app keeps its keys. Apps that only take keys while in front get a field's text set instead.
+- Pictures come from the window itself, and text in parts with no controls is read with Apple's Vision.
+- Cursors are see-through windows ordered just above the agent's window, so your other windows can cover them.
+- Ctrl+Option+Esc stops every agent.
+
+macOS asks once for Accessibility permission, and again for Screen Recording the first time a picture is taken. Both are granted to the app running your agent, such as Terminal, iTerm or Cursor. `setup` installs to `~/.cargo/bin` or `~/.local/bin`, adding the latter to `~/.zprofile` if it is not on PATH.
+
+Not on the Mac yet: `--real`, `--mouse` and borrowing the cursor, `draw`, held keys, `select`, `check` and the other toggles, `notifications`, `place`, `focus`, `screens`, `apps`, the clipboard and the demo.
 
 ```text
 $ deskcrew see Calculator
@@ -48,6 +64,8 @@ Run `deskcrew help` for every command. A background service starts itself on fir
 - Every action replies with only what changed, so there is nothing to read again.
 - `click e1 e2 e3` and `do` run many steps in one call.
 - Pictures are files that are only sent if the agent opens them. An unchanged picture is reported as `unchanged`.
+- `see` points out any large part of a window with no controls, such as a canvas or a game, and reads the text in it with Windows' own offline OCR. Clicks can use the x,y it gives, so a picture is only needed for drawings, and then only of that part.
+- When an action changes no control, its reply says whether the window's picture changed and where, so the agent doesn't need a picture to check.
 
 Measured on 2026-11-01 against agent-desktop 1.0.2, in characters an agent has to read, on throwaway windows at 150% scaling. Its figures use `snapshot -i --compact`. These are characters, not tokens, and agent-desktop's `--skeleton` mode reads less by leaving detail out.
 
@@ -66,7 +84,7 @@ For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 chara
 
 | | agent-desktop | deskcrew |
 | --- | --- | --- |
-| Platforms | macOS, Windows, Linux | Windows only |
+| Platforms | macOS, Windows, Linux | Windows; macOS written but not yet run |
 | Used from | command line, or a library called in process | command line and an agent skill |
 | Reading a window | 3,603 to 39,595 characters in the tests above | 260 to 3,375 characters, about 10 times less |
 | Drawn cursors | `cursor-overlay`, with `--multi-agent` for one per agent; always on top of other windows | always on, one per agent with no setup, and covered by whatever covers their window |
@@ -131,7 +149,9 @@ The second one drives throwaway windows it opens itself, including the real keyb
 
 ## Limits
 
-- Windows only. macOS and Linux are not written, and could not be tested on the machine this was built on.
+- The Windows version is the tested one. The macOS version has never been run (see [macOS](#macos)), and Linux is not written.
+- On a Mac, pictures use `CGWindowListCreateImage`, which Apple has deprecated. A future macOS may stop it working, and then pictures would need ScreenCaptureKit.
+- On a Mac, typed text goes out as key events carrying the characters. An app that reads key codes instead may get the wrong letters.
 - `notifications`, `down` and `--real` take focus, so they can interrupt what you are doing, and so does `type --paste` outside a classic text box. A key held with `down` reaches whichever window has focus, and is let go after 30 s, on `quit` and on Ctrl+Alt+Esc. If deskcrew is killed outright it stays down until you press that key.
 - `--real` typing stops if focus leaves the window, and reports how much it had typed.
 - `click --with ctrl` sends the modifier with the click. Apps that read the keyboard instead, such as WinForms, need `--real` as well.
@@ -153,6 +173,8 @@ The second one drives throwaway windows it opens itself, including the real keyb
 - Tested on one monitor at 150% scaling. A second monitor has not been tried.
 - Apps running as administrator can be read but not driven, unless deskcrew also runs as administrator.
 - Pictures are saved in `%LOCALAPPDATA%\deskcrew\shots` and can show private content.
+- Text read off a picture can mistake similar letters, such as `I` and `l`. It reads in the languages set up in Windows.
+- Each action takes a picture of the window before and after, which adds a little time on large windows. A blinking caret is ignored, but other animations show as a change.
 
 ## License
 

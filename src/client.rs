@@ -4,11 +4,12 @@ use std::{
     collections::HashMap,
     env,
     io::Write,
-    mem::zeroed,
-    ptr::null,
     thread,
     time::{Duration, Instant},
 };
+#[cfg(windows)]
+use std::{mem::zeroed, ptr::null};
+#[cfg(windows)]
 use windows_sys::Win32::{
     Foundation::{CloseHandle, INVALID_HANDLE_VALUE},
     System::{
@@ -18,8 +19,11 @@ use windows_sys::Win32::{
 };
 
 const START_TIMEOUT: Duration = Duration::from_secs(4);
+#[cfg(windows)]
 const DETACHED_PROCESS: u32 = 0x0000_0008;
+#[cfg(windows)]
 const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+#[cfg(windows)]
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Who is asking, so each agent keeps its own cursor. A flag beats the environment.
@@ -56,40 +60,65 @@ fn agent(args: &mut Vec<String>) -> String {
 
 /// Program names of the agents that set nothing in the environment.
 const AGENT_PROGRAMS: [(&str, &str); 13] = [
-    ("claude.exe", "Claude Code"),
-    ("cursor.exe", "Cursor"),
-    ("cursor-agent.exe", "Cursor"),
-    ("codex.exe", "Codex"),
-    ("gemini.exe", "Gemini"),
-    ("copilot.exe", "Copilot"),
-    ("windsurf.exe", "Windsurf"),
-    ("opencode.exe", "OpenCode"),
-    ("aider.exe", "Aider"),
-    ("goose.exe", "Goose"),
-    ("amp.exe", "Amp"),
-    ("kiro.exe", "Kiro"),
-    ("kiro-cli.exe", "Kiro"),
+    ("claude", "Claude Code"),
+    ("cursor", "Cursor"),
+    ("cursor-agent", "Cursor"),
+    ("codex", "Codex"),
+    ("gemini", "Gemini"),
+    ("copilot", "Copilot"),
+    ("windsurf", "Windsurf"),
+    ("opencode", "OpenCode"),
+    ("aider", "Aider"),
+    ("goose", "Goose"),
+    ("amp", "Amp"),
+    ("kiro", "Kiro"),
+    ("kiro-cli", "Kiro"),
 ];
 const MOST_ANCESTORS: usize = 16;
 
-/// The nearest agent among the processes that led to this one.
-fn launched_by() -> Option<&'static str> {
+/// Every process's parent and lower-case program name, without folder or `.exe`.
+#[cfg(not(windows))]
+fn processes() -> HashMap<u32, (u32, String)> {
+    let listed = std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,comm="]).output();
+    let text = listed.map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default();
+    text.lines()
+        .filter_map(|line| {
+            let mut parts = line.split_whitespace();
+            let pid = parts.next()?.parse().ok()?;
+            let parent = parts.next()?.parse().ok()?;
+            let program = parts.collect::<Vec<_>>().join(" ");
+            let program = program.rsplit('/').next().unwrap_or("").to_lowercase();
+            Some((pid, (parent, program)))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn processes() -> HashMap<u32, (u32, String)> {
     let mut parents = HashMap::new();
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
         if snapshot == INVALID_HANDLE_VALUE {
-            return None;
+            return parents;
         }
         let mut entry: PROCESSENTRY32W = zeroed();
         entry.dwSize = size_of::<PROCESSENTRY32W>() as u32;
         let mut more = Process32FirstW(snapshot, &mut entry) != 0;
         while more {
             let end = entry.szExeFile.iter().position(|c| *c == 0).unwrap_or(entry.szExeFile.len());
-            parents.insert(entry.th32ProcessID, (entry.th32ParentProcessID, String::from_utf16_lossy(&entry.szExeFile[..end]).to_lowercase()));
+            let program = String::from_utf16_lossy(&entry.szExeFile[..end]).to_lowercase();
+            let program = program.strip_suffix(".exe").map(str::to_string).unwrap_or(program);
+            parents.insert(entry.th32ProcessID, (entry.th32ParentProcessID, program));
             more = Process32NextW(snapshot, &mut entry) != 0;
         }
         CloseHandle(snapshot);
     }
+    parents
+}
+
+/// The nearest agent among the processes that led to this one.
+fn launched_by() -> Option<&'static str> {
+    let parents = processes();
     let mut id = std::process::id();
     for _ in 0..MOST_ANCESTORS {
         let (parent, _) = parents.get(&id)?;
@@ -103,6 +132,24 @@ fn launched_by() -> Option<&'static str> {
 }
 
 /// Nothing is inherited: a service holding the caller's output pipe would hang the agent's shell.
+/// Its own process group keeps it running when the agent's shell ends.
+#[cfg(not(windows))]
+fn start_service() -> Result<(), String> {
+    use std::os::unix::process::CommandExt;
+    use std::process::{Command, Stdio};
+    let exe = env::current_exe().map_err(|e| e.to_string())?;
+    Command::new(exe)
+        .arg("service")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .process_group(0)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("could not start the deskcrew service: {e}"))
+}
+
+#[cfg(windows)]
 fn spawn(exe: &str, flags: u32) -> bool {
     let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
     let application = wide(exe);
@@ -120,6 +167,7 @@ fn spawn(exe: &str, flags: u32) -> bool {
     }
 }
 
+#[cfg(windows)]
 fn start_service() -> Result<(), String> {
     let exe = env::current_exe().map_err(|e| e.to_string())?;
     let exe = exe.to_string_lossy();

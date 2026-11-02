@@ -1,7 +1,11 @@
 // Pictures of one window, taken from the window itself: it can sit behind others, and no overlay
 // can ever land in the frame.
+#[cfg(windows)]
 use crate::win::{self, Hwnd};
-use std::{fs, io::BufWriter, mem::zeroed, path::PathBuf, ptr::null_mut};
+use std::{fs, io::BufWriter, path::PathBuf};
+#[cfg(windows)]
+use std::{mem::zeroed, ptr::null_mut};
+#[cfg(windows)]
 use windows_sys::Win32::{
     Graphics::Gdi::{
         BITMAPINFO, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, DIB_RGB_COLORS, DeleteDC, DeleteObject, GetDC, GetDIBits,
@@ -10,6 +14,7 @@ use windows_sys::Win32::{
     Storage::Xps::PrintWindow,
 };
 
+#[cfg(windows)]
 const PW_RENDERFULLCONTENT: u32 = 2;
 pub const DEFAULT_EDGE: u32 = 1356;
 // Blue, green, red, as the pixels are stored.
@@ -52,6 +57,7 @@ impl Frames {
     }
 }
 
+#[cfg(windows)]
 fn read_bitmap(dc: *mut core::ffi::c_void, bitmap: *mut core::ffi::c_void, w: i32, h: i32) -> Option<Vec<u8>> {
     unsafe {
         let mut info: BITMAPINFO = zeroed();
@@ -68,6 +74,7 @@ fn read_bitmap(dc: *mut core::ffi::c_void, bitmap: *mut core::ffi::c_void, w: i3
 
 /// The window's own picture, cropped to the frame a person sees, and the screen pixels per pixel
 /// of it: an older app draws itself in its own smaller units, even on a high-DPI screen.
+#[cfg(windows)]
 pub fn window(hwnd: Hwnd) -> Result<(Frame, f32), String> {
     if win::minimized(hwnd) {
         return Err("that window is minimized: place restore first".into());
@@ -107,6 +114,7 @@ pub fn window(hwnd: Hwnd) -> Result<(Frame, f32), String> {
 }
 
 /// What is on screen in this rectangle. The caller clears the overlay first.
+#[cfg(windows)]
 pub fn screen(x: i32, y: i32, w: i32, h: i32) -> Result<Frame, String> {
     let pixels = unsafe {
         let source = GetDC(null_mut());
@@ -286,7 +294,10 @@ impl Frame {
 /// Where this agent's picture of this window goes. Each new one replaces the last.
 pub fn path_for(agent: &str, window: u32) -> PathBuf {
     let slug: String = agent.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    #[cfg(windows)]
     let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    #[cfg(not(windows))]
+    let root = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library").join("Caches")).unwrap_or_else(std::env::temp_dir);
     root.join("deskcrew").join("shots").join(format!("{slug}-w{window}.png"))
 }
 

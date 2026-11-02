@@ -6,6 +6,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.4] - 2026-11-02
+
+- Add a macOS version with the main commands: windows, see, get, click, set, type, key, scroll, drag, wait, shot, launch and do. It type-checks for Apple Silicon and Intel but has not been run on a Mac yet.
+- `see` points out any large part of a window with no controls and reads its text with Windows OCR, giving x,y that `click` takes.
+- When an action changes no control, its reply says whether the window's picture changed and where.
+
 ## [0.1.3] - 2026-11-01
 
 - Add `deskcrew cursor`: `--mouse` is back, off by default, and an agent can only borrow the cursor if the person allows it once, for the session or always.

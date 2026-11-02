@@ -4,11 +4,23 @@ use crate::pipe::Pipe;
 use std::{
     env, fs,
     path::{Path, PathBuf},
-    process::Command,
 };
+#[cfg(windows)]
+use std::process::Command;
 
 const SKILL: &str = include_str!("../skills/deskcrew/SKILL.md");
+#[cfg(windows)]
 const RULE: &str = "To operate Windows apps on this computer, run the deskcrew command. Start with: deskcrew help";
+#[cfg(not(windows))]
+const RULE: &str = "To operate Mac apps on this computer, run the deskcrew command. Start with: deskcrew help";
+#[cfg(windows)]
+const PROGRAM: &str = "deskcrew.exe";
+#[cfg(not(windows))]
+const PROGRAM: &str = "deskcrew";
+#[cfg(windows)]
+const HOME: &str = "USERPROFILE";
+#[cfg(not(windows))]
+const HOME: &str = "HOME";
 
 /// Where each agent keeps personal skills, and the folder that shows it is installed.
 const AGENTS: [(&str, &str, &str); 8] = [
@@ -34,10 +46,27 @@ fn install_folder(home: &Path) -> (PathBuf, bool) {
             return (folder, true);
         }
     }
-    let root = env::var_os("LOCALAPPDATA").map_or_else(|| home.to_path_buf(), PathBuf::from);
-    (root.join("deskcrew").join("bin"), false)
+    #[cfg(windows)]
+    let root = env::var_os("LOCALAPPDATA").map_or_else(|| home.to_path_buf(), PathBuf::from).join("deskcrew");
+    #[cfg(not(windows))]
+    let root = home.join(".local");
+    (root.join("bin"), false)
 }
 
+/// The shell that a Mac opens reads ~/.zprofile, so the folder goes there.
+#[cfg(not(windows))]
+fn add_to_user_path(folder: &Path) -> Result<(), String> {
+    let home = env::var_os(HOME).map(PathBuf::from).ok_or("no home folder found")?;
+    let profile = home.join(".zprofile");
+    let line = format!("export PATH=\"{}:$PATH\"\n", folder.display());
+    let current = fs::read_to_string(&profile).unwrap_or_default();
+    if current.contains(&line) {
+        return Ok(());
+    }
+    fs::write(&profile, current + &line).map_err(|e| format!("could not add it to your PATH: {e}"))
+}
+
+#[cfg(windows)]
 fn add_to_user_path(folder: &Path) -> Result<(), String> {
     let script = format!(
         "$f = '{}'; $p = [Environment]::GetEnvironmentVariable('Path', 'User'); if (($p -split ';') -notcontains $f) {{ [Environment]::SetEnvironmentVariable('Path', ($p.TrimEnd(';') + ';' + $f), 'User') }}",
@@ -49,7 +78,7 @@ fn add_to_user_path(folder: &Path) -> Result<(), String> {
 
 fn install_program(home: &Path) -> Result<String, String> {
     let (folder, on_path) = install_folder(home);
-    let target = folder.join("deskcrew.exe");
+    let target = folder.join(PROGRAM);
     let current = env::current_exe().map_err(|e| e.to_string())?;
     if current == target {
         return Ok(format!("program: already at {}", target.display()));
@@ -70,7 +99,7 @@ fn install_program(home: &Path) -> Result<String, String> {
 }
 
 pub fn run() -> i32 {
-    let Some(home) = env::var_os("USERPROFILE").map(PathBuf::from) else {
+    let Some(home) = env::var_os(HOME).map(PathBuf::from) else {
         eprintln!("no home folder found");
         return 1;
     };
