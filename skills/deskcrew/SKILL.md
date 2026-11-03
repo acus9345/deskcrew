@@ -14,6 +14,8 @@ Use this on your own whenever a task needs the desktop; the person does not need
 - Pictures only when text is not enough. `see` says when part of a window has no controls, reads the text there with its x,y, and gives the `shot` command for just that part: take it only if you need the drawing itself. `deskcrew shot` prints a PNG path to open; `unchanged` means you already have it. `click x,y` uses the last shot or text `see` read.
 - When an action changes no control, its reply says whether the picture changed and where, so do not take a shot just to check.
 - Prefer `check`, `uncheck`, `expand` and `collapse` to `click`: they leave a control alone if it is already that way. `--expect "text"` on an action fails unless the text shows afterwards. `shot --marks --rulers` numbers the controls by ref and labels pixels.
+- Read a file list or data grid in one call with `table e5`. Fill an Open or Save dialog with `pick-file "C:\path\name.txt"`.
+- Around the apps: `processes`, `kill`, `run "command"`, `fetch URL`, `file list|read|write|find|copy|move|trash`, `reg get|set`, `notify` and `settings page` need no window. `kill`, `write` and `copy` refuse risky cases without `--force`: ask the person first.
 - Before a risky `do`, show the plan with `--dry`, and pass `--risk high`: it is refused until the person agrees and you add `--force`.
 - `notifications` opens the panel and takes focus: read it, use its refs, then always run `notifications close`. `down` needs `up` within 30 seconds.
 - Each coding agent is recognised and gets its own name and colour. Copies of one agent working in parallel need separate names for separate cursors: `--agent "Claude 2"` or `DESKCREW_AGENT`.

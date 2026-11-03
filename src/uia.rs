@@ -53,6 +53,8 @@ pub struct Can {
 pub struct Node {
     pub runtime: Vec<i32>,
     pub identity: String,
+    // The automation id as the app gave it, numbers included: common dialogs name their parts this way.
+    pub control_id: String,
     pub parts: Parts,
     pub rect: (i32, i32, i32, i32),
     pub native: Hwnd,
@@ -234,7 +236,8 @@ unsafe fn walk(
             Some("") => !name.is_empty() && name != parent,
             Some("image") => acts && !name.is_empty(),
             Some(_) => true,
-            None => acts || scrollable,
+            // Tables and grids get a line even when idle, so `table` has something to name.
+            None => acts || scrollable || matches!(kind, 50028 | 50036),
         };
 
         let mut own = row;
@@ -243,7 +246,8 @@ unsafe fn walk(
                 *hidden += 1;
             } else {
                 // WinForms hands out window handles as ids, which mean nothing and change every run.
-                let automation_id = Some(text(el.CachedAutomationId())).filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default();
+                let control_id = text(el.CachedAutomationId());
+                let automation_id = Some(control_id.clone()).filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default();
                 if lines::is_window_chrome(&automation_id) {
                     walk_children(el, parent, row, all, nodes, hidden, depth);
                     return;
@@ -293,6 +297,7 @@ unsafe fn walk(
                 nodes.push(Node {
                     runtime: runtime_id(el),
                     identity: format!("{kind}|{automation_id}|{name}"),
+                    control_id,
                     parts,
                     rect: el.CachedBoundingRectangle().map(rect_of).unwrap_or_default(),
                     native: el.CachedNativeWindowHandle().map(|h| h.0 as Hwnd).unwrap_or(0),
@@ -348,6 +353,74 @@ fn patiently(element: &Element, call: impl FnOnce(&IUIAutomationElement) -> wind
         Ok(Err(error)) => Err(error),
         Err(_) => Ok(Done::StillRunning),
     }
+}
+
+/// A grid that offers no grid pattern, such as a WinForms data grid, read as rows of children:
+/// a row whose cells carry no values is the header.
+fn rows_of(element: &IUIAutomationElement, rows: usize, columns: usize, auto: &Uia) -> Result<Table, String> {
+    unsafe {
+        let every = auto.auto.CreateTrueCondition().map_err(say)?;
+        let children = |parent: &IUIAutomationElement| -> Vec<IUIAutomationElement> {
+            parent.FindAll(TreeScope_Children, &every).ok().map(|list| (0..list.Length().unwrap_or(0)).filter_map(|at| list.GetElement(at).ok()).collect()).unwrap_or_default()
+        };
+        let value = |el: &IUIAutomationElement| el.GetCurrentPropertyValue(UIA_ValueValuePropertyId).ok().and_then(|v| BSTR::try_from(&v).ok()).map(|s| s.to_string()).unwrap_or_default();
+        let mut headers = Vec::new();
+        let mut cells = Vec::new();
+        let mut total_rows = 0;
+        let mut total_columns = 0;
+        for row in children(element) {
+            let parts = children(&row);
+            if parts.is_empty() {
+                continue;
+            }
+            let values: Vec<String> = parts.iter().map(&value).collect();
+            let names: Vec<String> = parts.iter().map(|part| text(part.CurrentName())).collect();
+            // Header cells carry no value, or their own name as one.
+            if values.iter().zip(&names).all(|(v, n)| v.is_empty() || v == n) {
+                if headers.is_empty() && cells.is_empty() {
+                    headers = parts.iter().take(columns).map(|part| text(part.CurrentName())).collect();
+                }
+                continue;
+            }
+            total_rows += 1;
+            total_columns = total_columns.max(values.len());
+            if cells.len() < rows {
+                cells.push(values.into_iter().take(columns).collect());
+            }
+        }
+        if total_rows == 0 {
+            return Err("that control is not a table or grid, or a cell in one".into());
+        }
+        // Row-header cells carry no values: drop columns that are empty in every row read.
+        let empty: Vec<usize> = (0..total_columns).filter(|at| cells.iter().all(|row: &Vec<String>| row.get(*at).is_none_or(String::is_empty))).collect();
+        let keep = |at: &usize| !empty.contains(at);
+        let cells: Vec<Vec<String>> = cells.into_iter().map(|row| row.into_iter().enumerate().filter(|(at, _)| keep(at)).map(|(_, c)| c).collect()).collect();
+        let headers: Vec<String> = headers.into_iter().enumerate().filter(|(at, _)| keep(at)).map(|(_, h)| h).collect();
+        Ok(Table { headers, rows: cells, total_rows, total_columns: total_columns - empty.len() })
+    }
+}
+
+/// The table or grid this control sits in: itself, or one of the few elements above it.
+fn table_around(element: &IUIAutomationElement, auto: &Uia) -> Option<IUIAutomationElement> {
+    unsafe {
+        let walker = auto.auto.ControlViewWalker().ok()?;
+        let mut at = element.clone();
+        for _ in 0..4 {
+            let kind = at.CurrentControlType().map(|k| k.0).unwrap_or(0);
+            if matches!(kind, 50028 | 50036) || at.GetCurrentPatternAs::<IUIAutomationGridPattern>(UIA_GridPatternId).is_ok() {
+                return Some(at);
+            }
+            at = walker.GetParentElement(&at).ok()?;
+        }
+        None
+    }
+}
+
+pub struct Table {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub total_rows: usize,
+    pub total_columns: usize,
 }
 
 impl Element {
@@ -436,6 +509,46 @@ impl Element {
                         return value.to_string();
                     }
             text(self.0.CurrentName())
+        }
+    }
+
+    /// A grid's cells as rows of text, with its column headers, and how many rows and columns it
+    /// has in all. Only the first `rows` by `columns` cells are read.
+    pub fn grid(&self, rows: usize, columns: usize, auto: &Uia) -> Result<Table, String> {
+        unsafe {
+            // A cell knows its grid, so naming any cell works too.
+            let owner = match self.0.GetCurrentPatternAs::<IUIAutomationGridItemPattern>(UIA_GridItemPatternId).and_then(|item| item.CurrentContainingGrid()) {
+                Ok(grid) => grid,
+                Err(_) => table_around(&self.0, auto).unwrap_or_else(|| self.0.clone()),
+            };
+            // Some grids keep a cell's text in its value and the column's name in its name.
+            let cell = |element: &IUIAutomationElement| {
+                let value = element.GetCurrentPropertyValue(UIA_ValueValuePropertyId).ok().and_then(|v| BSTR::try_from(&v).ok()).map(|s| s.to_string()).unwrap_or_default();
+                if value.is_empty() { text(element.CurrentName()) } else { value }
+            };
+            let Ok(grid) = owner.GetCurrentPatternAs::<IUIAutomationGridPattern>(UIA_GridPatternId) else {
+                return rows_of(&owner, rows, columns, auto);
+            };
+            let (total_rows, total_columns) = (grid.CurrentRowCount().map_err(say)? as usize, grid.CurrentColumnCount().map_err(say)? as usize);
+            let mut headers = Vec::new();
+            if let Ok(table) = owner.GetCurrentPatternAs::<IUIAutomationTablePattern>(UIA_TablePatternId)
+                && let Ok(list) = table.GetCurrentColumnHeaders()
+            {
+                for at in 0..list.Length().unwrap_or(0).min(columns as i32) {
+                    if let Ok(header) = list.GetElement(at) {
+                        headers.push(cell(&header));
+                    }
+                }
+            }
+            let mut cells = Vec::new();
+            for row in 0..total_rows.min(rows) {
+                let mut line = Vec::new();
+                for column in 0..total_columns.min(columns) {
+                    line.push(grid.GetItem(row as i32, column as i32).map(|item| cell(&item)).unwrap_or_default());
+                }
+                cells.push(line);
+            }
+            Ok(Table { headers, rows: cells, total_rows, total_columns })
         }
     }
 

@@ -36,6 +36,7 @@ mod service;
 use mac::service;
 mod setup;
 mod shot;
+mod system;
 #[cfg(windows)]
 mod uia;
 #[cfg(windows)]
@@ -54,7 +55,22 @@ fn main() {
             demo::run(number("--seconds", 12), number("--linger", 0));
         }
         Some("--version") => println!("deskcrew {}", env!("CARGO_PKG_VERSION")),
-        None | Some("help" | "--help" | "-h") => println!("{}", service::HELP),
-        _ => std::process::exit(client::run(args)),
+        None | Some("help" | "--help" | "-h") => println!("{}
+{}", service::HELP, system::HELP),
+        _ => {
+            // Processes, files, the shell and the like need no window, so they skip the service.
+            let words: Vec<String> = args.iter().enumerate().filter(|(at, _)| !(args.get(at.wrapping_sub(1)).is_some_and(|w| w == "--agent") || args[*at] == "--agent")).map(|(_, w)| w.clone()).collect();
+            if let Some(reply) = system::handle(&words) {
+                match reply {
+                    Ok(text) => println!("{text}"),
+                    Err(text) => {
+                        println!("{text}");
+                        std::process::exit(1);
+                    }
+                }
+                return;
+            }
+            std::process::exit(client::run(args))
+        }
     }
 }

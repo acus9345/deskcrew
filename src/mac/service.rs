@@ -1282,6 +1282,7 @@ impl Service {
             }
             "cursor" => Err("the Mac version never borrows the cursor, so there is nothing to set".into()),
             "notifications" => Err("notifications are not on the Mac version yet".into()),
+            "table" | "pick-file" => Err(format!("{command} is not on the Mac version yet")),
             "resume" => {
                 STOP.store(false, Ordering::Relaxed);
                 Ok("ok".into())

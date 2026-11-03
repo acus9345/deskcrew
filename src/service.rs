@@ -55,6 +55,11 @@ const WAIT_MOST_MS: u64 = 60_000;
 const WAIT_STEP: Duration = Duration::from_millis(200);
 const MAX_WINDOWS: usize = 40;
 const MAX_GET_CHARS: usize = 20_000;
+const DEFAULT_TABLE_ROWS: usize = 50;
+const DIALOG_CLOSE: Duration = Duration::from_secs(3);
+const MAX_TABLE_ROWS: usize = 500;
+const MAX_TABLE_COLUMNS: usize = 20;
+const MAX_CELL_CHARS: usize = 60;
 const STOPPED: &str = "stopped by the person with Ctrl+Alt+Esc: ask them before doing more (deskcrew resume clears it)";
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
 
@@ -71,6 +76,7 @@ is e3 on|off|open|closed|selected|enabled|disabled
 down shift --real | down left x,y --mouse     up (lets go; 30 s limit)
 set e3 "value"     type [e3] "text" [--paste]     key enter [--hold ms --real]     select e3 "Item"
 scroll [e3] up|down [n]     show e3     wait "text" [--gone] [--ms N]
+table e5 [--from N]                   a table or grid as rows     pick-file "path"   fill an Open or Save dialog
 drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
 do "click e1; set e2 hi; key enter" [--dry] [--risk low|medium|high]   many steps, one reply
 Any action: --expect "text" fails unless the text shows afterwards.
@@ -1278,6 +1284,7 @@ impl Service {
             ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
             ("draw", _) => self.draw(who, &flags, tracked, view, rest),
             ("wait", [text]) => self.wait(&flags, tracked, view, text),
+            ("pick-file", [path]) => self.pick_file(who, &flags, tracked, view, path),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
         }
     }
@@ -1329,7 +1336,7 @@ impl Service {
                     self.remember(who, tracked.hwnd, view.lines.clone());
                 }
                 // The controls tell nothing: the picture still can, without sending one.
-                let picture = if nothing && !waited_only { picture_before.as_ref().map(|before| self.picture_change(&tracked, before)) } else { None };
+                let picture = if nothing && !waited_only && !routes.iter().any(|r| r.starts_with("dialog")) { picture_before.as_ref().map(|before| self.picture_change(&tracked, before)) } else { None };
                 match picture {
                     Some(Some(note)) => out.push(note),
                     Some(None) if routes.iter().any(|r| r == "message") => out.push("nothing changed, on screen either: try --real if it should have".into()),
@@ -1462,6 +1469,61 @@ impl Service {
         };
         view.blind = Some((hash, said.clone()));
         said
+    }
+
+    /// A table or grid as tab-separated rows, headers first, so a list of files or a data grid
+    /// reads in one call.
+    fn table(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
+        let word = words.first().ok_or("table needs a control")?;
+        let tracked = self.pick(who, flags.window.as_deref())?;
+        let mut view = tracked.view.lock().unwrap();
+        if !view.read_once {
+            self.first_read(&tracked, &mut view, false)?;
+        }
+        let Target::Control(id) = self.resolve(word, who, &tracked, &mut view)? else { return Err("table needs a control".into()) };
+        let rows = if flags.from == 0 { DEFAULT_TABLE_ROWS } else { flags.from.min(MAX_TABLE_ROWS) };
+        let table = view.nodes[&id].element.grid(rows, MAX_TABLE_COLUMNS, &self.uia)?;
+        // Explorer wraps dates in invisible direction marks, which only cost characters.
+        let clip = |cells: &[String]| cells.iter().map(|cell| lines::clip(&cell.replace(['\u{200e}', '\u{200f}'], ""), MAX_CELL_CHARS)).collect::<Vec<_>>().join("\t");
+        let mut out = vec![format!("{} rows, {} columns", table.total_rows, table.total_columns)];
+        if !table.headers.is_empty() {
+            out.push(clip(&table.headers));
+        }
+        out.extend(table.rows.iter().map(|row| clip(row)));
+        if table.total_rows > table.rows.len() {
+            out.push(format!("… {} more rows: table {word} --from N reads the first N (up to {MAX_TABLE_ROWS})", table.total_rows - table.rows.len()));
+        }
+        Ok(out.join("\n"))
+    }
+
+    /// Fill a Windows Open or Save dialog's file name and press its Open or Save button. The field
+    /// and button are found by their ids, which are the same in every language.
+    fn pick_file(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, path: &str) -> Reply {
+        self.read(tracked, view, false)?;
+        let field = view
+            .nodes
+            .iter()
+            .find(|(_, node)| node.parts.role == "edit" && ["1001", "1148"].contains(&node.control_id.as_str()))
+            .map(|(id, _)| *id)
+            .ok_or("no Open or Save dialog is showing in this window")?;
+        let button = view
+            .nodes
+            .iter()
+            .find(|(_, node)| node.parts.role == "button" && node.control_id == "1")
+            .map(|(id, _)| *id)
+            .ok_or("that dialog has no Open or Save button")?;
+        self.set(who, flags, tracked, view, &format!("e{field}"), path)?;
+        self.click(who, flags, tracked, view, &format!("e{button}"))?;
+        // The dialog closes a moment after its button is pressed: wait, so the reply shows it gone.
+        let started = Instant::now();
+        while started.elapsed() < DIALOG_CLOSE {
+            thread::sleep(WAIT_STEP);
+            self.read(tracked, view, false)?;
+            if !view.nodes.contains_key(&field) {
+                return Ok("dialog closed".into());
+            }
+        }
+        Ok("dialog still open: see what it asks".into())
     }
 
     fn get(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
@@ -1636,6 +1698,7 @@ impl Service {
             "windows" => self.windows_list(who, args.first()),
             "see" => self.see(who, &flags, args),
             "get" => self.get(who, &flags, args),
+            "table" => self.table(who, &flags, args),
             "shot" => self.shot(who, &flags, args),
             "launch" => self.launch(who, &flags, args),
             "focus" => {
@@ -1693,7 +1756,7 @@ impl Service {
                 self.act(who, &flags, &steps)
             }
             "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => self.draw_together(who, &flags, args),
-            "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" => {
+            "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" | "pick-file" => {
                 let mut steps = vec![rest.clone()];
                 steps.extend(expected(&flags));
                 self.act(who, &flags, &steps)

@@ -136,6 +136,58 @@ How each tool was called:
 - mcp-windows: `ui_snapshot` in full mode. Its incremental mode makes repeated reads cheaper and was not measured.
 - Windows-MCP: `Snapshot` without a picture. It always reads the whole desktop, other windows and taskbar included, so its figures are not for one window alone. It waits while the person is using the computer, and still took about 15 s per read after 12 idle seconds.
 
+## Features compared
+
+From each tool's own README, help and tool list, checked on 2026-11-03. A dash means its documentation does not mention it.
+
+| | deskcrew | [agent-desktop](https://github.com/vercel-labs/agent-desktop) | [agent-cu](https://github.com/kortix-ai/agent-computer-use) | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) | [mcp-windows](https://github.com/sbroenne/mcp-windows) |
+| --- | --- | --- | --- | --- | --- |
+| Form | command line, skill and standing rules | command line, C library | command line, skill | MCP server | MCP server, VS Code extension |
+| Platforms | Windows; macOS written, not yet run | macOS, Windows, Linux | macOS, Windows, Linux | Windows | Windows |
+| Sets up your agents for you | 15 agent apps and CLIs | — | skill installer and `setup` | — | — |
+| Controls by stable ref | yes | yes, checked again before acting | yes | labels | element ids |
+| Replies show only what changed | yes | — | — | — | incremental snapshots |
+| Leaves your mouse alone | yes; borrowing it needs your permission | moves it in `--headed` mode | clicks without taking focus | no | uses it for canvases |
+| Several agents at once | yes, in parallel | takes turns | — | — | — |
+| A drawn cursor per agent, coverable by your windows | yes | one overlay, always on top | — | — | — |
+| Works in covered windows | mostly | — | — | no | — |
+| Drawing strokes | yes | drag | drag | drag | yes |
+| Reads text from pictures | yes, offline OCR | no | — | through a vision model | — |
+| Says whether the picture changed | yes | — | — | — | — |
+| Screenshots | yes | yes | yes | yes, annotated | — |
+| Tables and grids | `table` | — | — | — | yes |
+| Open and Save dialogs | `pick-file` | — | — | — | yes |
+| Web pages | windows as apps, and `fetch` for page text | agent-browser | Electron apps | page DOM and scraping | Edge and Chrome pages |
+| Batches | `do`, `--expect` | — | `batch`, YAML workflows | multi-select and multi-edit | `ui_batch` |
+| Wait for text | yes | yes | yes | yes | yes |
+| Hold keys and buttons | yes, let go after 30 s | listed, not working yet | — | — | — |
+| Move, resize and close windows | yes | yes | move and resize | yes | yes, with monitors |
+| Clipboard | yes | yes | — | yes | — |
+| Notifications | read, dismiss and send | yes | — | send | — |
+| System settings pages | `settings` | system surfaces | — | — | — |
+| Shell commands | `run` | — | — | PowerShell | — |
+| Files | `file`, deleting to the Recycle Bin | — | — | yes | — |
+| Processes | `processes`, `kill` | — | — | yes | — |
+| Registry | `reg`, writing only your own settings | — | — | yes | — |
+| Stop switch | Ctrl+Alt+Esc stops every agent | refuses stale refs | — | waits while you use the computer | — |
+
+## Beyond windows
+
+These run in the command itself, without the service, so an agent can do the work around an app without switching tools.
+
+| Command | What it does |
+| --- | --- |
+| `processes [filter]` | Running programs, with their window titles |
+| `kill pid\|name [--force]` | Ends a program. It refuses Windows' own processes and the agent's own shell, and needs `--force` for Explorer or for a name that matches several |
+| `run "command" [--ms N]` | Runs a PowerShell command (zsh on a Mac) and returns its output and exit code, stopping after 60 s unless `--ms` says otherwise |
+| `fetch URL [--raw]` | A web page as plain text, or as it came with `--raw` |
+| `file list\|read\|write\|append\|find\|copy\|move\|trash` | Files and folders. `write`, `copy` and `move` refuse to replace a file without `--force`, and `trash` uses the Recycle Bin so nothing is lost |
+| `reg get\|list\|set` | The registry. `set` only writes under `HKCU`, the person's own settings |
+| `notify "title" "message"` | A Windows notification |
+| `settings [page]` | Opens a page of Settings, such as `display` or `bluetooth` |
+| `table e5 [--from N]` | A table or grid, such as a file list or data grid, as tab-separated rows with its headers |
+| `pick-file "path"` | Fills an Open or Save dialog and presses its button, in any Windows language |
+
 ## How actions reach an app
 
 Each reply names the route it took.

@@ -6,6 +6,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.9] - 2026-11-03
+
+- Add commands beyond windows: `processes`, `kill`, `run`, `fetch`, `file`, `reg`, `notify` and `settings`. They need no service, refuse to end Windows' own processes or the agent's shell, never overwrite without `--force`, delete only to the Recycle Bin, and write the registry only under HKCU.
+- Add `table`, which reads a table or grid as rows, and `pick-file`, which fills an Open or Save dialog in any Windows language.
+- Add a feature comparison with agent-desktop, agent-cu, Windows-MCP and mcp-windows to the README.
+
 ## [0.1.8] - 2026-11-03
 
 - `setup` writes a standing rule into every agent app and CLI it finds (Claude Code, Codex, Gemini CLI and Antigravity, Copilot CLI and VS Code Copilot, Windsurf, OpenCode, Amp, Qwen Code, Factory Droid, Kiro, Continue and Cline), telling them to use deskcrew on their own and instead of any other desktop control. Cursor gets the skill, and setup prints the rule for its User Rules.

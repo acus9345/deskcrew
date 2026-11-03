@@ -78,7 +78,7 @@ const MOST_ANCESTORS: usize = 16;
 
 /// Every process's parent and lower-case program name, without folder or `.exe`.
 #[cfg(not(windows))]
-fn processes() -> HashMap<u32, (u32, String)> {
+pub fn processes() -> HashMap<u32, (u32, String)> {
     let listed = std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,comm="]).output();
     let text = listed.map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default();
     text.lines()
@@ -94,7 +94,7 @@ fn processes() -> HashMap<u32, (u32, String)> {
 }
 
 #[cfg(windows)]
-fn processes() -> HashMap<u32, (u32, String)> {
+pub fn processes() -> HashMap<u32, (u32, String)> {
     let mut parents = HashMap::new();
     unsafe {
         let snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
