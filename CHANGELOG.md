@@ -6,6 +6,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.7] - 2026-11-03
+
+- Let agents use deskcrew on their own whenever a task needs the desktop: the skill now says it is the default way to control the computer, ahead of screenshots and other computer-use tools.
+
 ## [0.1.6] - 2026-11-03
 
 - Bring the macOS version close to Windows: toggles, `select`, `hover`, `show`, `is`, `draw`, held modifier keys, window placement, `focus`, `close`, the clipboard, screens, `--real`, `--paste`, `--fast`, `--with`, more click kinds, `do --dry` and `--risk`, and `wait --gone`. It type-checks for Apple Silicon and Intel but has still not been run on a Mac.
