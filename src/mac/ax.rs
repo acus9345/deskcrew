@@ -32,6 +32,7 @@ pub struct Node {
     pub identity: String,
     pub parts: Parts,
     pub rect: Bounds,
+    pub ax_role: String,
     pub element: Owned,
 }
 
@@ -80,6 +81,48 @@ pub fn set(element: &Owned, name: &str, value: CFTypeRef) -> Result<(), String> 
 pub fn set_text(element: &Owned, text: &str) -> Result<(), String> {
     let value = cf_string(text);
     set(element, "AXValue", value.0)
+}
+
+pub fn set_bool(element: &Owned, name: &str, value: bool) -> Result<(), String> {
+    set(element, name, unsafe { if value { kCFBooleanTrue } else { kCFBooleanFalse } })
+}
+
+/// Move a window, in top-left points.
+pub fn set_position(element: &Owned, x: i32, y: i32) -> Result<(), String> {
+    let point = CGPoint { x: x as f64, y: y as f64 };
+    let value = Owned::new(unsafe { AXValueCreate(kAXValueCGPointType, (&point as *const CGPoint).cast()) }).ok_or("macOS would not make that position")?;
+    set(element, "AXPosition", value.0)
+}
+
+pub fn set_size(element: &Owned, w: i32, h: i32) -> Result<(), String> {
+    let size = CGSize { width: w as f64, height: h as f64 };
+    let value = Owned::new(unsafe { AXValueCreate(kAXValueCGSizeType, (&size as *const CGSize).cast()) }).ok_or("macOS would not make that size")?;
+    set(element, "AXSize", value.0)
+}
+
+/// An element's children, such as the items of an open menu.
+pub fn children(element: &Owned) -> Vec<Owned> {
+    attribute(element, "AXChildren").map(|list| items(list.0).into_iter().filter_map(Owned::retain).collect()).unwrap_or_default()
+}
+
+/// The first element under this one, at most `depth` levels down, with a matching title or value.
+pub fn find_named(element: &Owned, wanted: &str, depth: usize) -> Option<Owned> {
+    let wanted = wanted.to_lowercase();
+    let mut level = vec![element.clone()];
+    for _ in 0..depth {
+        let mut next = Vec::new();
+        for parent in &level {
+            for child in children(parent) {
+                let name = full_text(&child).to_lowercase();
+                if name == wanted {
+                    return Some(child);
+                }
+                next.push(child);
+            }
+        }
+        level = next;
+    }
+    None
 }
 
 pub fn focus(element: &Owned) -> Result<(), String> {
@@ -283,6 +326,7 @@ impl Walk<'_> {
                     identity: format!("{ax_role}|{identifier}|{name}"),
                     parts: Parts { role: role.to_string(), name: shown, value, states, cells: Vec::new() },
                     rect,
+                    ax_role: ax_role.clone(),
                     element: kept,
                 });
                 if is_row(&ax_role) {

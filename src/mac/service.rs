@@ -9,7 +9,7 @@ use super::{
 };
 use crate::{
     lines::{self, Seen},
-    look,
+    look, motion,
     overlay::{self, Overlay, Rect},
     pipe::{self, Pipe},
     shot::{self, Frame, Frames},
@@ -26,25 +26,28 @@ use std::{
 };
 
 pub const HELP: &str = "\
-deskcrew - drive Mac apps in the background. Each agent gets its own cursor.
-windows [filter]                 list windows as w1, w2...
-see [window] [-f] [--all] [--find text] [--from N]
-                                 list controls as e1, e2... later calls show only changes
-get e3                           the whole text of a control
-click e3|name|x,y ... [--right] [--double]
-set e3 \"text\"                    replace a field's text
-type [e3] \"text\"                 type into a field, or wherever the app's focus is
-key cmd+s [--force]              press keys in the app, without bringing it forward
-scroll e3|x,y up|down [N]
-drag e3|x,y e4|x,y
-wait \"text\" [--timeout ms]       wait until text shows
-shot [window|e3] [-f] [--marks] [--rulers] [--changed] [--region x,y,w,h] [--edge N]
-launch App [--front] [args...]   open an app, behind the front one unless --front
-do \"click e1; set e2 hi; key enter\"
-status | resume | quit
-Pick a window with -w name|w2. Any action: --expect \"text\" fails unless the text shows afterwards.
-Every action replies with what changed, in the picture too. x,y are points in the last shot, or text see read.
-Ctrl+Option+Esc stops every agent. macOS asks once for Accessibility, and for Screen Recording before pictures.";
+deskcrew drives Mac apps in the background. Refs stay valid, so read once.
+windows [filter]                      list windows
+see [window] [-f] [-a] [--find word] [--from N]
+                                      controls; later reads show only changes (-f for all, -a off-screen too)
+get e3                                a control's full text
+shot [window|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
+                                      PNG path; \"unchanged\" if it matches the last one
+click e3 [e4 ...] | \"Name\" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift]
+hover e3 | x,y     check e3     uncheck e3     toggle e3     expand e3     collapse e3     clear e3
+is e3 on|off|open|closed|selected|enabled|disabled
+down shift     up (lets go; 30 s limit)
+set e3 \"value\"     type [e3] \"text\" [--paste]     key enter [--hold ms]     select e3 \"Item\"
+scroll [e3] up|down [n]     show e3     wait \"text\" [--gone] [--ms N]
+drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth]
+do \"click e1; set e2 hi; key enter\" [--dry] [--risk low|medium|high]   many steps, one reply
+Any action: --expect \"text\" fails unless the text shows afterwards.
+launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
+apps     screens     clip     clip set \"text\"     clip clear     status     resume     quit     setup (installs for your coding agents)
+Every action replies with what changed, in the picture too. x,y are points in the last shot, or text see read. Ctrl+Option+Esc stops every agent.
+Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
+--real (brings the app forward for a moment and uses the system keyboard: a last resort).
+macOS asks once for Accessibility, and for Screen Recording before the first picture.";
 
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 const SETTLE_FIRST: Duration = Duration::from_millis(60);
@@ -57,7 +60,12 @@ const WAIT_MOST_MS: u64 = 60_000;
 const WAIT_STEP: Duration = Duration::from_millis(200);
 const MAX_WINDOWS: usize = 40;
 const MAX_GET_CHARS: usize = 20_000;
-const DRAG_STEPS: usize = 24;
+const HOLD_MOST: Duration = Duration::from_secs(30);
+const FRONT_SETTLE: Duration = Duration::from_millis(80);
+const PASTE_SETTLE: Duration = Duration::from_millis(150);
+const MENU_OPEN: Duration = Duration::from_millis(200);
+const MENU_DEPTH: usize = 3;
+const LIST_DEPTH: usize = 4;
 const LEAST_CHANGE: u32 = 4;
 const STOPPED: &str = "stopped by the person with Ctrl+Option+Esc: ask them before doing more (deskcrew resume clears it)";
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
@@ -130,7 +138,7 @@ struct AgentState {
     shots: HashMap<u32, LastShot>,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Flags {
     window: Option<String>,
     full: bool,
@@ -139,15 +147,51 @@ struct Flags {
     from: usize,
     right: bool,
     double: bool,
+    triple: bool,
+    middle: bool,
+    back: bool,
+    forward: bool,
+    with: Option<String>,
     force: bool,
     front: bool,
+    fast: bool,
+    real: bool,
+    paste: bool,
+    smooth: bool,
+    gone: bool,
+    dry: bool,
+    risk: Option<String>,
     marks: bool,
     rulers: bool,
     changed: bool,
+    screen: bool,
     region: Option<String>,
     edge: Option<u32>,
-    timeout: Option<u64>,
+    ms: Option<u64>,
+    hold: Option<u64>,
     expect: Option<String>,
+}
+
+impl Flags {
+    /// A step's own flags, with the command's switched on too.
+    fn merged(mut self, outer: &Flags) -> Flags {
+        self.right |= outer.right;
+        self.double |= outer.double;
+        self.triple |= outer.triple;
+        self.middle |= outer.middle;
+        self.back |= outer.back;
+        self.forward |= outer.forward;
+        self.force |= outer.force;
+        self.fast |= outer.fast;
+        self.real |= outer.real;
+        self.paste |= outer.paste;
+        self.smooth |= outer.smooth;
+        self.gone |= outer.gone;
+        self.with = self.with.or_else(|| outer.with.clone());
+        self.ms = self.ms.or(outer.ms);
+        self.hold = self.hold.or(outer.hold);
+        self
+    }
 }
 
 fn parse(words: &[String]) -> (Flags, Vec<String>) {
@@ -157,36 +201,46 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
     while at < words.len() {
         let word = &words[at];
         let next = words.get(at + 1).cloned();
-        let mut takes = |value: &mut Option<String>| {
-            *value = next.clone();
-            at += 1;
-        };
+        let number = |text: &Option<String>| text.as_ref().and_then(|n| n.parse::<u64>().ok());
+        let mut took = true;
         match word.as_str() {
-            "-w" | "--window" => takes(&mut flags.window),
-            "--find" => takes(&mut flags.find),
-            "--region" => takes(&mut flags.region),
-            "--expect" => takes(&mut flags.expect),
-            "--from" => {
-                flags.from = next.and_then(|n| n.parse().ok()).unwrap_or(0);
-                at += 1;
-            }
-            "--edge" => {
-                flags.edge = next.and_then(|n| n.parse().ok());
-                at += 1;
-            }
-            "--timeout" => {
-                flags.timeout = next.and_then(|n| n.parse().ok());
-                at += 1;
-            }
+            "-w" | "--window" => flags.window = next.clone(),
+            "--find" => flags.find = next.clone(),
+            "--region" => flags.region = next.clone(),
+            "--expect" => flags.expect = next.clone(),
+            "--with" => flags.with = next.clone(),
+            "--risk" => flags.risk = next.clone(),
+            "--from" => flags.from = number(&next).unwrap_or(0) as usize,
+            "--edge" => flags.edge = number(&next).map(|n| n as u32),
+            "--ms" | "--timeout" => flags.ms = number(&next),
+            "--hold" => flags.hold = number(&next),
+            _ => took = false,
+        }
+        if took {
+            at += 2;
+            continue;
+        }
+        match word.as_str() {
             "-f" | "--full" => flags.full = true,
             "-a" | "--all" => flags.all = true,
             "--right" => flags.right = true,
             "--double" => flags.double = true,
+            "--triple" => flags.triple = true,
+            "--middle" => flags.middle = true,
+            "--back" => flags.back = true,
+            "--forward" => flags.forward = true,
             "--force" => flags.force = true,
             "--front" => flags.front = true,
+            "--fast" => flags.fast = true,
+            "--real" => flags.real = true,
+            "--paste" => flags.paste = true,
+            "--smooth" => flags.smooth = true,
+            "--gone" => flags.gone = true,
+            "--dry" => flags.dry = true,
             "--marks" => flags.marks = true,
             "--rulers" => flags.rulers = true,
             "--changed" => flags.changed = true,
+            "--screen" => flags.screen = true,
             _ => rest.push(word.clone()),
         }
         at += 1;
@@ -212,7 +266,16 @@ enum Target {
     Point(i32, i32),
 }
 
+/// Modifier keys one agent holds down in one app.
+struct Held {
+    pid: i32,
+    flags: u64,
+    since: Instant,
+}
+
 struct Service {
+    held: Mutex<HashMap<String, Held>>,
+    real_input: Mutex<()>,
     windows: Mutex<(u32, HashMap<u32, Arc<Tracked>>)>,
     agents: Mutex<HashMap<String, AgentState>>,
     overlay: Overlay,
@@ -374,82 +437,255 @@ impl Service {
         }
     }
 
-    fn cursor_on(&self, who: &str, tracked: &Tracked, x: i32, y: i32) {
+    fn cursor_on(&self, who: &str, flags: &Flags, tracked: &Tracked, x: i32, y: i32) {
         self.overlay.over(who, tracked.window);
-        self.overlay.move_to(who, x, y);
+        if flags.fast {
+            self.overlay.jump(who, x, y);
+        } else {
+            self.overlay.move_to(who, x, y);
+        }
         self.overlay.over(who, tracked.window);
+    }
+
+    /// A control's box now, and its element, for acting on it.
+    fn control(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<(u32, Bounds, Owned), String> {
+        match self.resolve(word, who, tracked, view)? {
+            Target::Control(id) => {
+                let node = &view.nodes[&id];
+                Ok((id, ax::rect(&node.element).unwrap_or(node.rect), node.element.clone()))
+            }
+            Target::Point(..) => Err("that needs a control".into()),
+        }
+    }
+
+    fn pressed(&self, who: &str, rect: Bounds) {
+        self.overlay.press(who, Rect { x: rect.0, y: rect.1, w: rect.2, h: rect.3 });
+    }
+
+    /// Bring the app forward for `work`, then give the front back to whatever had it. Agents take
+    /// turns here, because only one app can be in front.
+    fn front<T>(&self, tracked: &Tracked, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _turn = self.real_input.lock().unwrap();
+        let before = apps::front_pid();
+        if before != Some(tracked.pid) && !apps::activate(tracked.pid) {
+            return Err("macOS would not bring that app forward".into());
+        }
+        if let Some(window) = apps::find(tracked.window).and_then(|w| apps::element(&w)) {
+            let _ = ax::perform(&window, "AXRaise");
+        }
+        thread::sleep(FRONT_SETTLE);
+        let result = work();
+        thread::sleep(FRONT_SETTLE);
+        if let Some(pid) = before
+            && pid != tracked.pid
+        {
+            apps::activate(pid);
+        }
+        result
+    }
+
+    /// Modifier keys this agent holds down in this app, let go of after 30 seconds.
+    fn held_flags(&self, who: &str, pid: i32) -> u64 {
+        self.held.lock().unwrap().get(who).filter(|held| held.pid == pid).map_or(0, |held| held.flags)
+    }
+
+    /// Let go of held keys: everyone's, or only those held too long or since Ctrl+Option+Esc.
+    fn release(&self, all: bool) -> Vec<String> {
+        let stopped = STOP.load(Ordering::Relaxed);
+        let mut held = self.held.lock().unwrap();
+        let mut gone = Vec::new();
+        held.retain(|who, keys| {
+            let keep = !all && !stopped && keys.since.elapsed() < HOLD_MOST;
+            if !keep {
+                let _ = input::modifiers_changed(keys.pid, keys.flags, false);
+                gone.push(who.clone());
+            }
+            keep
+        });
+        gone
     }
 
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
-        let button = if flags.right { Button::Right } else { Button::Left };
-        let count = if flags.double { 2 } else { 1 };
-        match self.resolve(word, who, tracked, view)? {
-            Target::Point(x, y) => {
-                self.cursor_on(who, tracked, x, y);
-                self.overlay.press(who, Rect { x: x - 6, y: y - 6, w: 12, h: 12 });
-                input::click(tracked.pid, tracked.window, x as f64, y as f64, button, count)?;
-                Ok("event".into())
-            }
+        let button = match () {
+            _ if flags.right => Button::Right,
+            _ if flags.middle => Button::Middle,
+            _ if flags.back => Button::Back,
+            _ if flags.forward => Button::Forward,
+            _ => Button::Left,
+        };
+        let count = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
+        let with = match &flags.with {
+            Some(spec) => input::modifiers(spec)?,
+            None => 0,
+        } | self.held_flags(who, tracked.pid);
+        let (rect, element) = match self.resolve(word, who, tracked, view)? {
+            Target::Point(x, y) => ((x - 6, y - 6, 12, 12), None),
             Target::Control(id) => {
                 let node = &view.nodes[&id];
-                let rect = ax::rect(&node.element).unwrap_or(node.rect);
-                let (x, y) = centre(rect);
-                self.cursor_on(who, tracked, x, y);
-                self.overlay.press(who, Rect { x: rect.0, y: rect.1, w: rect.2, h: rect.3 });
-                // An action the app performs itself works behind other windows and takes no focus.
-                let action = match (flags.right, flags.double) {
-                    (true, _) => Some("AXShowMenu"),
-                    (false, false) => Some("AXPress"),
-                    _ => None,
-                };
-                if let Some(action) = action
-                    && ax::perform(&node.element, action).is_ok()
-                {
-                    return Ok(if flags.right { "menu".into() } else { "press".into() });
-                }
-                input::click(tracked.pid, tracked.window, x as f64, y as f64, button, count)?;
-                Ok("event".into())
+                (ax::rect(&node.element).unwrap_or(node.rect), Some(node.element.clone()))
             }
+        };
+        let (x, y) = centre(rect);
+        self.cursor_on(who, flags, tracked, x, y);
+        self.pressed(who, rect);
+        // An action the app performs itself works behind other windows and takes no focus.
+        if let Some(element) = &element
+            && with == 0
+            && count == 1
+            && !flags.real
+        {
+            let action = match button {
+                Button::Left => Some("AXPress"),
+                Button::Right => Some("AXShowMenu"),
+                _ => None,
+            };
+            if let Some(action) = action
+                && ax::perform(element, action).is_ok()
+            {
+                return Ok(if button == Button::Right { "menu".into() } else { "press".into() });
+            }
+        }
+        let send = || input::click(tracked.pid, tracked.window, x as f64, y as f64, button, count, with);
+        if flags.real {
+            self.front(tracked, send)?;
+            Ok("real".into())
+        } else {
+            send()?;
+            Ok("event".into())
         }
     }
 
-    fn set(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
-        let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("set needs a control".into()) };
-        let node = &view.nodes[&id];
-        let rect = ax::rect(&node.element).unwrap_or(node.rect);
+    fn hover(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
+        let (x, y) = self.point_of(word, who, tracked, view)?;
+        self.cursor_on(who, flags, tracked, x, y);
+        input::hover(tracked.pid, tracked.window, x as f64, y as f64)?;
+        Ok("hover".into())
+    }
+
+    fn set(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
+        let (_, rect, element) = self.control(word, who, tracked, view)?;
         let (x, y) = centre(rect);
-        self.cursor_on(who, tracked, x, y);
-        if !ax::settable(&node.element, "AXValue") {
+        self.cursor_on(who, flags, tracked, x, y);
+        if !ax::settable(&element, "AXValue") {
             return Err("that control's text can't be set: try type".into());
         }
-        ax::set_text(&node.element, value)?;
-        self.overlay.press(who, Rect { x: rect.0, y: rect.1, w: rect.2, h: rect.3 });
+        ax::set_text(&element, value)?;
+        self.pressed(who, rect);
         Ok("value".into())
     }
 
-    fn type_text(&self, who: &str, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+    /// Leave a checkbox or switch alone if it is already that way, or press it once.
+    fn ensure(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, wanted: Option<&'static str>) -> Reply {
+        let (id, rect, element) = self.control(word, who, tracked, view)?;
+        if let Some(wanted) = wanted
+            && view.nodes[&id].parts.states.contains(&wanted)
+        {
+            return Ok(format!("already {wanted}"));
+        }
+        let (x, y) = centre(rect);
+        self.cursor_on(who, flags, tracked, x, y);
+        self.pressed(who, rect);
+        ax::perform(&element, "AXPress")?;
+        Ok("toggle".into())
+    }
+
+    fn expand(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, open: bool) -> Reply {
+        let (id, rect, element) = self.control(word, who, tracked, view)?;
+        let wanted = if open { "open" } else { "closed" };
+        if view.nodes[&id].parts.states.contains(&wanted) {
+            return Ok(format!("already {wanted}"));
+        }
+        let (x, y) = centre(rect);
+        self.cursor_on(who, flags, tracked, x, y);
+        self.pressed(who, rect);
+        if ax::settable(&element, "AXExpanded") {
+            ax::set_bool(&element, "AXExpanded", open)?;
+        } else if open && view.nodes[&id].parts.role == "combobox" {
+            ax::perform(&element, "AXShowMenu").or_else(|_| ax::perform(&element, "AXPress"))?;
+        } else {
+            ax::perform(&element, "AXPress").map_err(|_| format!("that control cannot be {}", if open { "expanded" } else { "collapsed" }))?;
+        }
+        Ok("expand".into())
+    }
+
+    fn show(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
+        let (_, _, element) = self.control(word, who, tracked, view)?;
+        ax::perform(&element, "AXScrollToVisible").map_err(|_| "that control cannot scroll into view".to_string())?;
+        Ok("scroll".into())
+    }
+
+    /// Pick an entry: from a pop-up button's menu, by typing into a combo box, or in a list.
+    fn select(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, item: &str) -> Reply {
+        let (id, rect, element) = self.control(word, who, tracked, view)?;
+        let (x, y) = centre(rect);
+        self.cursor_on(who, flags, tracked, x, y);
+        self.pressed(who, rect);
+        let ax_role = view.nodes[&id].ax_role.clone();
+        if ax_role == "AXComboBox" && ax::settable(&element, "AXValue") {
+            ax::set_text(&element, item)?;
+            return Ok("value".into());
+        }
+        if ax_role == "AXPopUpButton" || ax_role == "AXMenuButton" {
+            ax::perform(&element, "AXPress").map_err(|_| "that dropdown did not answer".to_string())?;
+            thread::sleep(MENU_OPEN);
+            if let Some(entry) = ax::find_named(&element, item, MENU_DEPTH) {
+                ax::perform(&entry, "AXPress")?;
+                return Ok("select".into());
+            }
+            let _ = input::press(input::To::App(tracked.pid), &input::chord("esc")?, 0, Duration::ZERO);
+            return Err(format!("no entry named '{item}'"));
+        }
+        let entry = ax::find_named(&element, item, LIST_DEPTH).ok_or(format!("no entry named '{item}'"))?;
+        if ax::settable(&entry, "AXSelected") {
+            ax::set_bool(&entry, "AXSelected", true)?;
+        } else {
+            ax::perform(&entry, "AXPress")?;
+        }
+        Ok("select".into())
+    }
+
+    fn type_text(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let (target, text) = match words {
             [text] => (None, text.as_str()),
             [target, text] => (Some(target.as_str()), text.as_str()),
-            _ => return Err("type needs text, and can take a control first".into()),
+            _ => return Err("type [control] \"text\"".into()),
         };
         let mut field = None;
         if let Some(word) = target {
-            let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("type needs a control, not x,y".into()) };
-            let node = &view.nodes[&id];
-            let rect = ax::rect(&node.element).unwrap_or(node.rect);
+            let (_, rect, element) = self.control(word, who, tracked, view)?;
             let (x, y) = centre(rect);
-            self.cursor_on(who, tracked, x, y);
-            let _ = ax::focus(&node.element);
-            field = Some(node.element.clone());
+            self.cursor_on(who, flags, tracked, x, y);
+            let _ = ax::focus(&element);
+            field = Some(element);
+        }
+        if flags.paste {
+            let saved = apps::clipboard();
+            apps::set_clipboard(Some(text))?;
+            let paste = input::chord("cmd+v")?;
+            let sent = if flags.real {
+                self.front(tracked, || input::press(input::To::Front, &paste, 0, Duration::ZERO))
+            } else {
+                input::press(input::To::App(tracked.pid), &paste, 0, Duration::ZERO)
+            };
+            thread::sleep(PASTE_SETTLE);
+            let _ = apps::set_clipboard(saved.as_deref());
+            sent?;
+            return Ok("paste".into());
         }
         let before = field.as_ref().and_then(|f| ax::text(f, "AXValue"));
-        let typed = input::type_text(tracked.pid, text, &|| STOP.load(Ordering::Relaxed))?;
+        let stop = || STOP.load(Ordering::Relaxed);
+        let typed = if flags.real {
+            self.front(tracked, || input::type_text(input::To::Front, text, &stop))?
+        } else {
+            input::type_text(input::To::App(tracked.pid), text, &stop)?
+        };
         if typed < text.chars().count() {
             return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
         }
         // Some apps only take keys while in front. A field that ignored them gets the text set instead.
-        if let Some(field) = field {
+        if let Some(field) = field
+            && !flags.real
+        {
             thread::sleep(SETTLE_FIRST);
             let after = ax::text(&field, "AXValue");
             if after == before && ax::settable(&field, "AXValue") {
@@ -457,24 +693,49 @@ impl Service {
                 return Ok("value".into());
             }
         }
-        Ok("keys".into())
+        Ok(if flags.real { "keyboard".into() } else { "keys".into() })
     }
 
-    fn key(&self, flags: &Flags, tracked: &Tracked, spec: &str) -> Reply {
+    fn key(&self, who: &str, flags: &Flags, tracked: &Tracked, spec: &str) -> Reply {
         let chord = input::chord(spec)?;
         if input::is_risky(&chord) && !flags.force {
             return Err(format!("'{spec}' can quit or close things: ask the person, then add --force"));
         }
-        input::press(tracked.pid, &chord)?;
-        Ok("keys".into())
+        let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
+        let held = self.held_flags(who, tracked.pid);
+        if flags.real {
+            self.front(tracked, || input::press(input::To::Front, &chord, held, hold))?;
+            Ok("keyboard".into())
+        } else {
+            input::press(input::To::App(tracked.pid), &chord, held, hold)?;
+            Ok("keys".into())
+        }
     }
 
-    fn scroll(&self, who: &str, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+    /// Hold modifier keys for this agent's later clicks and keys in this app, until `up`.
+    fn down(&self, who: &str, tracked: &Tracked, words: &[String]) -> Reply {
+        let [spec] = words else { return Err("down shift (or ctrl, alt, cmd)".into()) };
+        if matches!(spec.as_str(), "left" | "right" | "middle") {
+            return Err("holding a mouse button needs the real mouse, which the Mac version does not borrow".into());
+        }
+        let chord = input::chord(spec)?;
+        if chord.key.is_some() {
+            return Err("on a Mac, down holds modifier keys: shift, ctrl, alt or cmd".into());
+        }
+        input::modifiers_changed(tracked.pid, chord.flags, true)?;
+        let mut held = self.held.lock().unwrap();
+        let flags = held.get(who).filter(|h| h.pid == tracked.pid).map_or(0, |h| h.flags) | chord.flags;
+        held.insert(who.to_string(), Held { pid: tracked.pid, flags, since: Instant::now() });
+        Ok("held".into())
+    }
+
+    fn scroll(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let (target, direction, amount) = match words {
             [direction] => (None, direction.as_str(), 3),
-            [target, direction] => (Some(target.as_str()), direction.as_str(), 3),
+            [target, direction] if direction == "up" || direction == "down" => (Some(target.as_str()), direction.as_str(), 3),
+            [direction, amount] => (None, direction.as_str(), amount.parse().unwrap_or(3)),
             [target, direction, amount] => (Some(target.as_str()), direction.as_str(), amount.parse().unwrap_or(3)),
-            _ => return Err("scroll e3 up|down [N]".into()),
+            _ => return Err("scroll [control] up|down [n]".into()),
         };
         let (x, y) = match target {
             Some(word) => self.point_of(word, who, tracked, view)?,
@@ -483,39 +744,92 @@ impl Service {
         let lines = match direction {
             "up" => amount,
             "down" => -amount,
-            _ => return Err("scroll up or down".into()),
+            _ => return Err("scroll [control] up|down [n]".into()),
         };
-        self.cursor_on(who, tracked, x, y);
+        self.cursor_on(who, flags, tracked, x, y);
         input::scroll(tracked.pid, x as f64, y as f64, lines)?;
         Ok("event".into())
     }
 
-    fn drag(&self, who: &str, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
-        let a = self.point_of(from, who, tracked, view)?;
-        let b = self.point_of(to, who, tracked, view)?;
-        self.cursor_on(who, tracked, a.0, a.1);
-        let points: Vec<(f64, f64)> = (0..=DRAG_STEPS)
-            .map(|i| {
-                let t = i as f64 / DRAG_STEPS as f64;
-                (a.0 as f64 + (b.0 - a.0) as f64 * t, a.1 as f64 + (b.1 - a.1) as f64 * t)
-            })
-            .collect();
-        input::stroke(tracked.pid, tracked.window, &points)?;
-        self.overlay.move_to(who, b.0, b.1);
+    /// Press, follow each stroke and let go, with the drawn cursor following along.
+    fn strokes(&self, who: &str, flags: &Flags, tracked: &Tracked, strokes: &[Vec<(f32, f32)>]) -> Reply {
+        let window = self.window_of(tracked)?.rect;
+        let inside = |p: &(f32, f32)| {
+            let (x, y) = (p.0 as i32, p.1 as i32);
+            x >= window.0 && y >= window.1 && x < window.0 + window.2 && y < window.1 + window.3
+        };
+        if !strokes.iter().flatten().all(inside) {
+            return Err("refused: that stroke leaves the window".into());
+        }
+        let first = strokes.iter().flatten().next().ok_or("nothing to draw")?;
+        self.cursor_on(who, flags, tracked, first.0 as i32, first.1 as i32);
+        let stop = || STOP.load(Ordering::Relaxed);
+        for stroke in strokes {
+            let points: Vec<(f64, f64)> = stroke.iter().map(|p| (p.0 as f64, p.1 as f64)).collect();
+            let mut moved = |at: usize, x: f64, y: f64| {
+                if at.is_multiple_of(3) {
+                    self.overlay.jump(who, x as i32, y as i32);
+                }
+            };
+            if !input::stroke(tracked.pid, tracked.window, &points, &stop, &mut moved)? {
+                return Err(STOPPED.into());
+            }
+        }
         Ok("event".into())
     }
 
+    fn drag(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
+        let a = self.point_of(from, who, tracked, view)?;
+        let b = self.point_of(to, who, tracked, view)?;
+        let path = motion::trace(&[a, b], false);
+        self.strokes(who, flags, tracked, &[path])
+    }
+
+    /// Strokes of x,y points in the last shot, or from a control's top left.
+    fn draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+        let (word, script) = match words {
+            [script] => (None, script),
+            [word, script] => (Some(word), script),
+            _ => return Err("draw [control] \"x,y x,y; x,y x,y\"".into()),
+        };
+        let origin = match word {
+            Some(word) => Some(self.control(word, who, tracked, view)?.1),
+            None => None,
+        };
+        let frames = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.window).map(|s| s.frames));
+        let mut strokes = Vec::new();
+        for stroke in script.split(';').filter(|s| !s.trim().is_empty()) {
+            let mut points = Vec::new();
+            for word in stroke.split_whitespace() {
+                let (x, y) = is_point(word).ok_or(format!("'{word}' is not x,y"))?;
+                points.push(match (origin, frames) {
+                    (Some(rect), _) => (rect.0 + x, rect.1 + y),
+                    (None, Some(frames)) => frames.to_screen(x, y),
+                    (None, None) => return Err("draw on a control, or take a shot first".into()),
+                });
+            }
+            if !points.is_empty() {
+                strokes.push(motion::trace(&points, flags.smooth));
+            }
+        }
+        if strokes.is_empty() {
+            return Err("nothing to draw".into());
+        }
+        self.strokes(who, flags, tracked, &strokes)
+    }
+
     fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
-        let limit = Duration::from_millis(flags.timeout.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MOST_MS));
+        let limit = Duration::from_millis(flags.ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MOST_MS));
         let wanted = text.to_lowercase();
         let started = Instant::now();
         loop {
             self.read(tracked, view, false)?;
-            if view.lines.values().any(|line| line.to_lowercase().contains(&wanted)) {
+            let shows = view.lines.values().any(|line| line.to_lowercase().contains(&wanted));
+            if shows != flags.gone {
                 return Ok(if started.elapsed() < WAIT_STEP { "found".into() } else { "waited".into() });
             }
             if started.elapsed() >= limit {
-                return Err(format!("'{text}' did not show within {} ms", limit.as_millis()));
+                return Err(format!("timed out waiting for '{text}'"));
             }
             if STOP.load(Ordering::Relaxed) {
                 return Err(STOPPED.into());
@@ -526,16 +840,27 @@ impl Service {
 
     fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let (own, words) = parse(words);
-        let merged = Flags { right: flags.right || own.right, double: flags.double || own.double, force: flags.force || own.force, timeout: own.timeout.or(flags.timeout), ..Flags::default() };
+        let flags = own.merged(flags);
         let (command, args) = words.split_first().ok_or("empty step")?;
         match (command.as_str(), args) {
-            ("click", [word]) => self.click(who, &merged, tracked, view, word),
-            ("set", [word, value]) => self.set(who, tracked, view, word, value),
-            ("type", rest) => self.type_text(who, tracked, view, rest),
-            ("key", [spec]) => self.key(&merged, tracked, spec),
-            ("scroll", rest) => self.scroll(who, tracked, view, rest),
-            ("drag", [from, to]) => self.drag(who, tracked, view, from, to),
-            ("wait", [text]) => self.wait(&merged, tracked, view, text),
+            ("click", [word]) => self.click(who, &flags, tracked, view, word),
+            ("hover", [word]) => self.hover(who, &flags, tracked, view, word),
+            ("set", [word, value]) => self.set(who, &flags, tracked, view, word, value),
+            ("clear", [word]) => self.set(who, &flags, tracked, view, word, ""),
+            ("check", [word]) => self.ensure(who, &flags, tracked, view, word, Some("on")),
+            ("uncheck", [word]) => self.ensure(who, &flags, tracked, view, word, Some("off")),
+            ("toggle", [word]) => self.ensure(who, &flags, tracked, view, word, None),
+            ("expand", [word]) => self.expand(who, &flags, tracked, view, word, true),
+            ("collapse", [word]) => self.expand(who, &flags, tracked, view, word, false),
+            ("show", [word]) => self.show(who, tracked, view, word),
+            ("select", [word, item]) => self.select(who, &flags, tracked, view, word, item),
+            ("type", rest) => self.type_text(who, &flags, tracked, view, rest),
+            ("key", [spec]) => self.key(who, &flags, tracked, spec),
+            ("down", rest) => self.down(who, tracked, rest),
+            ("scroll", rest) => self.scroll(who, &flags, tracked, view, rest),
+            ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
+            ("draw", rest) => self.draw(who, &flags, tracked, view, rest),
+            ("wait", [text]) => self.wait(&flags, tracked, view, text),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
         }
     }
@@ -596,7 +921,7 @@ impl Service {
                 match picture {
                     Some(Some(note)) => out.push(note),
                     Some(None) => out.push("nothing changed, on screen either".into()),
-                    None if nothing && routes.iter().any(|r| r == "event" || r == "keys") => out.push("nothing changed: check with shot".into()),
+                    None if nothing && routes.iter().any(|r| r == "event" || r == "keys" || r == "real" || r == "keyboard") => out.push("nothing changed: check with shot".into()),
                     None => {}
                 }
             }
@@ -740,6 +1065,27 @@ impl Service {
             small.save(&path)?;
             return Ok(format!("{} {}x{} scale {:.2}", path.display(), small.w, small.h, scale * units));
         }
+        if flags.screen {
+            let screens = apps::screens();
+            let main = screens.iter().find(|(_, main)| *main).map(|(r, _)| *r).unwrap_or((0, 0, 1, 1));
+            let (x, y, w, h) = if flags.all {
+                let left = screens.iter().map(|(r, _)| r.0).min().unwrap_or(0);
+                let top = screens.iter().map(|(r, _)| r.1).min().unwrap_or(0);
+                let right = screens.iter().map(|(r, _)| r.0 + r.2).max().unwrap_or(1);
+                let bottom = screens.iter().map(|(r, _)| r.1 + r.3).max().unwrap_or(1);
+                (left, top, right - left, bottom - top)
+            } else {
+                main
+            };
+            self.overlay.aside(true);
+            let taken = capture::screen(x, y, w, h);
+            self.overlay.aside(false);
+            let (frame, units) = taken?;
+            let (small, scale) = frame.shrink(edge);
+            let path = shot::path_for(who, 0);
+            small.save(&path)?;
+            return Ok(format!("{} {}x{} scale {:.2}", path.display(), small.w, small.h, scale * units));
+        }
         let word = words.first();
         let control = word.and_then(|w| is_ref(w));
         let tracked = self.pick(who, if control.is_some() { flags.window.as_deref() } else { word.map(String::as_str).or(flags.window.as_deref()) })?;
@@ -820,6 +1166,61 @@ impl Service {
         Ok(format!("deskcrew {} running; agents: {}{stopped}{access}", env!("CARGO_PKG_VERSION"), agents.join(", ")))
     }
 
+    fn is(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
+        let [word, state] = words else { return Err("is e3 on|off|open|closed|selected|enabled|disabled".into()) };
+        let tracked = self.pick(who, flags.window.as_deref())?;
+        let mut view = tracked.view.lock().unwrap();
+        self.read(&tracked, &mut view, false)?;
+        let Target::Control(id) = self.resolve(word, who, &tracked, &mut view)? else { return Err("is needs a control".into()) };
+        let states = &view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?.parts.states;
+        let yes = match state.as_str() {
+            "enabled" => !states.contains(&"disabled"),
+            other => states.contains(&other),
+        };
+        Ok(if yes { "yes" } else { "no" }.into())
+    }
+
+    fn place(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
+        let tracked = self.pick(who, flags.window.as_deref())?;
+        let window = self.window_of(&tracked)?;
+        let element = apps::element(&window).ok_or("that window does not answer accessibility requests")?;
+        let word = words.first().ok_or("place x,y,w,h|min|max|restore")?;
+        match word.as_str() {
+            "min" => ax::set_bool(&element, "AXMinimized", true)?,
+            "restore" | "show" => {
+                let _ = ax::set_bool(&element, "AXFullScreen", false);
+                ax::set_bool(&element, "AXMinimized", false)?;
+            }
+            "max" => {
+                let (x, y, w, h) = apps::work_area();
+                ax::set_position(&element, x, y)?;
+                ax::set_size(&element, w, h)?;
+            }
+            box_text => {
+                let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
+                let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
+                ax::set_position(&element, x, y)?;
+                ax::set_size(&element, w, h)?;
+            }
+        }
+        Ok("ok".into())
+    }
+
+    fn dry_run(&self, tracked: &Tracked, view: &View, steps: &[Vec<String>]) -> String {
+        let name = |word: &str| is_ref(word).and_then(|id| view.nodes.get(&id)).map(|node| lines::line(&node.parts));
+        steps
+            .iter()
+            .enumerate()
+            .map(|(at, step)| {
+                let (_, words) = parse(step);
+                let named: Vec<String> = words.iter().map(|word| name(word).map_or(word.clone(), |line| format!("{word} ({line})"))).collect();
+                format!("{}. {}", at + 1, named.join(" "))
+            })
+            .chain(Some(format!("nothing done in w{}", tracked.id)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     fn handle(&self, who: &str, words: &[String]) -> Reply {
         let (flags, rest) = parse(words);
         let (command, args) = rest.split_first().ok_or(HELP)?;
@@ -829,36 +1230,94 @@ impl Service {
             }
             steps
         };
+        let window_spec = || args.first().map(String::as_str).or(flags.window.as_deref());
         match command.as_str() {
             "help" => Ok(HELP.into()),
             "windows" => self.windows_list(who, args.first()),
             "see" => self.see(who, &flags, args),
             "get" => self.get(who, &flags, args),
+            "is" => self.is(who, &flags, args),
             "shot" => self.shot(who, &flags, args),
             "launch" => self.launch(who, &flags, args),
             "status" => self.status(),
+            "focus" => {
+                let tracked = self.pick(who, window_spec())?;
+                if !apps::activate(tracked.pid) {
+                    return Err("macOS would not bring that app forward".into());
+                }
+                if let Some(element) = apps::find(tracked.window).and_then(|w| apps::element(&w)) {
+                    let _ = ax::perform(&element, "AXRaise");
+                }
+                Ok("ok".into())
+            }
+            "close" => {
+                let tracked = self.pick(who, window_spec())?;
+                let window = self.window_of(&tracked)?;
+                let element = apps::element(&window).ok_or("that window does not answer accessibility requests")?;
+                let button = ax::attribute(&element, "AXCloseButton").ok_or("that window has no close button")?;
+                ax::perform(&button, "AXPress").map(|_| "ok".to_string())
+            }
+            "place" => self.place(who, &flags, args),
+            "clip" => match args {
+                [] => Ok(apps::clipboard().unwrap_or_else(|| "(no text on the clipboard)".into())),
+                [set, text] if set == "set" => apps::set_clipboard(Some(text)).map(|_| "ok".to_string()),
+                [clear] if clear == "clear" => apps::set_clipboard(None).map(|_| "ok".to_string()),
+                _ => Err("clip, clip set \"text\", or clip clear".into()),
+            },
+            "screens" => Ok(apps::screens()
+                .iter()
+                .enumerate()
+                .map(|(at, ((x, y, w, h), main))| format!("{at}: {x},{y} {w}x{h}{}", if *main { " primary" } else { "" }))
+                .collect::<Vec<_>>()
+                .join("\n")),
+            "apps" => {
+                let mut names: Vec<String> = apps::list().into_iter().map(|w| w.app).collect();
+                names.sort_unstable();
+                names.dedup();
+                Ok(names.join("\n"))
+            }
+            "up" => {
+                let gone = self.release(true);
+                Ok(if gone.is_empty() { "nothing was held".into() } else { format!("let go of keys held by {}", gone.join(", ")) })
+            }
+            "cursor" => Err("the Mac version never borrows the cursor, so there is nothing to set".into()),
+            "notifications" => Err("notifications are not on the Mac version yet".into()),
             "resume" => {
                 STOP.store(false, Ordering::Relaxed);
-                Ok("resumed".into())
+                Ok("ok".into())
             }
             "quit" => {
+                self.release(true);
                 self.quit.store(true, Ordering::Relaxed);
                 Ok("bye".into())
             }
             "do" => {
                 let script = args.join(" ");
-                self.act(who, &flags, &with_expect(lines::split_steps(&script)))
+                let steps = lines::split_steps(&script);
+                if flags.dry {
+                    let tracked = self.pick(who, flags.window.as_deref())?;
+                    let mut view = tracked.view.lock().unwrap();
+                    if !view.read_once {
+                        self.read(&tracked, &mut view, false)?;
+                    }
+                    return Ok(self.dry_run(&tracked, &view, &steps));
+                }
+                if matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
+                    return Err("declared risky: ask the person, then add --force".into());
+                }
+                self.act(who, &flags, &with_expect(steps))
             }
             "click" if args.len() > 1 => {
                 let steps = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
                 self.act(who, &flags, &with_expect(steps))
             }
-            "click" | "set" | "type" | "key" | "scroll" | "drag" | "wait" => {
+            "click" | "hover" | "set" | "clear" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "show" | "select" | "type" | "key"
+            | "down" | "scroll" | "drag" | "draw" | "wait" => {
                 let mut step = vec![command.clone()];
                 step.extend(args.iter().cloned());
                 self.act(who, &flags, &with_expect(vec![step]))
             }
-            other => Err(format!("unknown command '{other}': see deskcrew help")),
+            other => Err(format!("unknown command '{other}': deskcrew help")),
         }
     }
 
@@ -910,6 +1369,8 @@ pub fn run() {
     let Ok(listener) = Pipe::bind() else { return };
     let (overlay, inbox) = Overlay::new();
     let service = Arc::new(Service {
+        held: Mutex::new(HashMap::new()),
+        real_input: Mutex::new(()),
         windows: Mutex::new((0, HashMap::new())),
         agents: Mutex::new(HashMap::new()),
         overlay,
@@ -925,7 +1386,12 @@ pub fn run() {
     });
     watch_stop_keys();
     let keeper = service.clone();
-    overlay::run(inbox, &move || keeper.quit.load(Ordering::Relaxed) || keeper.last_used.lock().unwrap().elapsed() > IDLE_EXIT);
+    overlay::run(inbox, &move || {
+        // Held keys go after 30 seconds, and at once on Ctrl+Option+Esc.
+        keeper.release(false);
+        keeper.quit.load(Ordering::Relaxed) || keeper.last_used.lock().unwrap().elapsed() > IDLE_EXIT
+    });
+    service.release(true);
     // Give the last reply a moment to leave before the process goes.
     thread::sleep(Duration::from_millis(100));
     pipe::remove();

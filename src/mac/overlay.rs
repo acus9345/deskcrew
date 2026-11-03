@@ -32,7 +32,7 @@ pub struct Rect {
 }
 
 pub enum Command {
-    Move { agent: String, x: i32, y: i32, done: Option<Sender<()>> },
+    Move { agent: String, x: i32, y: i32, instant: bool, done: Option<Sender<()>> },
     Over { agent: String, window: u32 },
     Press { agent: String, target: Rect },
     Aside(bool),
@@ -52,8 +52,13 @@ impl Overlay {
     /// Glide there and return once the cursor has arrived.
     pub fn move_to(&self, agent: &str, x: i32, y: i32) {
         let (done, arrived) = mpsc::channel();
-        let _ = self.commands.send(Command::Move { agent: agent.into(), x, y, done: Some(done) });
+        let _ = self.commands.send(Command::Move { agent: agent.into(), x, y, instant: false, done: Some(done) });
         let _ = arrived.recv_timeout(Duration::from_secs(2));
+    }
+
+    /// Be there at once, for `--fast` and for following a stroke as it is drawn.
+    pub fn jump(&self, agent: &str, x: i32, y: i32) {
+        let _ = self.commands.send(Command::Move { agent: agent.into(), x, y, instant: true, done: None });
     }
 
     pub fn over(&self, agent: &str, window: u32) {
@@ -246,7 +251,7 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
             });
             while let Ok(command) = inbox.try_recv() {
                 match command {
-                    Command::Move { agent, x, y, done } => {
+                    Command::Move { agent, x, y, instant, done } => {
                         let taken: Vec<Rgb> = agents.values().map(|a| a.colour).collect();
                         let side = if agents.len().is_multiple_of(2) { 1.0 } else { -1.0 };
                         let entry = agents.entry(agent.clone()).or_insert_with(|| {
@@ -261,6 +266,15 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                             Agent { colour, layer, tip, at: (x as f32, y as f32), glide: None, above: 0, side }
                         });
                         let to = (x as f32, y as f32);
+                        if instant {
+                            entry.glide = None;
+                            entry.at = to;
+                            entry.layer.place(x as f64 - entry.tip.0, y as f64 - entry.tip.1, screen_h);
+                            if let Some(done) = done {
+                                let _ = done.send(());
+                            }
+                            continue;
+                        }
                         let ms = motion::travel_ms(entry.at, to);
                         entry.glide = Some(Glide { from: entry.at, middle: motion::bow(entry.at, to, entry.side), to, started: Instant::now(), ms, done });
                         entry.side = -entry.side;

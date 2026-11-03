@@ -90,6 +90,11 @@ pub const kCGEventRightMouseUp: u32 = 4;
 pub const kCGEventMouseMoved: u32 = 5;
 pub const kCGEventLeftMouseDragged: u32 = 6;
 pub const kCGEventKeyDown: u32 = 10;
+pub const kCGEventOtherMouseDown: u32 = 25;
+pub const kCGEventOtherMouseUp: u32 = 26;
+pub const kCGMouseButtonCenter: u32 = 2;
+pub const kCGMouseEventButtonNumber: u32 = 3;
+pub const kCGHIDEventTap: u32 = 0;
 pub const kCGMouseButtonLeft: u32 = 0;
 pub const kCGMouseButtonRight: u32 = 1;
 pub const kCGMouseEventClickState: u32 = 1;
@@ -180,6 +185,7 @@ unsafe extern "C" {
     pub fn AXUIElementGetTypeID() -> usize;
     pub fn AXValueGetValue(value: CFTypeRef, kind: i32, out: *mut c_void) -> u8;
     pub fn AXValueGetTypeID() -> usize;
+    pub fn AXValueCreate(kind: i32, value: *const c_void) -> CFTypeRef;
     // Private, but stable for years and used widely: the window number behind an AX window.
     pub fn _AXUIElementGetWindow(element: AXUIElementRef, window: *mut u32) -> AXError;
 }
@@ -242,6 +248,8 @@ unsafe extern "C" {
     pub fn CGEventSetIntegerValueField(event: CGEventRef, field: u32, value: i64);
     pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     pub fn CGEventPostToPid(pid: i32, event: CGEventRef);
+    pub fn CGEventPost(tap: u32, event: CGEventRef);
+    pub fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     pub fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, callback: CGEventTapCallBack, info: *mut c_void) -> *mut c_void;
 }
 

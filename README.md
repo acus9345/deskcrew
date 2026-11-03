@@ -44,7 +44,9 @@ It has the same commands and replies, built on Mac parts:
 
 macOS asks once for Accessibility permission, and again for Screen Recording the first time a picture is taken. Both are granted to the app running your agent, such as Terminal, iTerm or Cursor. `setup` installs to `~/.cargo/bin` or `~/.local/bin`, adding the latter to `~/.zprofile` if it is not on PATH.
 
-Not on the Mac yet: `--real`, `--mouse` and borrowing the cursor, `draw`, held keys, `select`, `check` and the other toggles, `notifications`, `place`, `focus`, `screens`, `apps`, the clipboard and the demo.
+Most commands and flags now match Windows: `check`, `uncheck`, `toggle`, `expand`, `collapse`, `clear`, `is`, `select`, `hover`, `show`, `draw`, `drag`, `down` and `up` for modifier keys, `place`, `focus`, `close`, `screens`, `apps`, `clip`, `shot --screen`, `do --dry` and `--risk`, `wait --gone`, `type --paste`, `--fast`, `--with`, and middle, back, forward and triple clicks. `--real` brings the app forward for a moment and sends keys through the system, then gives the front back.
+
+Not on the Mac yet: `--mouse` and borrowing the cursor, holding a mouse button, `notifications` and the demo. On a Mac, `down` holds modifier keys only, and they apply to that agent's later clicks and keys in that app.
 
 ```text
 $ deskcrew see Calculator

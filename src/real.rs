@@ -1,5 +1,6 @@
 // The real keyboard, and the real mouse for an agent the person has let borrow it. One agent at a
 // time, it waits for a pause in the person's own typing, and it puts focus and the pointer back.
+pub use crate::motion::{pace, trace};
 use crate::win::{self, Hwnd};
 use std::{
     mem::zeroed,
@@ -38,8 +39,6 @@ const DRAIN: Duration = Duration::from_millis(120);
 const FOCUS_MOVED: &str = "stopped: focus moved away from that window, so nothing more was typed";
 const QUIET_FOR: Duration = Duration::from_millis(350);
 const QUIET_TIMEOUT: Duration = Duration::from_secs(3);
-const STEP_PIXELS: f32 = 6.0;
-const PIXELS_PER_SECOND: f32 = 1000.0;
 
 /// Shortcuts that end a session or reach the shell: refused unless asked for with --force.
 /// Marks our own mouse events, so the shield against hidden ones lets them through.
@@ -192,54 +191,6 @@ pub fn wheel(x: i32, y: i32, notches: i32) {
     move_to(x, y);
     thread::sleep(ARRIVE);
     send(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, (notches * 120) as u32)]);
-}
-
-/// Points every few pixels along a stroke, through a smooth curve if asked for.
-pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
-    let at = |i: isize| {
-        let p = points[i.clamp(0, points.len() as isize - 1) as usize];
-        (p.0 as f32, p.1 as f32)
-    };
-    let mut out = vec![at(0)];
-    for i in 0..points.len().saturating_sub(1) as isize {
-        let (a, b, c, d) = (at(i - 1), at(i), at(i + 1), at(i + 2));
-        let steps = (((c.0 - b.0).hypot(c.1 - b.1) / STEP_PIXELS).ceil() as usize).max(1);
-        for step in 1..=steps {
-            let t = step as f32 / steps as f32;
-            out.push(if smooth {
-                let curve = |p0: f32, p1: f32, p2: f32, p3: f32| {
-                    0.5 * (2.0 * p1
-                        + (p2 - p0) * t
-                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t
-                        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t * t)
-                };
-                (curve(a.0, b.0, c.0, d.0), curve(a.1, b.1, c.1, d.1))
-            } else {
-                (b.0 + (c.0 - b.0) * t, b.1 + (c.1 - b.1) * t)
-            });
-        }
-    }
-    out
-}
-
-/// Visit each point of a stroke on schedule, at a steady speed. False if stopped on the way.
-pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, mut visit: impl FnMut(usize, i32, i32)) -> bool {
-    let started = Instant::now();
-    for (at, point) in path.iter().enumerate() {
-        if stop.load(Ordering::Relaxed) {
-            return false;
-        }
-        let due = Duration::from_secs_f32(at as f32 * STEP_PIXELS / PIXELS_PER_SECOND);
-        while let Some(left) = due.checked_sub(started.elapsed()) {
-            if left > Duration::from_millis(2) {
-                thread::sleep(left - Duration::from_millis(2));
-            } else {
-                std::hint::spin_loop();
-            }
-        }
-        visit(at, point.0.round() as i32, point.1.round() as i32);
-    }
-    true
 }
 
 /// Press, follow the path, and always let go.

@@ -1,6 +1,15 @@
 // How a drawn cursor gets from one place to another, and what colour it is.
 pub type Point = (f32, f32);
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::thread;
+use std::time::{Duration, Instant};
+
+// How far apart stroke points are, and how fast a stroke is drawn.
+const STEP_PIXELS: f32 = 6.0;
+#[cfg_attr(not(windows), allow(dead_code))]
+const PIXELS_PER_SECOND: f32 = 1000.0;
+
 const MIN_TRAVEL_MS: f32 = 90.0;
 const MAX_TRAVEL_MS: f32 = 320.0;
 const MS_PER_PIXEL: f32 = 0.16;
@@ -83,6 +92,55 @@ pub fn colour_for(name: &str, taken: &[Rgb]) -> Rgb {
         .map(|step| PALETTE[(start + step) % PALETTE.len()])
         .find(|colour| !taken.contains(colour))
         .unwrap_or(PALETTE[start % PALETTE.len()])
+}
+
+/// Points every few pixels along a stroke, through a smooth curve if asked for.
+pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
+    let at = |i: isize| {
+        let p = points[i.clamp(0, points.len() as isize - 1) as usize];
+        (p.0 as f32, p.1 as f32)
+    };
+    let mut out = vec![at(0)];
+    for i in 0..points.len().saturating_sub(1) as isize {
+        let (a, b, c, d) = (at(i - 1), at(i), at(i + 1), at(i + 2));
+        let steps = (((c.0 - b.0).hypot(c.1 - b.1) / STEP_PIXELS).ceil() as usize).max(1);
+        for step in 1..=steps {
+            let t = step as f32 / steps as f32;
+            out.push(if smooth {
+                let curve = |p0: f32, p1: f32, p2: f32, p3: f32| {
+                    0.5 * (2.0 * p1
+                        + (p2 - p0) * t
+                        + (2.0 * p0 - 5.0 * p1 + 4.0 * p2 - p3) * t * t
+                        + (3.0 * p1 - p0 - 3.0 * p2 + p3) * t * t * t)
+                };
+                (curve(a.0, b.0, c.0, d.0), curve(a.1, b.1, c.1, d.1))
+            } else {
+                (b.0 + (c.0 - b.0) * t, b.1 + (c.1 - b.1) * t)
+            });
+        }
+    }
+    out
+}
+
+/// Visit each point of a stroke on schedule, at a steady speed. False if stopped on the way.
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, mut visit: impl FnMut(usize, i32, i32)) -> bool {
+    let started = Instant::now();
+    for (at, point) in path.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            return false;
+        }
+        let due = Duration::from_secs_f32(at as f32 * STEP_PIXELS / PIXELS_PER_SECOND);
+        while let Some(left) = due.checked_sub(started.elapsed()) {
+            if left > Duration::from_millis(2) {
+                thread::sleep(left - Duration::from_millis(2));
+            } else {
+                std::hint::spin_loop();
+            }
+        }
+        visit(at, point.0.round() as i32, point.1.round() as i32);
+    }
+    true
 }
 
 #[cfg(test)]

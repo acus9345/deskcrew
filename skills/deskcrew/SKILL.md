@@ -5,7 +5,7 @@ description: Operate native Windows and Mac apps in the background with the desk
 
 # deskcrew
 
-Run `deskcrew help` once for the commands: the Mac version has fewer. Windows and macOS.
+Run `deskcrew help` once for the commands: the Mac version has nearly the same ones. Windows and macOS.
 
 - Pick a window, then work by ref: `deskcrew windows`, `deskcrew see Calculator`, `deskcrew click e12`. Refs stay valid across reads.
 - Every action replies with what changed, so do not read again after it. `see` also shows only changes; `see -f` lists everything, for when you no longer have the list.
