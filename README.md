@@ -28,7 +28,23 @@ To make it available to your agents:
 target/release/deskcrew setup
 ```
 
-That puts `deskcrew` on PATH and gives the skill to each agent it finds. For any other agent, add one line to its rules: `To operate Windows apps on this computer, run the deskcrew command. Start with: deskcrew help`. On a Mac the rule says Mac apps instead. Agents running in the cloud, or in a sandbox without access to your desktop, cannot reach it.
+That puts `deskcrew` on PATH and sets up every agent app and CLI it finds, so they use deskcrew on their own whenever a task needs the desktop, instead of built-in computer use or other desktop tools. Run it again after installing a new agent; it updates what it wrote instead of adding copies, and leaves the rest of each file alone.
+
+| Agent (app and CLI) | What setup writes |
+| --- | --- |
+| Claude Code | skill in `~/.claude/skills`, rule in `~/.claude/CLAUDE.md` |
+| Codex | skill in `~/.codex/skills`, rule in `~/.codex/AGENTS.md` |
+| Gemini CLI and Antigravity | skill in `~/.gemini/skills`, rule in `~/.gemini/GEMINI.md` |
+| GitHub Copilot CLI | skill in `~/.copilot/skills`, rule in `~/.copilot/copilot-instructions.md` |
+| GitHub Copilot in VS Code | rule in VS Code's user `prompts/deskcrew.instructions.md` |
+| Windsurf | skill, and rule in `~/.codeium/windsurf/memories/global_rules.md` |
+| OpenCode | skill, and rule in `~/.config/opencode/AGENTS.md` |
+| Amp, Qwen Code, Factory Droid | rule in `~/.config/amp/AGENTS.md`, `~/.qwen/QWEN.md`, `~/.factory/AGENTS.md` |
+| Kiro, Continue, Cline | rule file in `~/.kiro/steering`, `~/.continue/rules`, `~/Documents/Cline/Rules` |
+| Cursor | skill in `~/.cursor/skills`. Its User Rules live in your Cursor account, so setup prints the rule to add under Customize > Rules > New |
+| Grok, and agents sharing `~/.agents` | skill |
+
+The rule sits between `<!-- deskcrew: start -->` and `<!-- deskcrew: end -->` lines. For any other agent, add the rule setup prints to its own rules. Agents running in the cloud, or in a sandbox without access to your desktop, cannot reach it.
 
 ## macOS
 
