@@ -118,23 +118,24 @@ Pick agent-desktop if you need macOS or Linux, or want it as a library. Pick des
 
 ## Compared with other Windows tools
 
-Measured on 2026-11-03 on the same machine, reading the same four throwaway windows three times with each tool. These are characters an agent has to read, not tokens, and only reading was measured, not acting.
+Measured on 2026-11-04 on the same machine, reading the same four throwaway windows three times with each tool, all in one run. These are characters an agent has to read, not tokens, and only reading was measured, not acting.
 
-| Reading a window | deskcrew 0.1.7 | [agent-cu](https://github.com/kortix-ai/agent-computer-use) 0.1.1 | [mcp-windows](https://github.com/sbroenne/mcp-windows) 1.3.28 | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) 0.8.8 |
-| --- | --- | --- | --- | --- |
-| Test form | 488 | 1,775 | 7,089 | 5,932 |
-| Character Map | 485 | 823 | 3,760 | 4,582 |
-| Calculator | 689 | 2,199 | 8,212 | 6,444 |
-| File Explorer | 3,381 | 8,938 | 26,635 | 13,193 |
-| Time per read after the first | 20 to 102 ms | 0.1 to 3.9 s | 27 to 200 ms | about 15 s |
-| What an agent loads to learn the tool | 2,055 characters of help | a skill | 58,165 characters of tool schemas | 25,054 characters of tool schemas |
+| Reading a window | deskcrew 0.1.9 | [agent-desktop](https://github.com/vercel-labs/agent-desktop) 1.1.0 | [agent-cu](https://github.com/kortix-ai/agent-computer-use) 0.1.1 | [mcp-windows](https://github.com/sbroenne/mcp-windows) 1.3.28 | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) 0.8.8 |
+| --- | --- | --- | --- | --- | --- |
+| Test form | 488 | 9,641 | 1,776 | 7,089 | 4,216 |
+| Character Map | 485 | 3,664 | 823 | 3,760 | 3,007 |
+| Calculator | 689 | 9,394 | 2,199 | 8,212 | 4,680 |
+| File Explorer | 3,381 | 39,798 | 8,938 | 26,635 | 10,897 |
+| Time per read after the first | 22 to 101 ms | 192 to 308 ms | 0.13 to 4.4 s | 30 to 210 ms | about 14.5 s |
+| What an agent loads to learn the tool | 2,469 characters of help | 8,934 characters of help | a skill | 58,165 characters of tool schemas | 25,054 characters of tool schemas |
 
 How each tool was called:
 
 - deskcrew: `see -f`.
-- agent-cu: `snapshot -i -c`, its recommended compact mode. Its npm package has no Windows program, so it was built from the GitHub source. Its read time swung between about 70 ms and 4 s from run to run.
+- agent-desktop: `snapshot --window-id w-<handle> -i --compact`, its interactive, compact mode. Its `--skeleton` mode reads less by leaving detail out, and was not measured.
+- agent-cu: `snapshot -i -c`, its recommended compact mode. Its npm package has no Windows program, so it was built from the GitHub source. Its read time swung between about 0.1 s and 4 s from window to window.
 - mcp-windows: `ui_snapshot` in full mode. Its incremental mode makes repeated reads cheaper and was not measured.
-- Windows-MCP: `Snapshot` without a picture. It always reads the whole desktop, other windows and taskbar included, so its figures are not for one window alone. It waits while the person is using the computer, and still took about 15 s per read after 12 idle seconds.
+- Windows-MCP: `Snapshot` without a picture. It always reads the whole desktop, other windows and taskbar included, so its figures change with what else is open and are not for one window alone. It waits while the person is using the computer, and refuses to run while a screensaver is on.
 
 ## Features compared
 
