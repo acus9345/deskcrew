@@ -1,6 +1,6 @@
 [package]
 name = "deskcrew"
-version = "0.1.10"
+version = "0.1.11"
 edition = "2024"
 description = "Every coding agent gets its own cursor on your Windows or Mac desktop, for very few tokens."
 license = "MIT"

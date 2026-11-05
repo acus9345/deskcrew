@@ -263,8 +263,13 @@ pub fn stack_above(layer: Hwnd, root: Hwnd, force: bool) {
         let mut at = GetWindow(root, GW_HWNDPREV);
         while !at.is_null() {
             let popup = GetWindow(at, GW_OWNER) == root || (process(at) == theirs && GetWindowLongPtrW(at, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0);
-            if popup && IsWindowVisible(at) != 0 {
+            let shown = IsWindowVisible(at) != 0;
+            if popup && shown {
                 top = at;
+            } else if shown && process(at) != me && process(at) != theirs {
+                // Someone else's window covers this one: a popup above that, such as a tooltip
+                // kept on top, would lift the cursor over the person's window too.
+                break;
             }
             at = GetWindow(at, GW_HWNDPREV);
         }
@@ -522,6 +527,20 @@ impl FocusGuard {
         FocusGuard { front: if outer != 0 { outer } else { front } }
     }
 
+    /// Guard a window already known to be the person's.
+    pub fn of(front: Hwnd) -> FocusGuard {
+        FocusGuard { front }
+    }
+
+    pub fn front(&self) -> Hwnd {
+        self.front
+    }
+
+    /// True if the window in front belongs to one of these processes.
+    pub fn is_one_of(&self, pids: &[u32]) -> bool {
+        pids.contains(&pid(self.front)) || pids.contains(&content_pid(self.front))
+    }
+
     /// While an app starts: a window that did not exist before taking the front is that app, so
     /// the person gets it back. Going to a window that already existed was their own doing.
     pub fn hold_against(&self, existing: &HashSet<Hwnd>) {
@@ -559,6 +578,10 @@ impl FocusGuard {
         if !target_pids.contains(&pid(now)) && !target_pids.contains(&content_pid(now)) {
             return false;
         }
+        // A button or Alt held down means the person is switching to that app themself.
+        if person_switching() {
+            return false;
+        }
         let mut pulled = PULLED.lock().unwrap();
         for owner in [pid(now), content_pid(now)] {
             if !pulled.contains(&owner) {
@@ -571,6 +594,12 @@ impl FocusGuard {
         }
         true
     }
+}
+
+/// The person is pressing a mouse button, or holding Alt or the Windows key to switch apps.
+fn person_switching() -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
+    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_MENU, VK_LWIN, VK_RWIN].iter().any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0)
 }
 
 pub fn lparam(x: i32, y: i32) -> LPARAM {

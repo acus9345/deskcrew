@@ -250,7 +250,7 @@ The second one drives throwaway windows it opens itself, including the real keyb
 - The newest commands, such as `hover`, `down`, `check`, `is` and `notifications`, were tested by hand on throwaway windows and are not in the 65-check suite yet.
 - Keyboard shortcuts need `--real`, because they have to go to the window in front. While a `--real` action runs, anything you type goes to that window.
 - Text boxes drawn by XAML take `set`, but `type` needs `--real`.
-- Browser and Electron windows need to be showing for the parallel route. A covered one drops some window messages, so clicks and `type` fall back to accessibility, which can take focus for a moment. `draw` still works behind other windows: strokes land while it is covered and show once it is uncovered. A covered browser also stops repainting, so `shot` can show an old picture of it.
+- Browser and Electron windows are clicked, typed into, set and drawn in by window messages, covered or not, because accessibility makes them pull their window over yours. A covered browser stops repainting, so `shot` can show an old picture of it until it is uncovered.
 - Windows of the same browser share one process, and activate each other when worked at the same time, which loses input. Parallel agents need separate apps or separate browser profiles.
 - Rich text boxes, such as Notepad's, need `--real`.
 - The pen needs the window in front, so a `draw` borrows your focus for as long as it runs.

@@ -6,6 +6,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.11] - 2026-11-05
+
+- Stop agents taking the person's focus in browser and Electron apps: clicks, `type` and `set` there always go by window message, even while the window is covered, instead of accessibility, which raised the app over the person's window.
+- Never mistake an app agents work in for the person's window: after a steal outlived the focus keeper, the next action used to guard the app instead, leaving the person's window buried. The keeper also watches every 2 ms, stays on for 3 s after the last action, and lets the person switch apps themself.
+- Keep an agent's cursor under any window that covers its app, even when the app shows a tooltip on top.
+
 ## [0.1.10] - 2026-11-05
 
 - Stop an app that pulls its window forward when an agent presses it through accessibility from covering the person's window again: once the focus guard has had to take focus back from an app, later clicks on it are posted as messages, which never raise it. Seen with egui apps such as PkgStats. The first click on such an app can still cover for a few milliseconds.

@@ -43,8 +43,10 @@ const SHARED_PIECE: usize = 10;
 const SHARED_OVERLAP: usize = 4;
 const SHARED_GAP: Duration = Duration::from_millis(3);
 const TYPE_CHECK: Duration = Duration::from_millis(350);
-const FOCUS_WATCH: Duration = Duration::from_millis(10);
-const FOCUS_LINGER: Duration = Duration::from_millis(500);
+const FOCUS_WATCH: Duration = Duration::from_millis(2);
+/// How long the keeper stays on watch after the last action: apps can reach for the front a
+/// good while after they were pressed.
+const FOCUS_LINGER: Duration = Duration::from_secs(3);
 /// Chromium fills in its page some time after the first request, in bursts.
 const CHROMIUM_STEP: Duration = Duration::from_millis(250);
 const CHROMIUM_READS: usize = 16;
@@ -361,6 +363,8 @@ struct Home {
     pids: Vec<u32>,
     leaving: Option<Instant>,
     on_loan: bool,
+    /// The person's window from the last time agents worked, kept after the keeper goes idle.
+    person: Option<Hwnd>,
 }
 
 impl Service {
@@ -507,15 +511,25 @@ impl Service {
     /// while another app has just grabbed focus must not mistake that app for the person's.
     fn focus_in(&self, pids: &[u32]) {
         let mut home = self.home.lock().unwrap();
+        home.agents += 1;
+        home.leaving = None;
+        home.pids.extend_from_slice(pids);
         if home.guard.is_none() {
-            home.guard = Some(FocusGuard::take());
+            let mut guard = FocusGuard::take();
+            // An app agents work in is never the person's window, even when it is in front: it
+            // took focus at some point, and the person's last window gets it back.
+            if guard.is_one_of(&home.pids) && let Some(person) = home.person.filter(|hwnd| win::exists(*hwnd)) {
+                guard = FocusGuard::of(person);
+                guard.restore(&home.pids);
+            }
+            if !guard.is_one_of(&home.pids) {
+                home.person = Some(guard.front());
+            }
+            home.guard = Some(guard);
             if let Some(keeper) = self.keeper.get() {
                 keeper.unpark();
             }
         }
-        home.agents += 1;
-        home.leaving = None;
-        home.pids.extend_from_slice(pids);
     }
 
     /// Done with this action. The keeper hands focus back, so no agent queues behind a restore.
@@ -643,13 +657,6 @@ impl Service {
 
     /// Bring the window forward for work that needs it, and give focus back after. Every point has
     /// to land on this window: a press anywhere else would hit whatever the person has open there.
-    /// True if something else is on top of this point of the window.
-    fn covered(&self, tracked: &Tracked, view: &View, x: i32, y: i32) -> bool {
-        let mut family = view.surfaces.clone();
-        family.push(tracked.hwnd);
-        !win::owns_point(&family, x, y)
-    }
-
     fn with_front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], work: impl FnOnce() -> T) -> Result<T, String> {
         self.front(tracked, view, points, false, work)
     }
@@ -737,11 +744,10 @@ impl Service {
                 return run_menu_entry(tracked.hwnd, &entry);
             }
         }
-        // A browser's accessibility click pulls its window forward, so a message is better while
-        // the window shows. A covered browser drops messages, so that is when accessibility is needed.
-        // Any other app that has pulled its window forward before is pressed by message too, which
-        // covers the person's window for no moment at all.
-        let by_message = if win::is_chromium(tracked.hwnd) { !self.covered(tracked, view, x, y) } else { win::pulls_forward(&view.pids) && !win::draws_itself(tracked.hwnd) && view.surfaces.is_empty() && node.as_ref().is_some_and(|node| node.parts.role != "menuitem") };
+        // Accessibility makes a browser, and any app seen to do the same, pull its window over the
+        // person's. A window message never does, covered or not.
+        let by_message = win::is_chromium(tracked.hwnd)
+            || (win::pulls_forward(&view.pids) && !win::draws_itself(tracked.hwnd) && view.surfaces.is_empty() && node.as_ref().is_some_and(|node| node.parts.role != "menuitem"));
         let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !by_message);
         if let (Some(node), true) = (&node, plain) {
             let classic = !act::draws_at(tracked.hwnd, x, y);
@@ -933,7 +939,37 @@ impl Service {
                 Ok("keyboard".to_string())
             })?;
         }
+        // A browser raises its window when accessibility changes a field, so the field is filled
+        // the way a person would, by window messages. Accessibility is only the last resort.
+        if win::is_chromium(tracked.hwnd) && (node.can.value || node.can.range) && !node.element.value_read_only()
+            && let Some(done) = self.fill_in_page(tracked, &node, rect, value) {
+                return done;
+            }
         act::set(&node, tracked.hwnd, value)
+    }
+
+    /// Select everything in a browser field with a triple click, type over it, and read it back.
+    /// None if the text did not land.
+    fn fill_in_page(&self, tracked: &Tracked, node: &Node, rect: Bounds, value: &str) -> Option<Reply> {
+        let (x, y) = act::centre(rect);
+        act::post_press(tracked.hwnd, x, y, Button::Left, 3, 0).ok()?;
+        thread::sleep(FIELD_SETTLE);
+        let field = win::child_at(tracked.hwnd, x, y).0;
+        if let Err(error) = act::post_text(field, value, &self.stop) {
+            return Some(Err(error));
+        }
+        let until = Instant::now() + TYPE_CHECK;
+        while node.element.value_text() != value && Instant::now() < until {
+            thread::sleep(SETTLE_STEP);
+        }
+        if node.element.value_text() != value {
+            return None;
+        }
+        // A number field tells the page only when it loses focus, so focus moves on with Tab.
+        if node.can.range {
+            let _ = act::post_key(tracked.hwnd, &real::chord("tab").ok()?, "tab");
+        }
+        Some(Ok("message".into()))
     }
 
     fn type_text(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
@@ -964,11 +1000,6 @@ impl Service {
                 }
                 Ok("keyboard".to_string())
             })?;
-        }
-        if let (Some(_), Some(node)) = (place.filter(|(x, y)| win::is_chromium(tracked.hwnd) && self.covered(tracked, view, *x, *y)), &field) {
-            let mut value = node.element.value_text();
-            value.push_str(text);
-            return act::set(node, tracked.hwnd, &value);
         }
         if let (Some((x, y)), true) = (place, win::is_chromium(tracked.hwnd)) {
             // The page has to know which field has focus, and a click inside it says so.
