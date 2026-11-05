@@ -739,8 +739,10 @@ impl Service {
         }
         // A browser's accessibility click pulls its window forward, so a message is better while
         // the window shows. A covered browser drops messages, so that is when accessibility is needed.
-        let chromium_shows = win::is_chromium(tracked.hwnd) && !self.covered(tracked, view, x, y);
-        let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !chromium_shows);
+        // Any other app that has pulled its window forward before is pressed by message too, which
+        // covers the person's window for no moment at all.
+        let by_message = if win::is_chromium(tracked.hwnd) { !self.covered(tracked, view, x, y) } else { win::pulls_forward(&view.pids) && !win::draws_itself(tracked.hwnd) && view.surfaces.is_empty() && node.as_ref().is_some_and(|node| node.parts.role != "menuitem") };
+        let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !by_message);
         if let (Some(node), true) = (&node, plain) {
             let classic = !act::draws_at(tracked.hwnd, x, y);
             let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press(node), false) };

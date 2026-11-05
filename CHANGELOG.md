@@ -6,6 +6,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.10] - 2026-11-05
+
+- Stop an app that pulls its window forward when an agent presses it through accessibility from covering the person's window again: once the focus guard has had to take focus back from an app, later clicks on it are posted as messages, which never raise it. Seen with egui apps such as PkgStats. The first click on such an app can still cover for a few milliseconds.
+
 ## [0.1.9] - 2026-11-03
 
 - Add commands beyond windows: `processes`, `kill`, `run`, `fetch`, `file`, `reg`, `notify` and `settings`. They need no service, refuse to end Windows' own processes or the agent's shell, never overwrite without `--force`, delete only to the Recycle Bin, and write the registry only under HKCU.

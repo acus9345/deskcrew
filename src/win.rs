@@ -499,6 +499,15 @@ impl Drop for ForegroundLock {
     }
 }
 
+/// Processes that took focus when an agent pressed a control through accessibility. A posted
+/// click does not, so these are pressed that way from then on.
+static PULLED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+/// True if one of these processes has already pulled its window forward over the person's.
+pub fn pulls_forward(pids: &[u32]) -> bool {
+    PULLED.lock().unwrap().iter().any(|pid| pids.contains(pid))
+}
+
 /// Remembers the person's window, and takes focus back if the app under control grabbed it.
 #[derive(Clone)]
 pub struct FocusGuard {
@@ -550,6 +559,13 @@ impl FocusGuard {
         if !target_pids.contains(&pid(now)) && !target_pids.contains(&content_pid(now)) {
             return false;
         }
+        let mut pulled = PULLED.lock().unwrap();
+        for owner in [pid(now), content_pid(now)] {
+            if !pulled.contains(&owner) {
+                pulled.push(owner);
+            }
+        }
+        drop(pulled);
         if !bring_forward(self.front) {
             stop_flashing(self.front);
         }
