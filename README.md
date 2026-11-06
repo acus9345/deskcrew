@@ -48,7 +48,7 @@ The rule sits between `<!-- deskcrew: start -->` and `<!-- deskcrew: end -->` li
 
 ## macOS
 
-**The macOS version has not been run yet.** It was written and type-checked for both Apple Silicon and Intel Macs on a Windows PC, which cannot link or run Mac programs. Treat it as a first draft until someone tries it on a Mac.
+**The macOS version has not been run yet.** It was written and type-checked for both Apple Silicon and Intel Macs on a Windows PC, which cannot link or run Mac programs. Treat it as a first draft until someone tries it on a Mac.(please share ur feedback on a mac:D)
 
 It has the same commands and replies, built on Mac parts:
 
