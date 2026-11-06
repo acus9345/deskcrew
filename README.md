@@ -27,7 +27,7 @@ To make it available to your agents:
 ```bash
 target/release/deskcrew setup
 ```
-
+(or just tell ur agent to install deskcrew to ur agent app)
 That puts `deskcrew` on PATH and sets up every agent app and CLI it finds, so they use deskcrew on their own whenever a task needs the desktop, instead of built-in computer use or other desktop tools. Run it again after installing a new agent; it updates what it wrote instead of adding copies, and leaves the rest of each file alone.
 
 | Agent (app and CLI) | What setup writes |
