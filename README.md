@@ -27,7 +27,7 @@ To make it available to your agents:
 ```bash
 target/release/deskcrew setup
 ```
-
+(or just tell ur agent to install deskcrew to ur agentic app)
 That puts `deskcrew` on PATH and sets up every agent app and CLI it finds, so they use deskcrew on their own whenever a task needs the desktop, instead of built-in computer use or other desktop tools. Run it again after installing a new agent; it updates what it wrote instead of adding copies, and leaves the rest of each file alone.
 
 | Agent (app and CLI) | What setup writes |
@@ -48,7 +48,7 @@ The rule sits between `<!-- deskcrew: start -->` and `<!-- deskcrew: end -->` li
 
 ## macOS
 
-**The macOS version has not been run yet.** It was written and type-checked for both Apple Silicon and Intel Macs on a Windows PC, which cannot link or run Mac programs. Treat it as a first draft until someone tries it on a Mac.
+**The macOS version has not been run yet.** It was written and type-checked for both Apple Silicon and Intel Macs on a Windows PC, which cannot link or run Mac programs. Treat it as a first draft until someone tries it on a Mac.(please share ur feedback on a mac:D)
 
 It has the same commands and replies, built on Mac parts:
 
