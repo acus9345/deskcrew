@@ -75,6 +75,16 @@ pub fn press(node: &Node) -> Option<Result<String, String>> {
     None
 }
 
+/// A check box or radio button WinForms draws itself: its own default action flips it in place.
+/// Accessibility's toggle needs the window active, and WinForms drops a posted click on a spot
+/// another window covers.
+pub fn flip_self_drawn(node: &Node) -> Option<Result<String, String>> {
+    if !matches!(node.parts.role.as_str(), "checkbox" | "radio") || !node.can.legacy || !win::self_drawn_button(node.native) {
+        return None;
+    }
+    Some(node.element.default_action().map(|d| route("default", d)))
+}
+
 /// A classic push button with its own window: tell its parent it was clicked. Accessibility would
 /// activate the window and wait out any dialog, and a posted click is dropped when it is covered.
 pub fn post_button(node: &Node, root: Hwnd) -> Option<Result<String, String>> {

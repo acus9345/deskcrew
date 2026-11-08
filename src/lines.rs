@@ -18,7 +18,7 @@ pub fn clip(text: &str, max: usize) -> String {
         return flat;
     }
     let cut: String = flat.chars().take(max).collect();
-    format!("{cut}…")
+    format!("{cut}...")
 }
 
 /// UIA control types, by the numbers Windows gives them.
@@ -158,7 +158,7 @@ pub fn change_report(old: &Seen, new: &Seen) -> (Vec<String>, bool) {
     }
     let left = lines.len() - MAX_CHANGES;
     lines.truncate(MAX_CHANGES);
-    lines.push(format!("… {left} more changes: see"));
+    lines.push(format!("... {left} more changes: see"));
     (lines, false)
 }
 
@@ -173,7 +173,7 @@ pub fn page(seen: &Seen, find: Option<&str>, from: usize) -> Vec<String> {
     let total = matched.len();
     let mut out: Vec<String> = matched.into_iter().skip(from).take(MAX_LINES).collect();
     if from + out.len() < total {
-        out.push(format!("… {} more: see --from {} or --find word", total - from - out.len(), from + MAX_LINES));
+        out.push(format!("... {} more: see --from {} or --find word", total - from - out.len(), from + MAX_LINES));
     }
     out
 }
@@ -244,8 +244,8 @@ mod tests {
     #[test]
     fn long_text_is_cut_and_flattened() {
         assert_eq!(clip("a\n  b", 10), "a b");
-        assert_eq!(clip("abcdef", 3), "abc…");
-        assert_eq!(clip("字元對應表", 2), "字元…");
+        assert_eq!(clip("abcdef", 3), "abc...");
+        assert_eq!(clip("字元對應表", 2), "字元...");
     }
 
     #[test]

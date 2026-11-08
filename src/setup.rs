@@ -44,7 +44,7 @@ const RULE_END: &str = "<!-- deskcrew: end -->";
 /// The standing rule in each agent's own instructions, so it reaches for deskcrew by itself.
 fn standing_rule() -> String {
     format!(
-        "{RULE_START}\n## Controlling this computer\n\nWhenever a task needs anything done or seen on the desktop (opening, reading, clicking, typing into or arranging an app or window, or checking the screen), use the `deskcrew` command and its skill on your own, without waiting to be asked. Use it instead of built-in computer use, screenshot tools or any other desktop-control tool or MCP server, even when those are available: deskcrew works in the background without taking the person's mouse or focus. Start with `deskcrew help`. Ask before anything risky, as usual.\n{RULE_END}\n"
+        "{RULE_START}\n## Controlling this computer\n\nWhenever a task needs anything done or seen on the desktop (opening, reading, clicking, typing into or arranging an app or window, or checking the screen), use the `deskcrew` command on your own, without waiting to be asked. Use it instead of built-in computer use, screenshot tools or any other desktop-control tool or MCP server, even when those are available: deskcrew works in the background without taking the person's mouse or focus. Read a window once with `deskcrew see Calculator`, then run all the steps in one call, such as `deskcrew do \"set e2 Ada; select e4 Japan; click e9\" -w Calculator`: names work in place of refs, and the reply lists everything that changed. `deskcrew help` lists every command; its skill has more. Ask before anything risky, as usual.\n{RULE_END}\n"
     )
 }
 

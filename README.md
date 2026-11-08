@@ -78,9 +78,9 @@ Run `deskcrew help` for every command. A background service starts itself on fir
 
 ## Why it is cheap
 
-- Each control is one short line, and refs stay valid, so a window is read once.
-- Every action replies with only what changed, so there is nothing to read again.
-- `click e1 e2 e3` and `do` run many steps in one call.
+- Each control is one short line, and refs stay valid, so a window is read once. Labels that repeat a control's name, spinner arrows and dropdown buttons are left out, and a grid row is one line, with the rows scrolled out of sight added when they fit.
+- Every action replies with only what changed, new dialogs and their text included, so there is nothing to read again.
+- `do` runs a whole task in one call: names work in place of refs, and it goes on into the dialogs its steps open. A name that fits several controls picks the one that can take the action.
 - Pictures are files that are only sent if the agent opens them. An unchanged picture is reported as `unchanged`.
 - `see` points out any large part of a window with no controls, such as a canvas or a game, and reads the text in it with Windows' own offline OCR. Clicks can use the x,y it gives, so a picture is only needed for drawings, and then only of that part.
 - When an action changes no control, its reply says whether the window's picture changed and where, so the agent doesn't need a picture to check.
@@ -136,6 +136,41 @@ How each tool was called:
 - agent-cu: `snapshot -i -c`, its recommended compact mode. Its npm package has no Windows program, so it was built from the GitHub source. Its read time swung between about 0.1 s and 4 s from window to window.
 - mcp-windows: `ui_snapshot` in full mode. Its incremental mode makes repeated reads cheaper and was not measured.
 - Windows-MCP: `Snapshot` without a picture. It always reads the whole desktop, other windows and taskbar included, so its figures change with what else is open and are not for one window alone. It waits while the person is using the computer, and refuses to run while a screensaver is on.
+
+## Agents doing whole tasks
+
+Reading a window is only part of the cost. This measures what an agent spends to finish a task, in the tokens the API reports. Measured on 2026-11-08 with Claude Code 2.1.318 running Sonnet 5.5 headless at its default effort, three runs per tool, on the same machine, on throwaway windows. Each figure is the median of the three. "Right" is checked from the app's own log, not from what the agent said.
+
+- **Order form:** fill in name, email, quantity, country, shipping and gift wrap, submit, confirm the dialog, and report the order number.
+- **Stock grid:** find the item with the lowest stock in an 80-row grid, type its name into a box, press Check, and report the result.
+
+| Order form | Right | Time | Model calls | Tokens read | Tokens written | Cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| deskcrew (this version) | 3 of 3 | 17 s | 5 | 50,187 | 420 | $0.039 |
+| agent-desktop 1.1.0 | 0 of 3 | 55 s | 11 | 209,974 | 1,419 | $0.119 |
+| agent-cu | 3 of 3 | 348 s | 15 | 305,637 | 2,013 | $0.138 |
+| mcp-windows 1.3.28 | 3 of 3 | 73 s | 20 | 760,113 | 3,154 | $0.205 |
+| Windows-MCP 0.8.8 | 3 of 3 | 98 s | 10 | 372,519 | 1,394 | $0.210 |
+
+| Stock grid | Right | Time | Model calls | Tokens read | Tokens written | Cost |
+| --- | --- | --- | --- | --- | --- | --- |
+| deskcrew (this version) | 3 of 3 | 11 s | 4 | 41,373 | 293 | $0.041 |
+| agent-desktop 1.1.0 | 3 of 3 | 26 s | 8 | 142,283 | 1,338 | $0.107 |
+| agent-cu | 3 of 3 | 26 s | 6 | 129,703 | 676 | $0.111 |
+| mcp-windows 1.3.28 | 3 of 3 | 57 s | 19 | 1,035,417 | 4,486 | $0.311 |
+| Windows-MCP 0.8.8 | 3 of 3 | 127 s | 15 | 413,186 | 2,490 | $0.165 |
+
+Tokens read count everything sent to the model on every call, most of it from the prompt cache, which is billed at a tenth of the price; cost is what the API charged. Sonnet hardly thought on these tasks with any tool, so the time is mostly calls to the model and the tool's own work.
+
+How each tool was set up: every agent had only Bash and the Skill tool built in, none of your own settings, and the tool the way its README says to install it. deskcrew got what `setup` writes; agent-desktop its bundled skill and the lines its README gives for an agent's instructions; agent-cu its skill from skills.sh, built from source as above; mcp-windows and Windows-MCP as MCP servers.
+
+What happened with the others:
+
+- agent-desktop could not pick the form's WinForms radio button in its background mode: every click or select on it timed out. Each run stopped there and asked to use the real mouse, so no order was placed.
+- agent-cu got every order right, but its click on Submit waited about two minutes while the confirm dialog was open, and other reads waited 30 to 60 seconds.
+- mcp-windows and Windows-MCP finished every task, using the real mouse and keyboard, with their tool schemas sent on every call.
+
+Compared with deskcrew 0.1.11 under the same agent, this version took the order form from 29 s and 6 model calls to 17 s and 5, and the stock grid from 19 s and 7 calls to 14 s and 4, with 47% fewer tokens read. Those before-and-after runs were on a hidden desktop, where nothing can reach the person's screen. [`bench/`](bench/README.md) has the tasks and the runner.
 
 ## Features compared
 
@@ -237,6 +272,8 @@ cargo test --release --test desktop -- --ignored --nocapture
 ```
 
 The second one drives throwaway windows it opens itself, including the real keyboard and mouse for a few seconds, so leave the machine alone while it runs. It has 65 checks, and it counts synthetic mouse events to prove when the cursor was left alone.
+
+[`bench/`](bench/README.md) gives a coding agent the same desktop task with each tool and measures the time, model calls, tokens and cost, and whether the result was right.
 
 ## Limits
 

@@ -32,7 +32,7 @@ fn cut(text: &str) -> String {
         return text.to_string();
     }
     let kept: String = text.chars().take(MAX_OUTPUT).collect();
-    format!("{kept}\n… cut at {MAX_OUTPUT} characters")
+    format!("{kept}\n... cut at {MAX_OUTPUT} characters")
 }
 
 /// Run a command line through the shell, with a time limit. Output and errors come back together.
@@ -301,7 +301,7 @@ fn file(words: &[String], force: bool, from: usize) -> Result<String, String> {
                 })
                 .collect();
             if total > MAX_LIST {
-                out.push(format!("… {} more", total - MAX_LIST));
+                out.push(format!("... {} more", total - MAX_LIST));
             }
             Ok(if out.is_empty() { "empty".into() } else { out.join("\n") })
         }
@@ -342,7 +342,7 @@ fn file(words: &[String], force: bool, from: usize) -> Result<String, String> {
             let mut found = Vec::new();
             find(&root, &wanted.to_lowercase(), 0, &mut found);
             if found.len() >= MAX_FOUND {
-                found.push(format!("… stopped at {MAX_FOUND}: narrow the folder or the name"));
+                found.push(format!("... stopped at {MAX_FOUND}: narrow the folder or the name"));
             }
             Ok(if found.is_empty() { "nothing found".into() } else { found.join("\n") })
         }

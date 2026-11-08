@@ -393,6 +393,14 @@ pub fn parent_and_id(hwnd: Hwnd) -> (Hwnd, i32) {
     unsafe { (GetParent(raw(hwnd)) as Hwnd, GetDlgCtrlID(raw(hwnd))) }
 }
 
+/// A check box or radio button an app draws itself on a classic button window, as WinForms does.
+pub fn self_drawn_button(hwnd: Hwnd) -> bool {
+    const BS_TYPEMASK: u32 = 0x0F;
+    const BS_OWNERDRAW: u32 = 0x0B;
+    let style = unsafe { GetWindowLongPtrW(raw(hwnd), windows_sys::Win32::UI::WindowsAndMessaging::GWL_STYLE) } as u32;
+    hwnd != 0 && class(hwnd).to_uppercase().contains("BUTTON") && style & BS_TYPEMASK == BS_OWNERDRAW
+}
+
 /// Screen pixels per app unit. An app that predates high-DPI screens works in larger units than
 /// the pixels Windows shows it at, so its messages and its own pictures are in those units.
 pub fn app_scale(hwnd: Hwnd) -> f32 {

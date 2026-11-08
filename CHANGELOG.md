@@ -6,6 +6,18 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.12] - 2026-11-08
+
+- Let agents finish a task in fewer, faster calls. On the bench's order form a Claude Code agent went from 29 s and 6 model calls to 17 s and 5, and on an 80-row grid from 19 s and 7 calls to 14 s and 4, reading up to 47% fewer tokens, with every result still right.
+- `do` goes on into the dialogs its steps open, and a name that fits several controls picks the one that can take the action, so `set Quantity 3` finds the text box.
+- `see` leaves out spinner arrows, dropdown buttons and labels that repeat the next control's name, reads a grid row as one line, and adds a grid's off-screen rows when they fit.
+- `table` reads the right header, starts at row N with `--from N`, and returns as many rows as fit in one reply. It used to take a grid's scroll bar for its header and read the same first rows again.
+- Click WinForms check boxes and radio buttons with window messages. Accessibility briefly took focus for them, and in a covered window flipped them late.
+- Acting on a dialog by its own title works through the window that owns it, so the reply shows what the dialog changed there.
+- Each Windows desktop gets its own service, and deskcrew's own messages use plain ASCII.
+- The standing rule `setup` writes, the help and the skill lead with one `see`, then every step in one `do`.
+- Add `bench/`, which measures agents doing the same desktop task with each tool: time, calls, tokens, cost and whether the result is right.
+
 ## [0.1.11] - 2026-11-05
 
 - Stop agents taking the person's focus in browser and Electron apps: clicks, `type` and `set` there always go by window message, even while the window is covered, instead of accessibility, which raised the app over the person's window.

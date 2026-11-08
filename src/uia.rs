@@ -174,19 +174,68 @@ impl Uia {
     }
 
     /// Every control worth a line in this window, in reading order. Off-screen ones are counted.
-    pub fn read(&self, hwnd: Hwnd, all: bool, nodes: &mut Vec<Node>, hidden: &mut usize) -> Result<(), String> {
+    /// `quiet` gets the bounds of controls left out because another line says the same.
+    pub fn read(&self, hwnd: Hwnd, all: bool, nodes: &mut Vec<Node>, hidden: &mut usize, quiet: &mut Vec<(i32, i32, i32, i32)>) -> Result<(), String> {
         unsafe {
             let root = self.auto.ElementFromHandle(HWND(hwnd as _)).map_err(say)?;
             let tree = root.BuildUpdatedCache(&self.cache).map_err(say)?;
-            walk(&tree, "", None, all, nodes, hidden, 0);
+            walk(&tree, "", 0, None, all, nodes, hidden, 0);
+            if !all {
+                drop_labels(nodes, quiet);
+            }
             Ok(())
         }
     }
 }
 
+/// A caption read just before the control it names, or a shell around a control of the same name,
+/// says nothing the control's own line does not.
+fn drop_labels(nodes: &mut Vec<Node>, quiet: &mut Vec<(i32, i32, i32, i32)>) {
+    let mut at = 0;
+    while at + 1 < nodes.len() {
+        let (label, next) = (&nodes[at].parts, &nodes[at + 1].parts);
+        let shell = !label.role.is_empty() && encloses(nodes[at].rect, nodes[at + 1].rect);
+        if (label.role.is_empty() || shell) && label.value.is_none() && !label.name.is_empty() && !next.role.is_empty() && next.name == label.name {
+            quiet.push(nodes.remove(at).rect);
+        } else {
+            at += 1;
+        }
+    }
+}
+
+/// The texts of an element that holds only data cells, as a grid's row does when it has no row
+/// type of its own (WinForms grids), with its first cell. None for anything else.
+unsafe fn cells_of(el: &IUIAutomationElement) -> Option<(Vec<String>, IUIAutomationElement)> {
+    unsafe {
+        let children = el.GetCachedChildren().ok()?;
+        let count = children.Length().unwrap_or(0);
+        if count < 2 {
+            return None;
+        }
+        let mut cells = Vec::new();
+        let first = children.GetElement(0).ok()?;
+        for at in 0..count {
+            let cell = children.GetElement(at).ok()?;
+            if cell.CachedControlType().map(|k| k.0).unwrap_or(0) != 50029 {
+                return None;
+            }
+            let value = cached_text(&cell, UIA_ValueValuePropertyId);
+            cells.push(if value.is_empty() { text(cell.CachedName()) } else { value });
+        }
+        Some((cells, first))
+    }
+}
+
+/// True if `outer` holds all of `inner`.
+pub fn encloses(outer: (i32, i32, i32, i32), inner: (i32, i32, i32, i32)) -> bool {
+    outer != inner && outer.0 <= inner.0 && outer.1 <= inner.1 && outer.0 + outer.2 >= inner.0 + inner.2 && outer.1 + outer.3 >= inner.1 + inner.3
+}
+
+#[allow(clippy::too_many_arguments)]
 unsafe fn walk(
     el: &IUIAutomationElement,
     parent: &str,
+    parent_kind: i32,
     row: Option<usize>,
     all: bool,
     nodes: &mut Vec<Node>,
@@ -227,18 +276,54 @@ unsafe fn walk(
                 if !shown.is_empty() && shown != parent && !nodes[at].parts.cells.contains(&shown) {
                     nodes[at].parts.cells.push(shown);
                 }
-                walk_children(el, &name, row, all, nodes, hidden, depth);
+                walk_children(el, &name, kind, row, all, nodes, hidden, depth);
                 return;
             }
 
         let role = lines::role(kind);
+        // The arrows of a spinner and the open button of a dropdown, and the shells that only hold
+        // them: `set` and `select` do their work. `see -a` still lists them.
+        let fitting = !all
+            && ((role == Some("button") && matches!(parent_kind, 50003 | 50016))
+                || (kind == 50016 && !can.value && !can.range)
+                || (kind == 50003 && !can.value && !can.expand && !can.range));
         let listed = match role {
             Some("") => !name.is_empty() && name != parent,
             Some("image") => acts && !name.is_empty(),
             Some(_) => true,
             // Tables and grids get a line even when idle, so `table` has something to name.
             None => acts || scrollable || matches!(kind, 50028 | 50036),
-        };
+        } && !fitting;
+        // A row made only of data cells reads as one line, as the rows of other grids do.
+        let cells = if !listed && row.is_none() && !all { cells_of(el) } else { None };
+        // The row acts through its first cell, which a click selects as a person's would.
+        if let Some((cells, first)) = cells {
+            if off {
+                *hidden += 1;
+            } else {
+                nodes.push(Node {
+                    runtime: runtime_id(el),
+                    identity: format!("{kind}|row|{name}"),
+                    control_id: text(el.CachedAutomationId()),
+                    parts: Parts { role: "row".into(), name: name.clone(), value: None, states: Vec::new(), cells },
+                    rect: el.CachedBoundingRectangle().map(rect_of).unwrap_or_default(),
+                    native: first.CachedNativeWindowHandle().map(|h| h.0 as Hwnd).unwrap_or(0),
+                    can: Can {
+                        invoke: cached_bool(&first, UIA_IsInvokePatternAvailablePropertyId),
+                        toggle: cached_bool(&first, UIA_IsTogglePatternAvailablePropertyId),
+                        select: cached_bool(&first, UIA_IsSelectionItemPatternAvailablePropertyId),
+                        expand: false,
+                        value: false,
+                        range: false,
+                        scroll: false,
+                        scroll_item: cached_bool(&first, UIA_IsScrollItemPatternAvailablePropertyId),
+                        legacy: cached_bool(&first, UIA_IsLegacyIAccessiblePatternAvailablePropertyId),
+                    },
+                    element: Element(first.clone()),
+                });
+            }
+            return;
+        }
 
         let mut own = row;
         if listed {
@@ -249,7 +334,7 @@ unsafe fn walk(
                 let control_id = text(el.CachedAutomationId());
                 let automation_id = Some(control_id.clone()).filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default();
                 if lines::is_window_chrome(&automation_id) {
-                    walk_children(el, parent, row, all, nodes, hidden, depth);
+                    walk_children(el, parent, kind, row, all, nodes, hidden, depth);
                     return;
                 }
                 let mut states = Vec::new();
@@ -310,13 +395,15 @@ unsafe fn walk(
             }
         }
         let carried = if listed { name.as_str() } else { parent };
-        walk_children(el, carried, own, all, nodes, hidden, depth);
+        walk_children(el, carried, kind, own, all, nodes, hidden, depth);
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 unsafe fn walk_children(
     el: &IUIAutomationElement,
     parent: &str,
+    parent_kind: i32,
     row: Option<usize>,
     all: bool,
     nodes: &mut Vec<Node>,
@@ -327,7 +414,7 @@ unsafe fn walk_children(
         let Ok(children) = el.GetCachedChildren() else { return };
         for at in 0..children.Length().unwrap_or(0) {
             if let Ok(child) = children.GetElement(at) {
-                walk(&child, parent, row, all, nodes, hidden, depth + 1);
+                walk(&child, parent, parent_kind, row, all, nodes, hidden, depth + 1);
             }
         }
     }
@@ -357,7 +444,7 @@ fn patiently(element: &Element, call: impl FnOnce(&IUIAutomationElement) -> wind
 
 /// A grid that offers no grid pattern, such as a WinForms data grid, read as rows of children:
 /// a row whose cells carry no values is the header.
-fn rows_of(element: &IUIAutomationElement, rows: usize, columns: usize, auto: &Uia) -> Result<Table, String> {
+fn rows_of(element: &IUIAutomationElement, skip: usize, rows: usize, columns: usize, auto: &Uia) -> Result<Table, String> {
     unsafe {
         let every = auto.auto.CreateTrueCondition().map_err(say)?;
         let children = |parent: &IUIAutomationElement| -> Vec<IUIAutomationElement> {
@@ -369,6 +456,10 @@ fn rows_of(element: &IUIAutomationElement, rows: usize, columns: usize, auto: &U
         let mut total_rows = 0;
         let mut total_columns = 0;
         for row in children(element) {
+            // A grid's own scroll bars sit among its rows.
+            if row.CurrentControlType().map(|k| k.0).unwrap_or(0) == 50014 {
+                continue;
+            }
             let parts = children(&row);
             if parts.is_empty() {
                 continue;
@@ -384,7 +475,7 @@ fn rows_of(element: &IUIAutomationElement, rows: usize, columns: usize, auto: &U
             }
             total_rows += 1;
             total_columns = total_columns.max(values.len());
-            if cells.len() < rows {
+            if total_rows > skip && cells.len() < rows {
                 cells.push(values.into_iter().take(columns).collect());
             }
         }
@@ -514,7 +605,8 @@ impl Element {
 
     /// A grid's cells as rows of text, with its column headers, and how many rows and columns it
     /// has in all. Only the first `rows` by `columns` cells are read.
-    pub fn grid(&self, rows: usize, columns: usize, auto: &Uia) -> Result<Table, String> {
+    /// Rows of the table this control is or sits in, after the first `skip`.
+    pub fn grid(&self, skip: usize, rows: usize, columns: usize, auto: &Uia) -> Result<Table, String> {
         unsafe {
             // A cell knows its grid, so naming any cell works too.
             let owner = match self.0.GetCurrentPatternAs::<IUIAutomationGridItemPattern>(UIA_GridItemPatternId).and_then(|item| item.CurrentContainingGrid()) {
@@ -527,7 +619,7 @@ impl Element {
                 if value.is_empty() { text(element.CurrentName()) } else { value }
             };
             let Ok(grid) = owner.GetCurrentPatternAs::<IUIAutomationGridPattern>(UIA_GridPatternId) else {
-                return rows_of(&owner, rows, columns, auto);
+                return rows_of(&owner, skip, rows, columns, auto);
             };
             let (total_rows, total_columns) = (grid.CurrentRowCount().map_err(say)? as usize, grid.CurrentColumnCount().map_err(say)? as usize);
             let mut headers = Vec::new();
@@ -541,7 +633,7 @@ impl Element {
                 }
             }
             let mut cells = Vec::new();
-            for row in 0..total_rows.min(rows) {
+            for row in skip.min(total_rows)..total_rows.min(skip + rows) {
                 let mut line = Vec::new();
                 for column in 0..total_columns.min(columns) {
                     line.push(grid.GetItem(row as i32, column as i32).map(|item| cell(&item)).unwrap_or_default());

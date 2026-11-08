@@ -22,7 +22,27 @@ const MAX_MESSAGE: usize = 1 << 24;
 fn name() -> Vec<u16> {
     let mut session = 0;
     unsafe { ProcessIdToSessionId(GetCurrentProcessId(), &mut session) };
-    format!(r"\\.\pipe\deskcrew-{}-{session}", env!("CARGO_PKG_VERSION")).encode_utf16().chain(Some(0)).collect()
+    // A service only sees the windows of its own desktop, so each desktop gets its own.
+    let desktop = match desktop() {
+        name if name.is_empty() || name.eq_ignore_ascii_case("Default") => String::new(),
+        name => format!("-{name}"),
+    };
+    format!(r"\\.\pipe\deskcrew-{}-{session}{desktop}", env!("CARGO_PKG_VERSION")).encode_utf16().chain(Some(0)).collect()
+}
+
+fn desktop() -> String {
+    use windows_sys::Win32::System::{
+        StationsAndDesktops::{GetThreadDesktop, GetUserObjectInformationW, UOI_NAME},
+        Threading::GetCurrentThreadId,
+    };
+    let mut name = [0u16; 256];
+    let mut needed = 0;
+    let read = unsafe { GetUserObjectInformationW(GetThreadDesktop(GetCurrentThreadId()), UOI_NAME, name.as_mut_ptr().cast(), (name.len() * 2) as u32, &mut needed) };
+    if read == 0 {
+        return String::new();
+    }
+    let end = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+    String::from_utf16_lossy(&name[..end]).chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect()
 }
 
 pub struct Pipe(HANDLE);

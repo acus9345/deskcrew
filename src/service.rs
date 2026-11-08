@@ -57,7 +57,8 @@ const WAIT_MOST_MS: u64 = 60_000;
 const WAIT_STEP: Duration = Duration::from_millis(200);
 const MAX_WINDOWS: usize = 40;
 const MAX_GET_CHARS: usize = 20_000;
-const DEFAULT_TABLE_ROWS: usize = 50;
+/// How much of a table one reply carries: a few thousand characters, however many rows that is.
+const TABLE_CHARS: usize = 6000;
 const DIALOG_CLOSE: Duration = Duration::from_secs(3);
 const MAX_TABLE_ROWS: usize = 500;
 const MAX_TABLE_COLUMNS: usize = 20;
@@ -65,7 +66,7 @@ const MAX_CELL_CHARS: usize = 60;
 const STOPPED: &str = "stopped by the person with Ctrl+Alt+Esc: ask them before doing more (deskcrew resume clears it)";
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
 
-pub const HELP: &str = r#"deskcrew drives Windows apps in the background. Refs stay valid, so read once.
+pub const HELP: &str = r#"deskcrew drives Windows apps in the background. Fastest: see a window once, then do every step in one call.
 windows [filter]                      list windows
 see [window] [-f] [-a] [--find word] [--from N]
                                       controls; later reads show only changes (-f for all, -a off-screen too)
@@ -78,13 +79,14 @@ is e3 on|off|open|closed|selected|enabled|disabled
 down shift --real | down left x,y --mouse     up (lets go; 30 s limit)
 set e3 "value"     type [e3] "text" [--paste]     key enter [--hold ms --real]     select e3 "Item"
 scroll [e3] up|down [n]     show e3     wait "text" [--gone] [--ms N]
-table e5 [--from N]                   a table or grid as rows     pick-file "path"   fill an Open or Save dialog
+table e5 [--from N]                   a table or grid, as many rows as fit     pick-file "path"   fill an Open or Save dialog
 drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
-do "click e1; set e2 hi; key enter" [--dry] [--risk low|medium|high]   many steps, one reply
+do "set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Yes" [--dry] [--risk low|medium|high]
+                                      many steps, one reply; names work as refs, and it goes on into dialogs it opens
 Any action: --expect "text" fails unless the text shows afterwards.
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
 apps     screens     notifications [close]     clip     clip set "text"     clip clear     status     resume     quit     setup (installs for your coding agents)
-Every action replies with what changed, in the picture too. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
+Every action replies with what changed, new dialogs and their text too: no need to see again or sleep. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen: a last resort),
 --mouse (asks the person to borrow their cursor, if they allow asking: only if nothing else works).
@@ -158,6 +160,8 @@ struct View {
     read_once: bool,
     // The last look at the part with no controls: its picture's fingerprint and what it said.
     blind: Option<(u64, Vec<String>)>,
+    // Where the captions left out of the list sit: they are not a part with no controls.
+    quiet: Vec<Bounds>,
 }
 
 struct Tracked {
@@ -413,6 +417,12 @@ impl Service {
         match matches.as_slice() {
             [] => Err(format!("no window matches '{spec}'")),
             [only] => {
+                // A dialog already read as part of its window is worked from that window, so its
+                // refs hold and the reply shows what the dialog changed there.
+                if let Some(owner) = self.owner_of(only.hwnd) {
+                    self.set_current(who, owner.hwnd);
+                    return Ok(owner);
+                }
                 let tracked = self.track(only.hwnd);
                 self.set_current(who, only.hwnd);
                 Ok(tracked)
@@ -423,6 +433,12 @@ impl Service {
                 Err(out.join("\n"))
             }
         }
+    }
+
+    /// The window this one was read as a dialog or popup of, if any.
+    fn owner_of(&self, hwnd: Hwnd) -> Option<Arc<Tracked>> {
+        let windows: Vec<Arc<Tracked>> = self.windows.lock().unwrap().1.values().cloned().collect();
+        windows.into_iter().find(|t| t.hwnd != hwnd && t.view.try_lock().is_ok_and(|view| view.surfaces.contains(&hwnd)))
     }
 
     /// Read the window and any popups or dialogs that belong to it.
@@ -454,16 +470,18 @@ impl Service {
 
         let mut nodes = Vec::new();
         let mut hidden = 0;
-        self.uia.read(tracked.hwnd, all, &mut nodes, &mut hidden)?;
+        let mut quiet = Vec::new();
+        self.uia.read(tracked.hwnd, all, &mut nodes, &mut hidden, &mut quiet)?;
         for hwnd in view.surfaces.clone() {
             let before = nodes.len();
-            if self.uia.read(hwnd, all, &mut nodes, &mut hidden).is_err() {
+            if self.uia.read(hwnd, all, &mut nodes, &mut hidden, &mut quiet).is_err() {
                 nodes.truncate(before);
             }
         }
         // Windows lists a dialog under its owner too, so the same control can arrive twice.
         let mut met = HashSet::new();
         nodes.retain(|node| node.runtime.is_empty() || met.insert(node.runtime.clone()));
+        view.quiet = quiet;
         view.nodes = view.refs.assign(nodes);
         view.lines = view.nodes.iter().map(|(id, node)| (*id, lines::line(&node.parts))).collect();
         view.hidden = hidden;
@@ -587,6 +605,11 @@ impl Service {
     }
 
     fn resolve(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<Target, String> {
+        self.resolve_for(word, who, tracked, view, |_| true)
+    }
+
+    /// A control by ref, name or point. When a name fits several, the one that can take the action is meant.
+    fn resolve_for(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View, fits: impl Fn(&Node) -> bool) -> Result<Target, String> {
         if let Some(id) = is_ref(word) {
             if !view.nodes.contains_key(&id) {
                 self.read(tracked, view, false)?;
@@ -633,6 +656,12 @@ impl Service {
                     // A label and the control it names share a name: the one that acts is meant.
                     let acting: Vec<u32> = many.iter().copied().filter(|id| !view.nodes[id].parts.role.is_empty()).collect();
                     if let [only] = acting.as_slice() {
+                        return Ok(Target::Control(*only));
+                    }
+                    let able: Vec<u32> = acting.iter().copied().filter(|id| fits(&view.nodes[id])).collect();
+                    // A control and the shell around it: the inner one does the work.
+                    let inner: Vec<u32> = able.iter().copied().filter(|id| !able.iter().any(|other| uia::encloses(view.nodes[id].rect, view.nodes[other].rect))).collect();
+                    if let [only] = inner.as_slice() {
                         return Ok(Target::Control(*only));
                     }
                     let mut out = vec![format!("'{word}' matches {} controls:", many.len())];
@@ -740,6 +769,9 @@ impl Service {
             if plain && let Some(result) = act::post_button(node, tracked.hwnd) {
                 return result;
             }
+            if plain && let Some(result) = act::flip_self_drawn(node) {
+                return result;
+            }
             if plain && node.parts.role == "menuitem" && let Some(entry) = win::find_menu(win::menu_bar(tracked.hwnd), &node.parts.name) {
                 return run_menu_entry(tracked.hwnd, &entry);
             }
@@ -766,7 +798,7 @@ impl Service {
 
     /// Check, uncheck, expand or collapse, leaving a control that is already that way alone.
     fn ensure(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, (wanted, opposite): (&str, &str)) -> Reply {
-        let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("that needs a control".into()) };
+        let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.toggle || n.can.select || n.can.expand)? else { return Err("that needs a control".into()) };
         self.read(tracked, view, false)?;
         let states = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?.parts.states.clone();
         if states.contains(&wanted) {
@@ -780,7 +812,7 @@ impl Service {
             self.cursor_on(who, flags, rect);
             return node.element.open_or_close().map(|_| "expand".to_string());
         }
-        self.click(who, flags, tracked, view, word)
+        self.click(who, flags, tracked, view, &format!("e{id}"))
     }
 
     /// Text put in through the clipboard, which is faster for a lot of it. The clipboard is put back.
@@ -923,7 +955,7 @@ impl Service {
     }
 
     fn set(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
-        let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("set needs a control".into()) };
+        let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.value || n.can.range)? else { return Err("set needs a control".into()) };
         let (node, rect) = self.locate(id, tracked, view)?;
         self.cursor_on(who, flags, rect);
         if flags.real {
@@ -982,7 +1014,7 @@ impl Service {
         let mut hwnd = None;
         let mut field = None;
         if let Some(word) = target {
-            let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("type needs a control".into()) };
+            let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.value)? else { return Err("type needs a control".into()) };
             let (node, rect) = self.locate(id, tracked, view)?;
             self.cursor_on(who, flags, rect);
             place = Some(act::centre(rect));
@@ -1051,7 +1083,7 @@ impl Service {
     }
 
     fn select(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, item: &str) -> Reply {
-        let Target::Control(id) = self.resolve(word, who, tracked, view)? else { return Err("select needs a control".into()) };
+        let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.expand || n.can.select || matches!(n.parts.role.as_str(), "combobox" | "list"))? else { return Err("select needs a control".into()) };
         let (node, rect) = self.locate(id, tracked, view)?;
         self.cursor_on(who, flags, rect);
         let (result, tried_mouse) = self.overlay.shielded(|| act::select_item(&node, item, &self.uia, tracked.hwnd));
@@ -1441,16 +1473,39 @@ impl Service {
         let mut out = vec![format!("w{} \"{}\" {} controls{hidden}", tracked.id, lines::clip(&win::title(tracked.hwnd), 50), view.lines.len())];
         out.extend(lines::page(&view.lines, flags.find.as_deref(), flags.from));
         if !filtered {
+            out.extend(self.rows_off_screen(view));
             out.extend(self.blind_spot(who, &tracked, view));
         }
         Ok(out.join("\n"))
+    }
+
+    /// The rows of a table that scrolled out of the list, when they fit in the reply: one read
+    /// then holds the whole table, instead of a `table` call after it.
+    fn rows_off_screen(&self, view: &View) -> Vec<String> {
+        let mut out = Vec::new();
+        for (id, node) in view.nodes.iter().filter(|(_, n)| n.parts.role == "table") {
+            let Ok(table) = node.element.grid(0, MAX_TABLE_ROWS, MAX_TABLE_COLUMNS, &self.uia) else { continue };
+            let listed: HashSet<&Vec<String>> = view.nodes.values().filter(|n| n.parts.role == "row" && !n.parts.cells.is_empty()).map(|n| &n.parts.cells).collect();
+            let rest: Vec<String> = table.rows.iter().filter(|row| !listed.contains(row)).map(|row| row.iter().map(|cell| lines::clip(cell, MAX_CELL_CHARS)).collect::<Vec<_>>().join(" | ")).collect();
+            if rest.is_empty() || table.rows.len() < table.total_rows && table.total_rows > MAX_TABLE_ROWS {
+                continue;
+            }
+            if rest.iter().map(|line| line.len() + 1).sum::<usize>() > TABLE_CHARS {
+                out.push(format!("e{id} table: {} more rows off screen: table e{id} reads them", rest.len()));
+                continue;
+            }
+            out.push(format!("e{id} table, {} more rows off screen:", rest.len()));
+            out.extend(rest);
+        }
+        out
     }
 
     /// Point out the largest part of the window with no controls in it, and read any text there,
     /// so the agent knows when the list falls short and needs a picture of only that part.
     fn blind_spot(&self, who: &str, tracked: &Tracked, view: &mut View) -> Vec<String> {
         let window = win::rect(tracked.hwnd);
-        let rects: Vec<_> = view.nodes.values().map(|n| (n.rect, CONTAINERS.contains(&n.parts.role.as_str()))).collect();
+        let mut rects: Vec<_> = view.nodes.values().map(|n| (n.rect, CONTAINERS.contains(&n.parts.role.as_str()))).collect();
+        rects.extend(view.quiet.iter().map(|rect| (*rect, false)));
         let Some((x, y, w, h)) = look::empty_area(window, &rects) else { return Vec::new() };
         let Ok((frame, units)) = shot::window(tracked.hwnd) else { return Vec::new() };
         let inside = |value: i32| (value as f32 / units) as u32;
@@ -1514,17 +1569,29 @@ impl Service {
             self.first_read(&tracked, &mut view, false)?;
         }
         let Target::Control(id) = self.resolve(word, who, &tracked, &mut view)? else { return Err("table needs a control".into()) };
-        let rows = if flags.from == 0 { DEFAULT_TABLE_ROWS } else { flags.from.min(MAX_TABLE_ROWS) };
-        let table = view.nodes[&id].element.grid(rows, MAX_TABLE_COLUMNS, &self.uia)?;
+        // `--from N` starts at row N. As many rows follow as fit in one reply.
+        let skip = flags.from.saturating_sub(1);
+        let table = view.nodes[&id].element.grid(skip, MAX_TABLE_ROWS, MAX_TABLE_COLUMNS, &self.uia)?;
         // Explorer wraps dates in invisible direction marks, which only cost characters.
         let clip = |cells: &[String]| cells.iter().map(|cell| lines::clip(&cell.replace(['\u{200e}', '\u{200f}'], ""), MAX_CELL_CHARS)).collect::<Vec<_>>().join("\t");
         let mut out = vec![format!("{} rows, {} columns", table.total_rows, table.total_columns)];
         if !table.headers.is_empty() {
             out.push(clip(&table.headers));
         }
-        out.extend(table.rows.iter().map(|row| clip(row)));
-        if table.total_rows > table.rows.len() {
-            out.push(format!("… {} more rows: table {word} --from N reads the first N (up to {MAX_TABLE_ROWS})", table.total_rows - table.rows.len()));
+        let mut size = out.iter().map(String::len).sum::<usize>();
+        let mut shown = 0;
+        for row in &table.rows {
+            let line = clip(row);
+            if size + line.len() > TABLE_CHARS && shown > 0 {
+                break;
+            }
+            size += line.len() + 1;
+            out.push(line);
+            shown += 1;
+        }
+        let last = skip + shown;
+        if last < table.total_rows {
+            out.push(format!("rows {}-{last} of {} shown: table {word} --from {} reads on", skip + 1, table.total_rows, last + 1));
         }
         Ok(out.join("\n"))
     }
