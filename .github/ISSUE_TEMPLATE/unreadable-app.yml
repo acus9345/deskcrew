@@ -1,0 +1,39 @@
+name: An app deskcrew can't read
+description: "`see` shows few or no controls, or the wrong ones, for an app."
+labels: [app support]
+body:
+  - type: input
+    id: app
+    attributes:
+      label: The app
+      description: Its name, version, and where it comes from (store, download link, or package).
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: deskcrew version
+      description: The output of `deskcrew --version`.
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+    validations:
+      required: true
+  - type: textarea
+    id: see
+    attributes:
+      label: Output of `deskcrew see "<window>" -f`
+      description: Remove anything private first.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: missing
+    attributes:
+      label: What is missing or wrong
+      description: Which buttons, fields or text you can see in the window but deskcrew does not list. A `deskcrew shot` picture helps.
+    validations:
+      required: true

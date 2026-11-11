@@ -3,7 +3,7 @@
 **Windows, with early macOS and Linux (X11 / Xvfb) versions; Wayland is not supported.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
 ![Three agents draw, use Calculator and type a note at the same time, each with its own cursor](https://raw.githubusercontent.com/acus9345/deskcrew/main/demo/deskcrew-demo.gif)
 
-Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.*even when ur doing something in fullscreen*the agents can still work and do things
+Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working, even while you use another app full screen.
 
 <img width="1163" height="719" alt="image" src="https://github.com/user-attachments/assets/2cad4d13-546e-41d4-84b9-0406ff783b78" />
 
@@ -48,8 +48,8 @@ To make it available to your agents:
 ```bash
 target/release/deskcrew setup
 ```
-(or just tell ur agent to install deskcrew to ur agentic app)
-That puts `deskcrew` on PATH and sets up every agent app and CLI it finds, so they use deskcrew on their own whenever a task needs the desktop, instead of built-in computer use or other desktop tools. Run it again after installing a new agent; it updates what it wrote instead of adding copies, and leaves the rest of each file alone.
+
+That puts `deskcrew` on PATH and sets up every agent app and CLI it finds, so they use deskcrew on their own whenever a task needs the desktop, instead of built-in computer use or other desktop tools. Run it again after installing a new agent; it updates what it wrote instead of adding copies, and leaves the rest of each file alone. You can also ask your agent to install deskcrew for you.
 
 | Agent (app and CLI) | What setup writes |
 | --- | --- |
@@ -92,7 +92,7 @@ Each client shows up as its own cursor, named from what the client calls itself 
 
 ## macOS
 
-**The macOS version is early.** It was written on a Windows PC and has only run on GitHub's Mac runners so far. On every push, CI builds it for Apple Silicon and Intel, runs its unit tests, and drives TextEdit there: `windows`, `apps`, `screens`, `see`, typing with `do`, `get` and the clipboard all work. Pictures (`shot`) need Screen Recording, which the runners do not give, and no one has tried it on their own Mac yet.(please share ur feedback on a mac:D)
+**The macOS version is early.** It was written on a Windows PC and has only run on GitHub's Mac runners so far. On every push, CI builds it for Apple Silicon and Intel, runs its unit tests, and drives TextEdit there: `windows`, `apps`, `screens`, `see`, typing with `do`, `get` and the clipboard all work. Pictures (`shot`) need Screen Recording, which the runners do not give, and no one has tried it on their own Mac yet. If you try it on a Mac, please [open an issue](https://github.com/acus9345/deskcrew/issues/new/choose) with how it went.
 
 It has the same commands and replies, built on Mac parts:
 
@@ -168,8 +168,8 @@ For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 chara
 
 | | agent-desktop | deskcrew |
 | --- | --- | --- |
-| Platforms | macOS, Windows, Linux | Windows; macOS written but not yet run |
-| Used from | command line, or a library called in process | command line and an agent skill |
+| Platforms | macOS, Windows, Linux | Windows; macOS and Linux (X11) newer, tested in CI |
+| Used from | command line, or a library called in process | command line, an agent skill, or an MCP server |
 | Reading a window | 3,603 to 39,595 characters in the tests above | 260 to 3,375 characters, about 10 times less |
 | Drawn cursors | `cursor-overlay`, with `--multi-agent` for one per agent; always on top of other windows | always on, one per agent with no setup, and covered by whatever covers their window |
 | Clicks, typing, toggles, menus, scrolling, drag | yes | yes |
@@ -180,7 +180,7 @@ For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 chara
 | Notifications | yes | `notifications`, which opens the panel and takes focus until `notifications close` |
 | System surfaces | `open-system-surface` | `launch` with a Windows link such as `ms-settings:` |
 
-Pick agent-desktop if you need macOS or Linux, or want it as a library. Pick deskcrew on Windows if you want several agents on screen for fewer tokens.
+Pick agent-desktop if you want it as a library, or need macOS or Linux support that has been used more widely. Pick deskcrew if you want several agents on screen for fewer tokens, especially on Windows.
 
 ## Compared with other Windows tools
 

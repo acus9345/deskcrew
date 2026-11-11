@@ -1,0 +1,53 @@
+name: Bug report
+description: Something deskcrew did wrong, or did not do.
+labels: [bug]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you or your agent asked for, what happened, and what you expected instead.
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: deskcrew version
+      description: The output of `deskcrew --version`.
+      placeholder: deskcrew 0.1.13
+    validations:
+      required: true
+  - type: input
+    id: os
+    attributes:
+      label: Operating system and version
+      description: For example Windows 11 24H2, macOS 15.5, or Ubuntu 24.04 on X11 / Xvfb.
+    validations:
+      required: true
+  - type: input
+    id: agent
+    attributes:
+      label: Agent or client
+      description: For example Claude Code, Codex, Cursor, Claude Desktop through `deskcrew mcp`, or your own script.
+    validations:
+      required: true
+  - type: input
+    id: app
+    attributes:
+      label: The app being driven
+      description: Its name and version, for example Notepad, Chrome 140, or a GTK app.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: The deskcrew command and its full output
+      description: The exact command (or MCP tool call) and everything it printed. Remove anything private first.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: more
+    attributes:
+      label: Anything else
+      description: A screenshot from `deskcrew shot`, steps to reproduce, or whether it happens every time.
