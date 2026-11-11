@@ -294,7 +294,7 @@ pub fn capture(rect: Bounds) -> Result<Frame, String> {
     // 24 and 32 bit visuals keep pixels as blue, green, red, padding: the order Frame uses.
     let mut pixels = image.data;
     pixels.truncate((w * h * 4) as usize);
-    for pixel in pixels.chunks_exact_mut(4) {
+    for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
     Ok(Frame { w: w as u32, h: h as u32, pixels })

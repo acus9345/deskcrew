@@ -416,8 +416,7 @@ mod form {
         shared.draw();
         println!("ready");
 
-        loop {
-            let Ok(event) = shared.conn.wait_for_event() else { break };
+        while let Ok(event) = shared.conn.wait_for_event() {
             match event {
                 Event::Expose(_) => shared.draw(),
                 Event::ButtonPress(press) => {
