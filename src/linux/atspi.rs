@@ -239,9 +239,8 @@ impl Walk<'_> {
             Some("edit") if has_iface("org.a11y.atspi.Text") => text_of(obj).map(|t| t.replace('\n', " ")),
             Some("slider" | "progress") if has_iface("org.a11y.atspi.Value") => property::<f64>(obj, "org.a11y.atspi.Value", "CurrentValue").ok().map(|v| format!("{v}")),
             Some("combobox") => {
-                let shown = if name.is_empty() { None } else { Some(name.clone()) };
-                // A GTK combo box names the entry it shows; its own name is often empty.
-                shown.or_else(|| children(obj).iter().map(name_of).find(|n| !n.is_empty()))
+                // The chosen entry, then whatever the box shows; a GTK box often names itself by it.
+                selected_name(obj).or_else(|| text_of(obj).filter(|t| !t.is_empty())).or_else(|| (!name.is_empty()).then(|| name.clone()))
             }
             _ => None,
         };
@@ -327,10 +326,6 @@ impl Walk<'_> {
             self.walk(&child, shown, own, depth + 1);
         }
     }
-}
-
-fn name_of(obj: &Obj) -> String {
-    name(obj)
 }
 
 fn hash_of(bus: &str, path: &str) -> usize {
@@ -443,6 +438,30 @@ pub fn find_named(obj: &Obj, wanted: &str, depth: usize) -> Option<Obj> {
         level = next;
     }
     None
+}
+
+/// The name of the entry a combo box or list has chosen.
+pub fn selected_name(obj: &Obj) -> Option<String> {
+    let (bus, path) = call::<_, (String, OwnedObjectPath)>(obj, "org.a11y.atspi.Selection", "GetSelectedChild", &(0i32,)).ok()?;
+    let chosen = Obj { bus, path: path.as_str().to_string() };
+    (chosen.path != "/org/a11y/atspi/null").then(|| name(&chosen)).filter(|n| !n.is_empty())
+}
+
+/// Choose a combo box's entry by name: GTK's box selects by the entry's place in its list.
+pub fn choose(combo: &Obj, wanted: &str) -> Result<(), String> {
+    let lower = wanted.to_lowercase();
+    let mut lists = vec![combo.clone()];
+    lists.extend(children(combo));
+    for list in &lists {
+        let entries = children(list);
+        if let Some(at) = entries.iter().position(|e| name(e).to_lowercase() == lower) {
+            let done: bool = call(combo, "org.a11y.atspi.Selection", "SelectChild", &(at as i32))?;
+            if done && selected_name(combo).is_some_and(|n| n.to_lowercase() == lower) {
+                return Ok(());
+            }
+        }
+    }
+    Err(format!("no entry named '{wanted}'"))
 }
 
 /// Select a child of a list or combo box through the Selection interface.

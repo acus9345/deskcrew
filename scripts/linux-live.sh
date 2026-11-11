@@ -20,7 +20,11 @@ refuse() { # refuse "text" command...: it must fail and say this
     fi
 }
 
-refuse "Wayland" env -u DISPLAY WAYLAND_DISPLAY=wayland-0 "$exe" windows
+# A Wayland session with no X display gets a plain refusal.
+echo "\$ WAYLAND_DISPLAY=wayland-0 deskcrew windows (no DISPLAY)"
+out=$(env -u DISPLAY WAYLAND_DISPLAY=wayland-0 "$exe" windows 2>&1); code=$?
+echo "$out"; echo "(exit $code)"
+if [ $code -eq 0 ] || ! grep -qF "Wayland" <<<"$out"; then echo "FAILED: expected a Wayland refusal"; failed=1; fi
 Xvfb :99 -screen 0 1280x800x24 >/dev/null 2>&1 &
 export DISPLAY=:99
 sleep 2
@@ -33,12 +37,13 @@ expect "Deskcrew Form" windows
 expect "1280x800 primary" screens
 expect 'edit "Name"' see "Deskcrew Form"
 expect 'checkbox "Gift wrap" [off]' see "Deskcrew Form" -f
+# Keys go through XTest into the focused window: select all in Name and type over it.
+expect "Grace" do "click Name; key ctrl+a; type Grace" -w "Deskcrew Form"
 expect "Ordered for Ada to Japan, gift wrap yes" do "set Name Ada; select Country Japan; check 'Gift wrap'; click Submit" -w "Deskcrew Form"
+expect "=Japan" see "Deskcrew Form" -f
 expect "Ada Lovelace" do "type Name ' Lovelace'" -w "Deskcrew Form"
 expect "Ada Lovelace" get Name -w "Deskcrew Form"
 expect ".png" shot "Deskcrew Form"
-# Keys go through XTest into the focused window: select all in Name and type over it.
-expect "Grace" do "click Name; key ctrl+a; type Grace" -w "Deskcrew Form"
 expect "ok" clip set "deskcrew clip"
 expect "deskcrew clip" clip
 expect "bye" quit

@@ -595,21 +595,27 @@ impl Service {
             atspi::set_text(&element, item)?;
             return Ok("text".into());
         }
-        if let Some(entry) = atspi::find_named(&element, item, MENU_DEPTH) {
-            if atspi::select_child(&element, &entry).is_ok() {
-                return Ok("select".into());
-            }
-            if atspi::press(&entry).is_ok() {
-                return Ok("select".into());
-            }
+        let combo = view.nodes[&id].parts.role == "combobox";
+        if combo && atspi::choose(&element, item).is_ok() {
+            return Ok("select".into());
+        }
+        if !combo
+            && let Some(entry) = atspi::find_named(&element, item, MENU_DEPTH)
+            && (atspi::select_child(&element, &entry).is_ok() || atspi::press(&entry).is_ok())
+        {
+            return Ok("select".into());
         }
         // A combo box may build its list only once it opens.
-        if view.nodes[&id].parts.role == "combobox" {
+        if combo {
             atspi::press(&element).map_err(|_| "that dropdown did not answer".to_string())?;
             thread::sleep(MENU_OPEN);
-            if let Some(entry) = atspi::find_named(&element, item, MENU_DEPTH) {
-                atspi::press(&entry).or_else(|_| atspi::select_child(&element, &entry).map(|_| String::new()))?;
-                return Ok("select".into());
+            if let Some(entry) = atspi::find_named(&element, item, MENU_DEPTH)
+                && atspi::press(&entry).is_ok()
+            {
+                thread::sleep(MENU_OPEN);
+                if atspi::selected_name(&element).is_some_and(|n| n.eq_ignore_ascii_case(item)) {
+                    return Ok("select".into());
+                }
             }
             let _ = self.front(tracked, || x::press(&x::chord("esc")?, Duration::ZERO));
         }

@@ -254,7 +254,12 @@ pub fn screens() -> Vec<(Bounds, bool)> {
     if let Some(monitors) = x.conn.randr_get_monitors(x.root, true).ok().and_then(|c| c.reply().ok())
         && !monitors.monitors.is_empty()
     {
-        return monitors.monitors.iter().map(|m| ((m.x as i32, m.y as i32, m.width as i32, m.height as i32), m.primary)).collect();
+        let mut out: Vec<(Bounds, bool)> = monitors.monitors.iter().map(|m| ((m.x as i32, m.y as i32, m.width as i32, m.height as i32), m.primary)).collect();
+        // Xvfb and some setups name no primary monitor: the first one is it then.
+        if !out.iter().any(|m| m.1) {
+            out[0].1 = true;
+        }
+        return out;
     }
     let screen = &x.conn.setup().roots[0];
     vec![((0, 0, screen.width_in_pixels as i32, screen.height_in_pixels as i32), true)]
@@ -662,7 +667,15 @@ pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
         if let Some(mut input) = child.stdin.take() {
             input.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
         }
-        // xclip stays behind to own the selection; xsel does too. Neither needs waiting for.
+        // The program leaves a copy of itself behind to own the clipboard: wait until it does,
+        // so the next read sees the new text.
+        let started = Instant::now();
+        while started.elapsed() < Duration::from_secs(1) {
+            if child.try_wait().ok().flatten().is_some() && clipboard().ok().flatten().unwrap_or_default() == text {
+                return Ok(());
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
         thread::spawn(move || child.wait());
         return Ok(());
     }
