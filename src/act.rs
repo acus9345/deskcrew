@@ -199,13 +199,30 @@ pub fn post_paste(hwnd: Hwnd) -> Result<String, String> {
     Ok("paste message".into())
 }
 
-pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32) -> Result<String, String> {
+/// Wheel notches: positive is up, or right for a sideways wheel.
+pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32, sideways: bool) -> Result<String, String> {
+    const WM_MOUSEHWHEEL: u32 = 0x020E;
     let (hwnd, _, _) = win::child_at(root, x, y);
     if win::draws_itself(hwnd) || win::draws_itself(root) {
         return Err(NEEDS_REAL.into());
     }
     let wheel = ((notches * WHEEL_DELTA) as u32 & 0xFFFF) << 16;
-    post(hwnd, WM_MOUSEWHEEL, wheel as usize, win::lparam(x, y))?;
+    post(hwnd, if sideways { WM_MOUSEHWHEEL } else { WM_MOUSEWHEEL }, wheel as usize, win::lparam(x, y))?;
+    Ok("message".into())
+}
+
+/// A long press: the button stays down for `hold` before it lets go.
+pub fn post_long_press(root: Hwnd, x: i32, y: i32, right: bool, hold: std::time::Duration) -> Result<String, String> {
+    let (hwnd, cx, cy) = win::child_at(root, x, y);
+    if win::draws_itself(hwnd) || win::draws_itself(root) {
+        return Err(NEEDS_REAL.into());
+    }
+    let at = win::lparam(cx, cy);
+    let (down, up, held) = if right { (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON) } else { (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON) };
+    post(hwnd, WM_MOUSEMOVE, 0, at)?;
+    post(hwnd, down, held, at)?;
+    std::thread::sleep(hold);
+    post(hwnd, up, 0, at)?;
     Ok("message".into())
 }
 

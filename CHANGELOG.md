@@ -7,6 +7,7 @@ and this project uses [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 - Add `deskcrew mcp`, an MCP server over stdio with `see`, `do`, `shot` and a `deskcrew` tool for every other command, for Claude Desktop, Codex, Cursor and other apps that call tools instead of running a shell. A shot comes back as the picture itself.
+- `scroll left|right` scrolls sideways, and `click --hold ms` is a long press, by window message like any other click. These were the last things desk-pilot did that deskcrew did not.
 - `bench/` can run deskcrew as an MCP server (`--tool deskcrew-mcp`).
 
 ## [0.1.12] - 2026-11-08

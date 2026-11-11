@@ -73,12 +73,12 @@ see [window] [-f] [-a] [--find word] [--from N]
 get e3                                a control's full text
 shot [window|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
                                       PNG path; "unchanged" if it matches the last one
-click e3 [e4 ...] | "Name" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift]
+click e3 [e4 ...] | "Name" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift] [--hold ms]
 hover e3 | x,y     check e3     uncheck e3     toggle e3     expand e3     collapse e3     clear e3
 is e3 on|off|open|closed|selected|enabled|disabled
 down shift --real | down left x,y --mouse     up (lets go; 30 s limit)
 set e3 "value"     type [e3] "text" [--paste]     key enter [--hold ms --real]     select e3 "Item"
-scroll [e3] up|down [n]     show e3     wait "text" [--gone] [--ms N]
+scroll [e3] up|down|left|right [n]     show e3     wait "text" [--gone] [--ms N]
 table e5 [--from N]                   a table or grid, as many rows as fit     pick-file "path"   fill an Open or Save dialog
 drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
 do "set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Yes" [--dry] [--risk low|medium|high]
@@ -724,6 +724,14 @@ impl Service {
                 (Some(node), act::centre(rect))
             }
         };
+        if let Some(ms) = flags.hold {
+            if flags.mouse || extra || flags.double || flags.with.is_some() {
+                return Err("--hold is a long press of the left or right button: leave out the other click flags".into());
+            }
+            let hold = Duration::from_millis(ms.min(HOLD_MOST_MS));
+            let press = || act::post_long_press(tracked.hwnd, x, y, flags.right, hold);
+            return if flags.real { self.with_front(tracked, view, &[(x, y)], press)? } else { press() };
+        }
         if flags.mouse {
             let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
             let held = flags.with.as_deref().map(real::chord).transpose()?;
@@ -1091,9 +1099,10 @@ impl Service {
     }
 
     fn scroll(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        let direction = |word: &String| word == "up" || word == "down";
-        let at = words.iter().position(direction).ok_or("scroll [control] up|down [n]")?;
-        let down = words[at] == "down";
+        let direction = |word: &String| matches!(word.as_str(), "up" | "down" | "left" | "right");
+        let at = words.iter().position(direction).ok_or("scroll [control] up|down|left|right [n]")?;
+        let sideways = words[at] == "left" || words[at] == "right";
+        let down = words[at] == "down" || words[at] == "right";
         let times: i32 = words.get(at + 1).and_then(|n| n.parse().ok()).unwrap_or(1);
         let id = match words[..at].first() {
             Some(word) => match self.resolve(word, who, tracked, view)? {
@@ -1106,13 +1115,19 @@ impl Service {
         let (node, rect) = self.locate(id, tracked, view)?;
         self.cursor_on(who, flags, rect);
         let (x, y) = act::centre(rect);
-        let notches = if down { -times } else { times };
+        // A wheel turned down scrolls down, but a sideways one turned positive scrolls right.
+        let notches = if down != sideways { -times } else { times };
         if flags.mouse {
-            self.front(tracked, view, &[(x, y)], true, || real::wheel(x, y, notches))?;
+            self.front(tracked, view, &[(x, y)], true, || real::wheel(x, y, notches, sideways))?;
             return Ok("mouse".into());
         }
         if flags.real {
-            let page = real::chord(if down { "pagedown" } else { "pageup" })?;
+            let page = real::chord(match (sideways, down) {
+                (false, true) => "pagedown",
+                (false, false) => "pageup",
+                (true, true) => "right",
+                (true, false) => "left",
+            })?;
             self.with_front(tracked, view, &[(x, y)], || {
                 for _ in 0..times.max(1) {
                     real::press_chord(&page);
@@ -1122,11 +1137,11 @@ impl Service {
         }
         if node.can.scroll {
             for _ in 0..times.max(1) {
-                node.element.scroll(down, true)?;
+                node.element.scroll(down, true, sideways)?;
             }
             return Ok("scroll".into());
         }
-        act::post_wheel(tracked.hwnd, x, y, notches)
+        act::post_wheel(tracked.hwnd, x, y, notches, sideways)
     }
 
     fn point_of(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<(i32, i32), String> {

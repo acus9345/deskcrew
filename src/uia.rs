@@ -567,14 +567,15 @@ impl Element {
         unsafe { self.0.GetCurrentPatternAs::<IUIAutomationRangeValuePattern>(UIA_RangeValuePatternId).and_then(|p| p.SetValue(value)).map_err(say) }
     }
 
-    pub fn scroll(&self, down: bool, large: bool) -> Result<(), String> {
+    /// `down` is right for a sideways scroll.
+    pub fn scroll(&self, down: bool, large: bool, sideways: bool) -> Result<(), String> {
         let amount = match (down, large) {
             (true, true) => ScrollAmount_LargeIncrement,
             (true, false) => ScrollAmount_SmallIncrement,
             (false, true) => ScrollAmount_LargeDecrement,
             (false, false) => ScrollAmount_SmallDecrement,
         };
-        unsafe { self.0.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId).and_then(|p| p.Scroll(ScrollAmount_NoAmount, amount)).map_err(say) }
+        unsafe { self.0.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId).and_then(|p| if sideways { p.Scroll(amount, ScrollAmount_NoAmount) } else { p.Scroll(ScrollAmount_NoAmount, amount) }).map_err(say) }
     }
 
     pub fn bring_into_view(&self) -> Result<(), String> {

@@ -187,10 +187,11 @@ pub fn release_all() -> usize {
     held.len()
 }
 
-pub fn wheel(x: i32, y: i32, notches: i32) {
+pub fn wheel(x: i32, y: i32, notches: i32, sideways: bool) {
+    const MOUSEEVENTF_HWHEEL: windows_sys::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS = 0x1000;
     move_to(x, y);
     thread::sleep(ARRIVE);
-    send(&[mouse(MOUSEEVENTF_WHEEL, 0, 0, (notches * 120) as u32)]);
+    send(&[mouse(if sideways { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL }, 0, 0, (notches * 120) as u32)]);
 }
 
 /// Press, follow the path, and always let go.

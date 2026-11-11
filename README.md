@@ -298,6 +298,22 @@ The second one drives throwaway windows it opens itself, including the real keyb
 
 [`bench/`](bench/README.md) gives a coding agent the same desktop task with each tool and measures the time, model calls, tokens and cost, and whether the result was right.
 
+## Coming from desk-pilot
+
+[desk-pilot](https://github.com/acus9345/desk-pilot) is the earlier tool by the same author, which drove the real mouse and keyboard. Everything it did is in deskcrew, which works in the background instead. With `deskcrew mcp` its three tools map like this:
+
+| desk-pilot | deskcrew |
+| --- | --- |
+| `screen_view` (screen, window or region, rulers) | `shot` tool, or `shot --screen`, `shot --region x,y,w,h`, `--rulers`; `--changed` for only what changed |
+| `desktop_control` `controls` | `see` |
+| `desktop_control` click kinds, modifiers, long press | `click` with `--right`, `--double`, `--triple`, `--middle`, `--back`, `--forward`, `--with ctrl+shift`, `--hold ms` |
+| `move`, `drag`, `draw`, `down`/`up`, `scroll` | `hover`, `drag`, `draw`, `down`/`up`, `scroll up|down|left|right` |
+| `type`, `key`, `focus`, `waitFor`, `launch`, `clipboard` | `type`, `key`, `focus`, `wait`, `launch`, `clip` |
+| `window` (move, resize, minimize, maximize, restore), `windows`, `screens` | `place`, `windows`, `screens` |
+| `desktop_sequence` with `risk` and `dryRun` | `do` with `--risk` and `--dry` |
+
+desk-pilot always moved your real pointer; deskcrew only does with `--real` or `--mouse`, as a last resort.
+
 ## Limits
 
 - The Windows version is the tested one. The macOS version has never been run (see [macOS](#macos)), and Linux is not written.
