@@ -17,8 +17,11 @@ const MAX_FIND_DEPTH: usize = 12;
 const RUN_DEFAULT_MS: u64 = 60_000;
 const RUN_MOST_MS: u64 = 600_000;
 const FETCH_SECONDS: u64 = 30;
-// Processes an agent must never end: Windows itself, the person's desktop, and session login.
+// Processes an agent must never end: the system itself, the person's desktop, and session login.
+#[cfg(windows)]
 const VITAL: [&str; 12] = ["system", "smss", "csrss", "wininit", "winlogon", "lsass", "services", "svchost", "dwm", "fontdrvhost", "registry", "memory compression"];
+#[cfg(not(windows))]
+const VITAL: [&str; 12] = ["launchd", "kernel_task", "windowserver", "loginwindow", "systemuiserver", "coreservicesd", "securityd", "opendirectoryd", "configd", "logd", "notifyd", "distnoted"];
 
 pub const COMMANDS: [&str; 8] = ["processes", "kill", "run", "fetch", "file", "reg", "notify", "settings"];
 
@@ -528,7 +531,8 @@ mod tests {
     #[test]
     fn vital_and_own_processes_are_refused() {
         assert!(kill(&std::process::id().to_string(), true).unwrap_err().contains("running this agent"));
-        assert!(kill("csrss", true).unwrap_err().contains("operating system"));
+        let vital = if cfg!(windows) { "csrss" } else { "launchd" };
+        assert!(kill(vital, true).unwrap_err().contains("operating system"));
     }
 
     #[test]
