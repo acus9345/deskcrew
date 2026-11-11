@@ -6,6 +6,11 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.14] - 2026-11-11
+
+- Write the README in plain sentences, and bring its comparison with agent-desktop up to date now that deskcrew runs on macOS and Linux and as an MCP server. The crates.io page shows the new README.
+- Add GitHub issue forms for bug reports and for apps deskcrew can't read, and open Discussions for questions.
+
 ## [0.1.13] - 2026-11-11
 
 - Add a Linux version for X11, including headless Xvfb: controls through AT-SPI in the background, points and keys through XTest, one service per X display. It also works without at-spi2-core, on a bus named by `AT_SPI_BUS_ADDRESS`. On Wayland it explains that Wayland is not supported. Tested in CI on Ubuntu with a GTK window and a toolkit-free one, and on a Debian 13 machine.
