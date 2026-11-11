@@ -85,7 +85,7 @@ do "set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Y
                                       many steps, one reply; names work as refs, and it goes on into dialogs it opens
 Any action: --expect "text" fails unless the text shows afterwards.
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
-apps     screens     notifications [close]     clip     clip set "text"     clip clear     status     resume     quit     setup (installs for your coding agents)
+apps     screens     notifications [close]     clip     clip set "text"     clip clear     status     resume     quit     setup (installs for your coding agents)     mcp (the same as MCP tools, over stdio)
 Every action replies with what changed, new dialogs and their text too: no need to see again or sleep. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen: a last resort),

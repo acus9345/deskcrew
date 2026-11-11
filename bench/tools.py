@@ -60,6 +60,13 @@ def prepare(tool, work, deskcrew_exe):
         add_skill(work, 'deskcrew', os.path.join(REPO, 'skills', 'deskcrew', 'SKILL.md'))
         open(os.path.join(work, 'CLAUDE.md'), 'w', encoding='utf-8').write(deskcrew_rule() + '\n')
         return {'flags': flags, 'path': bin_dir, 'cleanup': [os.path.join(bin_dir, 'deskcrew.exe') + ' quit']}
+    if tool == 'deskcrew-mcp':
+        # The MCP server alone: no skill, no standing rule, no deskcrew on PATH.
+        exe = os.path.join(work, 'mcp', 'deskcrew.exe'); os.makedirs(os.path.dirname(exe))
+        shutil.copy(deskcrew_exe, exe)
+        config = os.path.join(work, 'mcp.json')
+        json.dump({'mcpServers': {'deskcrew': {'command': exe, 'args': ['mcp']}}}, open(config, 'w', encoding='utf-8'))
+        return {'flags': flags + ['--mcp-config', config], 'path': bin_dir, 'cleanup': [exe + ' quit']}
     p = paths()
     if tool == 'agent-desktop':
         shutil.copy(p['agent-desktop'], os.path.join(bin_dir, 'agent-desktop.exe'))

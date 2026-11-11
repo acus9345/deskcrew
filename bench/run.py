@@ -80,6 +80,17 @@ def deskcrew_actions(command):
     return count
 
 
+def mcp_actions(name, given):
+    """The same count for a call to deskcrew's MCP tools."""
+    given = given if isinstance(given, dict) else {}
+    if name == 'mcp__deskcrew__do':
+        return sum(1 for s in str(given.get('steps', '')).split(';') if s.strip().split(' ')[0] in ACTIONS)
+    if name == 'mcp__deskcrew__deskcrew':
+        words = given.get('args') or ['']
+        return int(str(words[0]) in ACTIONS)
+    return 0
+
+
 def analyse(lines, wall):
     calls, tools_used, cur, last_mark = [], [], None, None
     result, init = {}, {}
@@ -113,7 +124,8 @@ def analyse(lines, wall):
             for b in m['message'].get('content', []):
                 if b.get('type') == 'tool_use':
                     cmd = b['input'].get('command') if isinstance(b.get('input'), dict) else None
-                    pending[b['id']] = {'name': b['name'], 'command': cmd or json.dumps(b.get('input'))[:400], 'start': t}
+                    pending[b['id']] = {'name': b['name'], 'command': cmd or json.dumps(b.get('input'))[:400], 'start': t,
+                                        'mcp_actions': mcp_actions(b['name'], b.get('input'))}
         elif kind == 'user':
             content = m.get('message', {}).get('content', [])
             for b in content if isinstance(content, list) else []:
@@ -137,7 +149,7 @@ def analyse(lines, wall):
         to_act.append((acts[0] if acts else c['end']) - c['sent'])
     model_s = sum(c['end'] - c['sent'] for c in calls)
     tool_s = sum(u['end'] - u['start'] for u in tools_used)
-    actions = sum(deskcrew_actions(u['command']) for u in tools_used if u['name'] == 'Bash')
+    actions = sum(deskcrew_actions(u['command']) if u['name'] == 'Bash' else u.get('mcp_actions', 0) for u in tools_used)
     return {
         'wall_s': round(wall, 1), 'model_s': round(model_s, 1), 'tool_s': round(tool_s, 1),
         'think_s': round(think, 1), 'to_act_s': round(sum(to_act), 1),

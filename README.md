@@ -8,7 +8,7 @@ Agents act through Windows accessibility, window messages and a synthetic pen, s
 
 **[Watch the 11-second demo](demo/deskcrew-demo.mp4):** three agents draw in Photon Studio, use Calculator and type a note at the same time. Calculator's title and mode label were overlaid in English in the video.
 
-It is a single command, so any agent that can run a shell command on this computer can use it: Claude Code, Cursor, Codex, Gemini CLI, Copilot, Windsurf, OpenCode, Aider and the rest. There is no MCP server and no tool schema loaded into every conversation.
+It is a single command, so any agent that can run a shell command on this computer can use it: Claude Code, Cursor, Codex, Gemini CLI, Copilot, Windsurf, OpenCode, Aider and the rest. Apps that call tools instead of a shell, such as Claude Desktop, can use it as an [MCP server](#as-an-mcp-server).
 
 ## Try it
 
@@ -45,6 +45,29 @@ That puts `deskcrew` on PATH and sets up every agent app and CLI it finds, so th
 | Grok, and agents sharing `~/.agents` | skill |
 
 The rule sits between `<!-- deskcrew: start -->` and `<!-- deskcrew: end -->` lines. For any other agent, add the rule setup prints to its own rules. Agents running in the cloud, or in a sandbox without access to your desktop, cannot reach it.
+
+### As an MCP server
+
+`deskcrew mcp` serves the same commands as four MCP tools over stdio: `see`, `do`, `shot` (which sends the picture itself) and `deskcrew` for any other command. Use it for apps that cannot run a shell command, or if you prefer tools to a rule. Each client below needs `deskcrew` on PATH; `setup` puts it there.
+
+| Client | How to add it |
+| --- | --- |
+| Claude Code | `claude mcp add deskcrew -- deskcrew mcp` |
+| Codex | `codex mcp add deskcrew -- deskcrew mcp` |
+| Claude Desktop | in `claude_desktop_config.json` (Settings > Developer > Edit Config): `"mcpServers": { "deskcrew": { "command": "deskcrew", "args": ["mcp"] } }` |
+| Cursor | the same `mcpServers` entry in `~/.cursor/mcp.json` |
+| Gemini CLI | the same `mcpServers` entry in `~/.gemini/settings.json` |
+| VS Code (Copilot) | in `.vscode/mcp.json` or your user `mcp.json`: `"servers": { "deskcrew": { "type": "stdio", "command": "deskcrew", "args": ["mcp"] } }` |
+
+Codex's own config takes it as:
+
+```toml
+[mcp_servers.deskcrew]
+command = "deskcrew"
+args = ["mcp"]
+```
+
+Each client shows up as its own cursor, named from what the client calls itself (Claude, Codex, Cursor...). Set `DESKCREW_AGENT` in the server's environment to choose the name.
 
 ## macOS
 

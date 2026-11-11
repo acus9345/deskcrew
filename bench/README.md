@@ -15,7 +15,7 @@ python bench/report.py --by tool --labels mine
 
 - `--task order` fills an order form, confirms a dialog and reports the order number.
 - `--task stock` finds the item with the lowest stock in an 80-row grid, enters it and reports the check.
-- `--tool` is `deskcrew`, `agent-desktop`, `agent-cu`, `mcp-windows` or `windows-mcp`. Each gets its own
+- `--tool` is `deskcrew`, `deskcrew-mcp` (deskcrew as an MCP server, with no skill or rule), `agent-desktop`, `agent-cu`, `mcp-windows` or `windows-mcp`. Each gets its own
   skill or the instructions its README gives, and the same built-in tools (Bash and Skill). Paths to
   the other tools go in `bench/tools.json`: `{"agent-desktop": "...exe", "agent-cu": "...exe", "mcp-windows": "...exe"}`.
 - The agent is Claude Code (`claude -p`) with a config folder holding only a copy of your sign-in,

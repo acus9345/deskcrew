@@ -43,7 +43,7 @@ drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth]
 do \"click e1; set e2 hi; key enter\" [--dry] [--risk low|medium|high]   many steps, one reply
 Any action: --expect \"text\" fails unless the text shows afterwards.
 launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
-apps     screens     clip     clip set \"text\"     clip clear     status     resume     quit     setup (installs for your coding agents)
+apps     screens     clip     clip set \"text\"     clip clear     status     resume     quit     setup (installs for your coding agents)     mcp (the same as MCP tools, over stdio)
 Every action replies with what changed, in the picture too. x,y are points in the last shot, or text see read. Ctrl+Option+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the app forward for a moment and uses the system keyboard: a last resort).

@@ -13,6 +13,7 @@ mod client;
 mod demo;
 mod lines;
 mod look;
+mod mcp;
 #[cfg(target_os = "macos")]
 mod mac;
 mod motion;
@@ -46,6 +47,7 @@ fn main() {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
     match args.first().map(String::as_str) {
         Some("service") => service::run(),
+        Some("mcp") => mcp::serve(),
         Some("setup") => std::process::exit(setup::run()),
         #[cfg(windows)]
         Some("demo") => {

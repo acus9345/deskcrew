@@ -6,6 +6,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Add `deskcrew mcp`, an MCP server over stdio with `see`, `do`, `shot` and a `deskcrew` tool for every other command, for Claude Desktop, Codex, Cursor and other apps that call tools instead of running a shell. A shot comes back as the picture itself.
+- `bench/` can run deskcrew as an MCP server (`--tool deskcrew-mcp`).
+
 ## [0.1.12] - 2026-11-08
 
 - Let agents finish a task in fewer, faster calls. On the bench's order form a Claude Code agent went from 29 s and 6 model calls to 17 s and 5, and on an 80-row grid from 19 s and 7 calls to 14 s and 4, reading up to 47% fewer tokens, with every result still right.
