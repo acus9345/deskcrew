@@ -391,13 +391,16 @@ pub fn set_text(obj: &Obj, text: &str) -> Result<(), String> {
     if done { Ok(()) } else { Err("the app refused the text".into()) }
 }
 
-/// Insert text where the caret is in a focused field, or at the end of any other.
+/// Add text to the end of a field, as typing into it does on Windows and macOS, and leave the
+/// caret after it.
 pub fn insert_text(obj: &Obj, text: &str) -> Result<(), String> {
-    let caret: i32 = property(obj, "org.a11y.atspi.Text", "CaretOffset").unwrap_or(-1);
     let end: i32 = property(obj, "org.a11y.atspi.Text", "CharacterCount").unwrap_or(0);
-    let at = if caret >= 0 && has(states(obj), FOCUSED) { caret } else { end };
-    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(at, text, text.chars().count() as i32))?;
-    if done { Ok(()) } else { Err("the app refused the text".into()) }
+    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(end, text, text.chars().count() as i32))?;
+    if !done {
+        return Err("the app refused the text".into());
+    }
+    let _ = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetCaretOffset", &(end + text.chars().count() as i32,));
+    Ok(())
 }
 
 pub fn set_value(obj: &Obj, value: f64) -> Result<(), String> {
