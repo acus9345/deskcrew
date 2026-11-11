@@ -307,7 +307,7 @@ The second one drives throwaway windows it opens itself, including the real keyb
 | `screen_view` (screen, window or region, rulers) | `shot` tool, or `shot --screen`, `shot --region x,y,w,h`, `--rulers`; `--changed` for only what changed |
 | `desktop_control` `controls` | `see` |
 | `desktop_control` click kinds, modifiers, long press | `click` with `--right`, `--double`, `--triple`, `--middle`, `--back`, `--forward`, `--with ctrl+shift`, `--hold ms` |
-| `move`, `drag`, `draw`, `down`/`up`, `scroll` | `hover`, `drag`, `draw`, `down`/`up`, `scroll up|down|left|right` |
+| `move`, `drag`, `draw`, `down`/`up`, `scroll` | `hover`, `drag`, `draw`, `down`/`up`, `scroll` (up, down, left or right) |
 | `type`, `key`, `focus`, `waitFor`, `launch`, `clipboard` | `type`, `key`, `focus`, `wait`, `launch`, `clip` |
 | `window` (move, resize, minimize, maximize, restore), `windows`, `screens` | `place`, `windows`, `screens` |
 | `desktop_sequence` with `risk` and `dryRun` | `do` with `--risk` and `--dry` |
