@@ -33,7 +33,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends xvfb at-spi2-core dbus-x11 python3-gi gir1.2-gtk-3.0 libatk-adaptor xclip
       - name: Build
-        run: cargo build --release --locked
+        run: cargo build --release --locked --bins --examples
       - name: Unit tests
         run: cargo test --release --locked
       - name: Smoke test
@@ -42,6 +42,8 @@ jobs:
           python3 scripts/mcp-smoke.py target/release/deskcrew
       - name: Live commands on a GTK window under Xvfb
         run: dbus-run-session -- bash scripts/linux-live.sh target/release/deskcrew
+      - name: Live commands on a toolkit-free window, without at-spi2-core
+        run: DESKCREW_FORM=target/release/examples/linux_form bash scripts/linux-live.sh target/release/deskcrew 98
       - uses: actions/upload-artifact@v4
         if: always()
         with:

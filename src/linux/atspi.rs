@@ -44,22 +44,30 @@ pub struct Node {
 
 static BUS: OnceLock<Result<Connection, String>> = OnceLock::new();
 
-/// The accessibility bus, found through the session bus. Apps started after this see that
-/// someone is listening, and turn their accessibility on.
+/// The accessibility bus: the one AT_SPI_BUS_ADDRESS or the X display names, or the one the
+/// session bus hands out. Apps started after this see that someone is listening, and turn their
+/// accessibility on.
 pub fn bus() -> Result<&'static Connection, String> {
     BUS.get_or_init(|| {
-        let session = Connection::session().map_err(|e| format!("no D-Bus session ({e}): start one with dbus-run-session, or run inside a desktop session"))?;
-        let address: String = session
-            .call_method(Some("org.a11y.Bus"), "/org/a11y/bus", Some("org.a11y.Bus"), "GetAddress", &())
-            .and_then(|m| m.body().deserialize())
-            .map_err(|e| format!("no accessibility bus ({e}): install at-spi2-core"))?;
-        let _ = session.call_method(
-            Some("org.a11y.Bus"),
-            "/org/a11y/bus",
-            Some("org.freedesktop.DBus.Properties"),
-            "Set",
-            &("org.a11y.Status", "IsEnabled", zbus::zvariant::Value::from(true)),
-        );
+        let named = std::env::var("AT_SPI_BUS_ADDRESS").ok().filter(|a| !a.is_empty()).or_else(super::x::accessibility_bus);
+        let address = match named {
+            Some(address) => address,
+            None => {
+                let session = Connection::session().map_err(|e| format!("no D-Bus session ({e}): start one with dbus-run-session, or run inside a desktop session"))?;
+                let address: String = session
+                    .call_method(Some("org.a11y.Bus"), "/org/a11y/bus", Some("org.a11y.Bus"), "GetAddress", &())
+                    .and_then(|m| m.body().deserialize())
+                    .map_err(|e| format!("no accessibility bus ({e}): install at-spi2-core, or set AT_SPI_BUS_ADDRESS"))?;
+                let _ = session.call_method(
+                    Some("org.a11y.Bus"),
+                    "/org/a11y/bus",
+                    Some("org.freedesktop.DBus.Properties"),
+                    "Set",
+                    &("org.a11y.Status", "IsEnabled", zbus::zvariant::Value::from(true)),
+                );
+                address
+            }
+        };
         zbus::blocking::connection::Builder::address(address.as_str())
             .and_then(|b| b.build())
             .map_err(|e| format!("could not join the accessibility bus: {e}"))
@@ -139,11 +147,33 @@ fn pid_of(bus_name: &str) -> Option<u32> {
         .ok()
 }
 
+/// Every app on the bus: the registry's list, or, with no registry running, each connection
+/// that answers at the usual root path.
+fn applications() -> Vec<Obj> {
+    let root = Obj { bus: ROOT_BUS.into(), path: ROOT_PATH.into() };
+    let listed = children(&root);
+    if !listed.is_empty() {
+        return listed;
+    }
+    let Ok(bus) = bus() else { return Vec::new() };
+    let mine = bus.unique_name().map(|n| n.to_string()).unwrap_or_default();
+    let names: Vec<String> = bus
+        .call_method(Some("org.freedesktop.DBus"), "/org/freedesktop/DBus", Some("org.freedesktop.DBus"), "ListNames", &())
+        .ok()
+        .and_then(|m| m.body().deserialize().ok())
+        .unwrap_or_default();
+    names
+        .into_iter()
+        .filter(|n| n.starts_with(':') && *n != mine)
+        .map(|bus| Obj { bus, path: ROOT_PATH.into() })
+        .filter(|app| role_name(app) == "application")
+        .collect()
+}
+
 /// The app's top-level windows on the accessibility bus, with the process each belongs to.
 pub fn frames() -> Vec<(Obj, u32)> {
-    let root = Obj { bus: ROOT_BUS.into(), path: ROOT_PATH.into() };
     let mut out = Vec::new();
-    for app in children(&root) {
+    for app in applications() {
         let Some(pid) = pid_of(&app.bus) else { continue };
         for frame in children(&app) {
             out.push((frame, pid));
