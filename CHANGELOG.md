@@ -8,6 +8,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 - Add `deskcrew mcp`, an MCP server over stdio with `see`, `do`, `shot` and a `deskcrew` tool for every other command, for Claude Desktop, Codex, Cursor and other apps that call tools instead of running a shell. A shot comes back as the picture itself.
 - `scroll left|right` scrolls sideways, and `click --hold ms` is a long press, by window message like any other click. These were the last things desk-pilot did that deskcrew did not.
+- When a name matches several windows, use the one the agent is already working in. On a Mac, also prefer an exact name and the only window with a title, so the untitled panels TextEdit opens while typing no longer make `-w TextEdit` ambiguous.
+- CI drives TextEdit on GitHub's Mac runners: the first time the Mac version has run.
 - On a Mac, `kill` refuses the system's own processes, such as WindowServer and loginwindow, as it already did for Windows'.
 - `bench/` can run deskcrew as an MCP server (`--tool deskcrew-mcp`).
 

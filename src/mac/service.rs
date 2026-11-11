@@ -323,7 +323,22 @@ impl Service {
         }
         let wanted = spec.to_lowercase();
         let listed = apps::list();
-        let matches: Vec<&Window> = listed.iter().filter(|w| w.title.to_lowercase().contains(&wanted) || w.app.to_lowercase().contains(&wanted)).collect();
+        let exact: Vec<&Window> = listed.iter().filter(|w| w.title.to_lowercase() == wanted || w.app.to_lowercase() == wanted).collect();
+        let mut matches: Vec<&Window> = if exact.is_empty() {
+            listed.iter().filter(|w| w.title.to_lowercase().contains(&wanted) || w.app.to_lowercase().contains(&wanted)).collect()
+        } else {
+            exact
+        };
+        if matches.len() > 1 {
+            // The window the agent is already working in, then the only one with a title: apps
+            // open untitled panels for autocomplete and the like, which share the app's name.
+            let current = self.agents.lock().unwrap().get(who).and_then(|a| a.current);
+            if let Some(mine) = matches.iter().find(|w| Some(w.id) == current) {
+                matches = vec![*mine];
+            } else if matches.iter().filter(|w| !w.title.is_empty()).count() == 1 {
+                matches.retain(|w| !w.title.is_empty());
+            }
+        }
         match matches.as_slice() {
             [] => Err(format!("no window matches '{spec}'")),
             [one] => {

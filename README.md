@@ -1,6 +1,6 @@
 # deskcrew
 
-**Windows, with an untested macOS version.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
+**Windows, with an early macOS version.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
 ![Three agents draw, use Calculator and type a note at the same time, each with its own cursor](https://raw.githubusercontent.com/acus9345/deskcrew/main/demo/deskcrew-demo.gif)
 
 Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.*even when ur doing something in fullscreen*the agents can still work and do things
@@ -92,7 +92,7 @@ Each client shows up as its own cursor, named from what the client calls itself 
 
 ## macOS
 
-**The macOS version has not been run on a real Mac yet.** It was written on a Windows PC. CI builds it for Apple Silicon and Intel on GitHub's Mac runners, runs its unit tests and checks the MCP server there, but those runners give it no Accessibility or Screen Recording permission, so its commands have not been tried on real windows. Treat it as a first draft until someone tries it on a Mac.(please share ur feedback on a mac:D)
+**The macOS version is early.** It was written on a Windows PC and has only run on GitHub's Mac runners so far. On every push, CI builds it for Apple Silicon and Intel, runs its unit tests, and drives TextEdit there: `windows`, `apps`, `screens`, `see`, typing with `do`, `get` and the clipboard all work. Pictures (`shot`) need Screen Recording, which the runners do not give, and no one has tried it on their own Mac yet.(please share ur feedback on a mac:D)
 
 It has the same commands and replies, built on Mac parts:
 

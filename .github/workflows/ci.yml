@@ -46,10 +46,8 @@ jobs:
           out/deskcrew --version
           out/deskcrew help | head -3
           python3 scripts/mcp-smoke.py out/deskcrew
-      # GitHub's Mac runners have no Accessibility or Screen Recording grant for this program,
-      # so this step shows how far the commands get there rather than failing the build.
-      - name: Live commands (informational)
-        continue-on-error: true
+      # GitHub's Mac runners allow Accessibility, so deskcrew can read and type into TextEdit there.
+      - name: Live commands on TextEdit
         run: bash scripts/mac-live.sh out/deskcrew
       - uses: actions/upload-artifact@v4
         with:

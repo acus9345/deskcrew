@@ -409,11 +409,18 @@ impl Service {
         let wanted = spec.to_lowercase();
         let all = win::list();
         let exact: Vec<_> = all.iter().filter(|w| w.title.to_lowercase() == wanted || w.app.to_lowercase() == wanted).collect();
-        let matches = if exact.is_empty() {
+        let mut matches: Vec<_> = if exact.is_empty() {
             all.iter().filter(|w| w.title.to_lowercase().contains(&wanted) || w.app.to_lowercase().contains(&wanted)).collect()
         } else {
             exact
         };
+        if matches.len() > 1 {
+            // Several match: the one the agent is already working in.
+            let current = self.agents.lock().unwrap().get(who).and_then(|a| a.current);
+            if let Some(mine) = matches.iter().find(|w| Some(w.hwnd) == current) {
+                matches = vec![*mine];
+            }
+        }
         match matches.as_slice() {
             [] => Err(format!("no window matches '{spec}'")),
             [only] => {
