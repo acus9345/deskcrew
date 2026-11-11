@@ -30,3 +30,15 @@ desktop you see: `--visible` runs there, and only while you are away from the co
 Results are appended to `bench/results.jsonl`, with each run's tool calls and replies.
 
 `awake.sh` ends the screensaver every two seconds during a `--visible` run, since real input cannot reach the desktop under it. It changes no settings.
+
+## The homepage comparison
+
+`compare.py` reruns it: the order form, deskcrew against the next-best tool (mcp-windows by default), three runs each, and prints the table with how many times faster, lighter and cheaper deskcrew was.
+
+```bash
+python bench/compare.py --visible
+```
+
+mcp-windows sends real input, so this runs on your own desktop: start it only when you will be away for about ten minutes. `--report <label>` prints the table for runs already made, and `--save` writes it to `published/`, with each run's commands but not the tools' replies, which can hold your own window titles.
+
+`published/clean-order.md` and `published/clean-stock.md` are the runs behind the README's tables, made on 2026-11-08.
