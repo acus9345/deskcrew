@@ -15,7 +15,12 @@ const CONNECT_WAIT: Duration = Duration::from_secs(120);
 
 fn path() -> PathBuf {
     let folder = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    folder.join(format!("deskcrew-{}.sock", env!("CARGO_PKG_VERSION")))
+    // On Linux each X display (a desktop, or an Xvfb) gets its own service.
+    #[cfg(target_os = "linux")]
+    let display: String = std::env::var("DISPLAY").unwrap_or_default().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    #[cfg(not(target_os = "linux"))]
+    let display = String::new();
+    folder.join(format!("deskcrew-{}{}{display}.sock", env!("CARGO_PKG_VERSION"), if display.is_empty() { "" } else { "-" }))
 }
 
 pub struct Pipe(UnixStream);

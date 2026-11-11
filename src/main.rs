@@ -1,6 +1,6 @@
 // deskcrew - every agent gets its own cursor on the desktop.
-#[cfg(not(any(windows, target_os = "macos")))]
-compile_error!("deskcrew runs on Windows and macOS only");
+#[cfg(not(any(windows, target_os = "macos", target_os = "linux")))]
+compile_error!("deskcrew runs on Windows, macOS and Linux (X11) only");
 
 #[cfg(windows)]
 mod act;
@@ -12,10 +12,14 @@ mod client;
 #[cfg(windows)]
 mod demo;
 mod lines;
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod look;
 mod mcp;
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(target_os = "macos")]
 mod mac;
+#[cfg_attr(target_os = "linux", allow(dead_code))]
 mod motion;
 #[cfg(windows)]
 mod overlay;
@@ -26,13 +30,15 @@ mod overlay;
 mod pen;
 #[cfg(windows)]
 mod pipe;
-#[cfg(target_os = "macos")]
+#[cfg(unix)]
 #[path = "mac/pipe.rs"]
 mod pipe;
 #[cfg(windows)]
 mod real;
 #[cfg(windows)]
 mod service;
+#[cfg(target_os = "linux")]
+use linux::service;
 #[cfg(target_os = "macos")]
 use mac::service;
 mod setup;
@@ -71,6 +77,11 @@ fn main() {
                     }
                 }
                 return;
+            }
+            #[cfg(target_os = "linux")]
+            if let Some(problem) = linux::x::display_problem() {
+                eprintln!("{problem}");
+                std::process::exit(1);
             }
             std::process::exit(client::run(args))
         }

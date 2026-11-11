@@ -20,8 +20,10 @@ const FETCH_SECONDS: u64 = 30;
 // Processes an agent must never end: the system itself, the person's desktop, and session login.
 #[cfg(windows)]
 const VITAL: [&str; 12] = ["system", "smss", "csrss", "wininit", "winlogon", "lsass", "services", "svchost", "dwm", "fontdrvhost", "registry", "memory compression"];
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 const VITAL: [&str; 12] = ["launchd", "kernel_task", "windowserver", "loginwindow", "systemuiserver", "coreservicesd", "securityd", "opendirectoryd", "configd", "logd", "notifyd", "distnoted"];
+#[cfg(target_os = "linux")]
+const VITAL: [&str; 12] = ["systemd", "init", "kthreadd", "xorg", "xvfb", "xwayland", "gnome-shell", "dbus-daemon", "dbus-broker", "systemd-logind", "gdm", "lightdm"];
 
 pub const COMMANDS: [&str; 8] = ["processes", "kill", "run", "fetch", "file", "reg", "notify", "settings"];
 
@@ -48,7 +50,7 @@ pub fn shell(line: &str, limit: Duration) -> Result<(String, Option<i32>), Strin
     };
     #[cfg(not(windows))]
     let mut command = {
-        let mut command = Command::new("/bin/zsh");
+        let mut command = Command::new(if cfg!(target_os = "macos") { "/bin/zsh" } else { "/bin/sh" });
         command.args(["-c", line]);
         command
     };
@@ -187,7 +189,7 @@ fn end(pid: u32) -> Result<(), String> {
 #[cfg(not(windows))]
 fn end(pid: u32) -> Result<(), String> {
     let done = Command::new("/bin/kill").arg(pid.to_string()).status().map_err(|e| e.to_string())?;
-    if done.success() { Ok(()) } else { Err("macOS refused".into()) }
+    if done.success() { Ok(()) } else { Err("the system refused".into()) }
 }
 
 /// A web page as readable text: scripts, styles and tags dropped, entities and spacing tidied.
@@ -393,7 +395,7 @@ fn trash(path: &Path) -> Result<(), String> {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn trash(path: &Path) -> Result<(), String> {
     let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("no home folder")?;
     let name = path.file_name().ok_or("that path has no name")?;
@@ -432,9 +434,32 @@ fn reg(words: &[String]) -> Result<String, String> {
     }
 }
 
+/// The desktop's own trash, as the freedesktop.org spec lays it out, so a file manager can restore it.
+#[cfg(target_os = "linux")]
+fn trash(path: &Path) -> Result<(), String> {
+    let home = std::env::var_os("HOME").map(PathBuf::from).ok_or("no home folder")?;
+    let data = std::env::var_os("XDG_DATA_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".local").join("share"));
+    let (files, info) = (data.join("Trash").join("files"), data.join("Trash").join("info"));
+    fs::create_dir_all(&files).and_then(|_| fs::create_dir_all(&info)).map_err(|e| e.to_string())?;
+    let name = path.file_name().ok_or("that path has no name")?.to_string_lossy().into_owned();
+    let mut kept = name.clone();
+    let mut n = 1;
+    while files.join(&kept).exists() || info.join(format!("{kept}.trashinfo")).exists() {
+        kept = format!("{name}.{n}");
+        n += 1;
+    }
+    let full = fs::canonicalize(path).map_err(|e| e.to_string())?;
+    let when = Command::new("date").arg("+%Y-%m-%dT%H:%M:%S").output().map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string()).unwrap_or_default();
+    fs::write(info.join(format!("{kept}.trashinfo")), format!("[Trash Info]
+Path={}
+DeletionDate={when}
+", full.display())).map_err(|e| e.to_string())?;
+    fs::rename(path, files.join(&kept)).map_err(|e| format!("could not move it to the trash: {e}"))
+}
+
 #[cfg(not(windows))]
 fn reg(_words: &[String]) -> Result<String, String> {
-    Err("a Mac has no registry: read settings with run \"defaults read ...\"".into())
+    Err(if cfg!(target_os = "macos") { "a Mac has no registry: read settings with run \"defaults read ...\"" } else { "Linux has no registry: read settings with run \"gsettings get ...\"" }.into())
 }
 
 fn notify(title: &str, message: &str) -> Result<String, String> {
@@ -448,8 +473,10 @@ fn notify(title: &str, message: &str) -> Result<String, String> {
         quote(title),
         quote(message)
     );
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     let line = format!("/usr/bin/osascript -e 'display notification \"{}\" with title \"{}\"'", message.replace(['"', '\''], ""), title.replace(['"', '\''], ""));
+    #[cfg(target_os = "linux")]
+    let line = format!("notify-send '{}' '{}'", title.replace('\'', ""), message.replace('\'', ""));
     let (text, code) = shell(&line, Duration::from_secs(15))?;
     if code == Some(0) { Ok("shown".into()) } else { Err(format!("the notification was refused: {}", crate::lines::clip(text.trim(), 200))) }
 }
@@ -459,8 +486,10 @@ fn settings(page: Option<&str>) -> Result<String, String> {
     let page: String = page.unwrap_or("").chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-').collect();
     #[cfg(windows)]
     let (program, link) = ("explorer.exe", format!("ms-settings:{page}"));
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     let (program, link) = ("/usr/bin/open", if page.is_empty() { "x-apple.systempreferences:".to_string() } else { format!("x-apple.systempreferences:com.apple.{page}") });
+    #[cfg(target_os = "linux")]
+    let (program, link) = ("gnome-control-center", page.clone());
     Command::new(program).arg(&link).spawn().map_err(|e| format!("could not open {link}: {e}"))?;
     Ok(format!("opened {link}: it takes the front, so work in it with see and click, then close it"))
 }
@@ -531,7 +560,7 @@ mod tests {
     #[test]
     fn vital_and_own_processes_are_refused() {
         assert!(kill(&std::process::id().to_string(), true).unwrap_err().contains("running this agent"));
-        let vital = if cfg!(windows) { "csrss" } else { "launchd" };
+        let vital = if cfg!(windows) { "csrss" } else if cfg!(target_os = "macos") { "launchd" } else { "1" };
         assert!(kill(vital, true).unwrap_err().contains("operating system"));
     }
 

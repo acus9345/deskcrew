@@ -92,9 +92,14 @@ fn app_data(_home: &Path) -> Option<PathBuf> {
     env::var_os("APPDATA").map(PathBuf::from)
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
 fn app_data(home: &Path) -> Option<PathBuf> {
     Some(home.join("Library").join("Application Support"))
+}
+
+#[cfg(target_os = "linux")]
+fn app_data(home: &Path) -> Option<PathBuf> {
+    Some(env::var_os("XDG_CONFIG_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".config")))
 }
 
 /// Put the rule in an instructions file, replacing an older copy and leaving everything else alone.
@@ -129,11 +134,12 @@ fn install_folder(home: &Path) -> (PathBuf, bool) {
     (root.join("bin"), false)
 }
 
-/// The shell that a Mac opens reads ~/.zprofile, so the folder goes there.
+/// The shell that a Mac opens reads ~/.zprofile, and a Linux login shell ~/.profile, so the
+/// folder goes there.
 #[cfg(not(windows))]
 fn add_to_user_path(folder: &Path) -> Result<(), String> {
     let home = env::var_os(HOME).map(PathBuf::from).ok_or("no home folder found")?;
-    let profile = home.join(".zprofile");
+    let profile = home.join(if cfg!(target_os = "macos") { ".zprofile" } else { ".profile" });
     let line = format!("export PATH=\"{}:$PATH\"\n", folder.display());
     let current = fs::read_to_string(&profile).unwrap_or_default();
     if current.contains(&line) {

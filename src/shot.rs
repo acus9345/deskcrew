@@ -296,8 +296,13 @@ pub fn path_for(agent: &str, window: u32) -> PathBuf {
     let slug: String = agent.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
     #[cfg(windows)]
     let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    #[cfg(not(windows))]
+    #[cfg(target_os = "macos")]
     let root = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library").join("Caches")).unwrap_or_else(std::env::temp_dir);
+    #[cfg(target_os = "linux")]
+    let root = std::env::var_os("XDG_CACHE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
+        .unwrap_or_else(std::env::temp_dir);
     root.join("deskcrew").join("shots").join(format!("{slug}-w{window}.png"))
 }
 
