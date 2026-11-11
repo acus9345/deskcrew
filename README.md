@@ -71,7 +71,7 @@ Each client shows up as its own cursor, named from what the client calls itself 
 
 ## macOS
 
-**The macOS version has not been run yet.** It was written and type-checked for both Apple Silicon and Intel Macs on a Windows PC, which cannot link or run Mac programs. Treat it as a first draft until someone tries it on a Mac.(please share ur feedback on a mac:D)
+**The macOS version has not been run on a real Mac yet.** It was written on a Windows PC. CI builds it for Apple Silicon and Intel on GitHub's Mac runners, runs its unit tests and checks the MCP server there, but those runners give it no Accessibility or Screen Recording permission, so its commands have not been tried on real windows. Treat it as a first draft until someone tries it on a Mac.(please share ur feedback on a mac:D)
 
 It has the same commands and replies, built on Mac parts:
 
@@ -85,7 +85,7 @@ macOS asks once for Accessibility permission, and again for Screen Recording the
 
 Most commands and flags now match Windows: `check`, `uncheck`, `toggle`, `expand`, `collapse`, `clear`, `is`, `select`, `hover`, `show`, `draw`, `drag`, `down` and `up` for modifier keys, `place`, `focus`, `close`, `screens`, `apps`, `clip`, `shot --screen`, `do --dry` and `--risk`, `wait --gone`, `type --paste`, `--fast`, `--with`, and middle, back, forward and triple clicks. `--real` brings the app forward for a moment and sends keys through the system, then gives the front back.
 
-Not on the Mac yet: `--mouse` and borrowing the cursor, holding a mouse button, `notifications` and the demo. On a Mac, `down` holds modifier keys only, and they apply to that agent's later clicks and keys in that app.
+Not on the Mac yet: `table`, `pick-file`, sideways `scroll`, `click --hold`, `--mouse` and borrowing the cursor, holding a mouse button, `notifications` and the demo. On a Mac, `down` holds modifier keys only, and they apply to that agent's later clicks and keys in that app.
 
 ```text
 $ deskcrew see Calculator

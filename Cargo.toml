@@ -6,7 +6,7 @@ description = "Every coding agent gets its own cursor on your Windows or Mac des
 license = "MIT"
 repository = "https://github.com/acus9345/deskcrew"
 readme = "README.md"
-exclude = ["demo/", "bench/"]
+exclude = ["demo/", "bench/", "scripts/", ".github/"]
 
 [package.metadata.docs.rs]
 default-target = "x86_64-pc-windows-msvc"
