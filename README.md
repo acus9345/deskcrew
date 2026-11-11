@@ -1,14 +1,35 @@
 # deskcrew
 
 **Windows, with an untested macOS version.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
-<img width="1163" height="719" alt="image" src="https://github.com/user-attachments/assets/2cad4d13-546e-41d4-84b9-0406ff783b78" />
-
+![Three agents draw, use Calculator and type a note at the same time, each with its own cursor](https://raw.githubusercontent.com/acus9345/deskcrew/main/demo/deskcrew-demo.gif)
 
 Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.*even when ur doing something in fullscreen*the agents can still work and do things
 
-**[Watch the 11-second demo](demo/deskcrew-demo.mp4):** three agents draw in Photon Studio, use Calculator and type a note at the same time. Calculator's title and mode label were overlaid in English in the video.
+<img width="1163" height="719" alt="image" src="https://github.com/user-attachments/assets/2cad4d13-546e-41d4-84b9-0406ff783b78" />
+
+**Above, and [as a video](demo/deskcrew-demo.mp4):** three agents draw in Photon Studio, use Calculator and type a note at the same time. Calculator's title and mode label were overlaid in English in the video.
 
 It is a single command, so any agent that can run a shell command on this computer can use it: Claude Code, Cursor, Codex, Gemini CLI, Copilot, Windsurf, OpenCode, Aider and the rest. Apps that call tools instead of a shell, such as Claude Desktop, can use it as an [MCP server](#as-an-mcp-server).
+
+## Quick start
+
+```bash
+cargo install deskcrew
+deskcrew setup
+```
+
+Then ask your agent to do something in a desktop app, such as "add 12 and 30 in Calculator". `setup` tells every agent app it finds to use deskcrew on its own.
+
+## Works with
+
+| Agent | How it uses deskcrew |
+| --- | --- |
+| Claude Code | `setup` adds a skill and a rule, or as an MCP server: `claude mcp add deskcrew -- deskcrew mcp` |
+| Codex | `setup` adds a skill and a rule, or as an MCP server: `codex mcp add deskcrew -- deskcrew mcp` |
+| Cursor | `setup` adds a skill and prints a rule for Cursor's settings, or as an MCP server in `~/.cursor/mcp.json` |
+| Claude Desktop | as an MCP server ([config](#as-an-mcp-server)) |
+| Gemini CLI, Copilot, Windsurf, OpenCode, Amp, Qwen Code, Factory, Kiro, Continue, Cline | `setup` adds a rule, and a skill where the app takes one ([details](#try-it)) |
+| Anything else that runs shell commands | the `deskcrew` command; `deskcrew help` lists everything |
 
 ## Try it
 
