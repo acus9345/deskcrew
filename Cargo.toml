@@ -1,8 +1,8 @@
 [package]
 name = "deskcrew"
-version = "0.1.12"
+version = "0.1.13"
 edition = "2024"
-description = "Every coding agent gets its own cursor on your Windows or Mac desktop, for very few tokens."
+description = "Every coding agent gets its own cursor on your Windows, Mac or Linux (X11) desktop, for very few tokens. Also an MCP server."
 license = "MIT"
 repository = "https://github.com/acus9345/deskcrew"
 readme = "README.md"

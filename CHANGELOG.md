@@ -6,7 +6,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
-- Add a Linux version for X11, including headless Xvfb: controls through AT-SPI in the background, points and keys through XTest, one service per X display. On Wayland it explains that Wayland is not supported. CI drives a GTK window under Xvfb on Ubuntu.
+## [0.1.13] - 2026-11-11
+
+- Add a Linux version for X11, including headless Xvfb: controls through AT-SPI in the background, points and keys through XTest, one service per X display. It also works without at-spi2-core, on a bus named by `AT_SPI_BUS_ADDRESS`. On Wayland it explains that Wayland is not supported. Tested in CI on Ubuntu with a GTK window and a toolkit-free one, and on a Debian 13 machine.
 - Add `deskcrew mcp`, an MCP server over stdio with `see`, `do`, `shot` and a `deskcrew` tool for every other command, for Claude Desktop, Codex, Cursor and other apps that call tools instead of running a shell. A shot comes back as the picture itself.
 - `scroll left|right` scrolls sideways, and `click --hold ms` is a long press, by window message like any other click. These were the last things desk-pilot did that deskcrew did not.
 - When a name matches several windows, use the one the agent is already working in. On a Mac, also prefer an exact name and the only window with a title, so the untitled panels TextEdit opens while typing no longer make `-w TextEdit` ambiguous.
