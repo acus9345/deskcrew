@@ -1,6 +1,6 @@
 # deskcrew
 
-**Windows, with an early macOS version.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
+**Windows, with early macOS and Linux (X11 / Xvfb) versions; Wayland is not supported.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
 ![Three agents draw, use Calculator and type a note at the same time, each with its own cursor](https://raw.githubusercontent.com/acus9345/deskcrew/main/demo/deskcrew-demo.gif)
 
 Agents act through Windows accessibility, window messages and a synthetic pen, so your cursor stays yours. Each agent appears as a drawn cursor in its own colour with its name beside it. The cursor glides to a control, and the control lights up with an outline in that colour when it is pressed. Agents work side by side while you keep working.*even when ur doing something in fullscreen*the agents can still work and do things
@@ -119,6 +119,28 @@ ok invoke
 ```
 
 Run `deskcrew help` for every command. A background service starts itself on first use and exits after 30 idle minutes.
+
+## Linux (X11 / Xvfb)
+
+**Linux (X11 / Xvfb); Wayland not supported.** Wayland does not let one app read or drive another's windows, so on a Wayland session deskcrew says so and stops. Log in to an X11 (Xorg) session, or run the apps on a virtual display such as Xvfb, which is how agents on cloud machines and in CI usually work.
+
+The Linux version is the newest and least tried. CI runs it on Ubuntu under Xvfb on every push, against a GTK window and against a toolkit-free test window (`examples/linux_form.rs`) on a bare accessibility bus.
+
+- Controls are read and pressed through AT-SPI, the accessibility bus GTK, Qt, Firefox, Chromium and LibreOffice speak, so `see`, `set`, `check`, `select` and pressing buttons work in the background, behind other windows, without the pointer. GTK apps take part once the bus is running. Qt apps need `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, and Chrome `--force-renderer-accessibility`.
+- Clicks on x,y points, keys, drags, drawing, scrolling and typing with no field named go through XTest. X has one pointer and one keyboard, so deskcrew brings the window forward for a moment, uses them, then puts the pointer and the front window back. On a virtual display no one notices; on a person's own desktop the pointer moves briefly.
+- The window list comes from the window manager, or straight from the X server on a bare Xvfb with none.
+- The accessibility bus is the one `AT_SPI_BUS_ADDRESS` or the display names, or else the one at-spi2-core starts. Without at-spi2-core's registry, deskcrew finds the apps on the bus itself.
+- There are no drawn cursors per agent on Linux yet, and no `table`, `pick-file` or `notifications`. The clipboard needs `xclip` or `xsel`.
+
+To try it on a virtual display:
+
+```bash
+sudo apt install xvfb at-spi2-core xclip
+Xvfb :99 & export DISPLAY=:99
+dbus-run-session -- bash -c 'gedit & sleep 2; deskcrew see gedit'
+```
+
+Each X display gets its own background service, so agents on `:99` and `:0` never mix.
 
 ## Why it is cheap
 

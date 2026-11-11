@@ -79,7 +79,8 @@ const MOST_ANCESTORS: usize = 16;
 /// Every process's parent and lower-case program name, without folder or `.exe`.
 #[cfg(not(windows))]
 pub fn processes() -> HashMap<u32, (u32, String)> {
-    let listed = std::process::Command::new("/bin/ps").args(["-axo", "pid=,ppid=,comm="]).output();
+    let flags = if cfg!(target_os = "linux") { "-eo" } else { "-axo" };
+    let listed = std::process::Command::new("ps").args([flags, "pid=,ppid=,comm="]).output();
     let text = listed.map(|out| String::from_utf8_lossy(&out.stdout).into_owned()).unwrap_or_default();
     text.lines()
         .filter_map(|line| {
