@@ -37,6 +37,9 @@ mod pipe;
 mod real;
 #[cfg(windows)]
 mod service;
+// The drawing code's tests reach the overlay by this name on every system.
+#[cfg(all(target_os = "linux", test))]
+use linux::overlay;
 #[cfg(target_os = "linux")]
 use linux::service;
 #[cfg(target_os = "macos")]

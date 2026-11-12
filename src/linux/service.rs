@@ -4,6 +4,7 @@
 // keyboard, so for those the window is brought forward and agents take turns.
 use super::{
     atspi::{self, Node, Obj},
+    overlay::Overlay,
     x::{self, Bounds, Button, Window},
 };
 use crate::{
@@ -267,9 +268,21 @@ struct Service {
     agents: Mutex<HashMap<String, AgentState>>,
     last_used: Mutex<Instant>,
     quit: AtomicBool,
+    overlay: Overlay,
 }
 
 impl Service {
+    /// Glide this agent's drawn cursor to a spot, keep it above the agent's window, and light up
+    /// the control there when it is pressed.
+    fn cursor_on(&self, who: &str, tracked: &Tracked, rect: Bounds, press: bool) {
+        let (px, py) = centre(rect);
+        self.overlay.move_to(who, px, py);
+        self.overlay.over(who, tracked.window);
+        if press && rect.2 > 0 && rect.3 > 0 {
+            self.overlay.press(who, rect);
+        }
+    }
+
     fn track(&self, window: &Window) -> Arc<Tracked> {
         let mut windows = self.windows.lock().unwrap();
         let (next, known) = &mut *windows;
@@ -509,6 +522,7 @@ impl Service {
                 (atspi::rect(&node.element).unwrap_or(node.rect), Some(node.element.clone()))
             }
         };
+        self.cursor_on(who, tracked, rect, element.is_some());
         let plain = with.is_empty() && count == 1 && flags.hold.is_none() && button == Button::Left;
         // Clicking a text field puts the caret there: focus does that without the pointer.
         if let Some(element) = &element
@@ -541,13 +555,16 @@ impl Service {
 
     fn hover(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let (px, py) = self.point_of(word, who, tracked, view)?;
+        self.cursor_on(who, tracked, (px, py, 0, 0), false);
         let _turn = self.real_input.lock().unwrap();
         x::move_to(px, py)?;
         Ok("pointer".into())
     }
 
     fn set(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
-        let (_, _, element) = self.control(word, who, tracked, view)?;
+        let (_, rect, element) = self.control(word, who, tracked, view)?;
+        self.cursor_on(who, tracked, rect, true);
+        self.overlay.typing(who, value.chars().count());
         if atspi::editable(&element) {
             atspi::set_text(&element, value)?;
             return Ok("text".into());
@@ -563,7 +580,8 @@ impl Service {
 
     /// Leave a checkbox or switch alone if it is already that way, or press it once.
     fn ensure(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, wanted: Option<&'static str>) -> Reply {
-        let (id, _, element) = self.control(word, who, tracked, view)?;
+        let (id, rect, element) = self.control(word, who, tracked, view)?;
+        self.cursor_on(who, tracked, rect, true);
         if let Some(wanted) = wanted
             && view.nodes[&id].parts.states.contains(&wanted)
         {
@@ -573,7 +591,8 @@ impl Service {
     }
 
     fn expand(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, open: bool) -> Reply {
-        let (id, _, element) = self.control(word, who, tracked, view)?;
+        let (id, rect, element) = self.control(word, who, tracked, view)?;
+        self.cursor_on(who, tracked, rect, true);
         let wanted = if open { "open" } else { "closed" };
         if view.nodes[&id].parts.states.contains(&wanted) {
             return Ok(format!("already {wanted}"));
@@ -583,14 +602,16 @@ impl Service {
     }
 
     fn show(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
-        let (_, _, element) = self.control(word, who, tracked, view)?;
+        let (_, rect, element) = self.control(word, who, tracked, view)?;
+        self.cursor_on(who, tracked, rect, false);
         atspi::show(&element)?;
         Ok("scroll".into())
     }
 
     /// Pick an entry from a combo box or a list.
     fn select(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, item: &str) -> Reply {
-        let (id, _, element) = self.control(word, who, tracked, view)?;
+        let (id, rect, element) = self.control(word, who, tracked, view)?;
+        self.cursor_on(who, tracked, rect, true);
         if view.nodes[&id].parts.role == "edit" && atspi::editable(&element) {
             atspi::set_text(&element, item)?;
             return Ok("text".into());
@@ -631,9 +652,14 @@ impl Service {
         // Into a named field: insert through accessibility, in the background. Without one, keys
         // go to whatever has focus, so they replace a selection as typing would.
         let field = match target {
-            Some(word) => Some(self.control(word, who, tracked, view)?.2),
+            Some(word) => {
+                let (_, rect, element) = self.control(word, who, tracked, view)?;
+                self.cursor_on(who, tracked, rect, true);
+                Some(element)
+            }
             None => None,
         };
+        self.overlay.typing(who, text.chars().count());
         if !flags.paste
             && let Some(field) = &field
             && atspi::editable(field)
@@ -700,6 +726,7 @@ impl Service {
             Some(word) => self.point_of(word, who, tracked, view)?,
             None => centre(self.window_of(tracked)?.rect),
         };
+        self.cursor_on(who, tracked, (px, py, 0, 0), false);
         let sideways = words[at] == "left" || words[at] == "right";
         let notches = if words[at] == "up" || words[at] == "right" { times } else { -times };
         let notches = if sideways { -notches } else { notches };
@@ -707,7 +734,7 @@ impl Service {
         Ok("pointer".into())
     }
 
-    fn strokes(&self, tracked: &Tracked, strokes: &[Vec<(f32, f32)>]) -> Reply {
+    fn strokes(&self, who: &str, tracked: &Tracked, strokes: &[Vec<(f32, f32)>]) -> Reply {
         let window = self.window_of(tracked)?.rect;
         let inside = |p: &(f32, f32)| {
             let (px, py) = (p.0 as i32, p.1 as i32);
@@ -717,9 +744,13 @@ impl Service {
             return Err("refused: that stroke leaves the window".into());
         }
         let stop = || STOP.load(Ordering::Relaxed);
+        if let Some(&(px, py)) = strokes.first().and_then(|s| s.first()) {
+            self.cursor_on(who, tracked, (px as i32, py as i32, 0, 0), false);
+        }
+        // The drawn cursor rides along with the pen.
         let finished = self.front(tracked, || {
             for stroke in strokes {
-                if !x::stroke(stroke, &stop, &mut |_, _, _| {})? {
+                if !x::stroke(stroke, &stop, &mut |_, px, py| self.overlay.jump(who, px, py))? {
                     return Ok(false);
                 }
             }
@@ -731,7 +762,7 @@ impl Service {
     fn drag(&self, who: &str, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
         let a = self.point_of(from, who, tracked, view)?;
         let b = self.point_of(to, who, tracked, view)?;
-        self.strokes(tracked, &[motion::trace(&[a, b], false)])
+        self.strokes(who, tracked, &[motion::trace(&[a, b], false)])
     }
 
     /// Strokes of x,y points in the last shot, or from a control's top left.
@@ -764,7 +795,7 @@ impl Service {
         if strokes.is_empty() {
             return Err("nothing to draw".into());
         }
-        self.strokes(tracked, &strokes)
+        self.strokes(who, tracked, &strokes)
     }
 
     fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
@@ -1242,6 +1273,7 @@ pub fn run() {
         agents: Mutex::new(HashMap::new()),
         last_used: Mutex::new(Instant::now()),
         quit: AtomicBool::new(false),
+        overlay: Overlay::start(),
     });
     let server = service.clone();
     thread::spawn(move || {

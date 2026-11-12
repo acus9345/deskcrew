@@ -282,12 +282,16 @@ pub fn capture(rect: Bounds) -> Result<Frame, String> {
     if w < 1 || h < 1 {
         return Err("that part is off the screen".into());
     }
-    let image = x
-        .conn
-        .get_image(ImageFormat::Z_PIXMAP, x.root, left as i16, top as i16, w as u16, h as u16, !0)
-        .map_err(|e| e.to_string())?
-        .reply()
-        .map_err(|e| format!("X would not copy the screen: {e}"))?;
+    // The agents' drawn cursors stay out of the picture.
+    let overlay = super::overlay::Overlay::running();
+    if let Some(overlay) = &overlay {
+        overlay.aside(true);
+    }
+    let image = x.conn.get_image(ImageFormat::Z_PIXMAP, x.root, left as i16, top as i16, w as u16, h as u16, !0).map_err(|e| e.to_string()).and_then(|c| c.reply().map_err(|e| format!("X would not copy the screen: {e}")));
+    if let Some(overlay) = &overlay {
+        overlay.aside(false);
+    }
+    let image = image?;
     if image.depth < 24 || image.data.len() < (w * h * 4) as usize {
         return Err(format!("the screen's colour depth ({}) is not supported", image.depth));
     }

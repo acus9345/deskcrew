@@ -60,6 +60,7 @@ fi
 form=$!
 for _ in $(seq 50); do grep -q ready "$log" && break; sleep 0.2; done
 sleep 1
+mkdir -p shots
 
 expect "running" status
 expect "Deskcrew Form" windows
@@ -82,6 +83,18 @@ if command -v xclip >/dev/null || command -v xsel >/dev/null; then
     expect "deskcrew clip" clip
 else
     echo "SKIPPED the clipboard checks: neither xclip nor xsel is installed"
+fi
+# Each agent's drawn cursor is on the screen, in its colour: Claude's is 208,111,89.
+if command -v xwd >/dev/null; then
+    run click Name -w "Deskcrew Form" --agent Claude
+    if [ $code -ne 0 ]; then echo "FAILED: the click for the cursor check"; failed=1; fi
+    sleep 0.3
+    cursor=$(xwd -root -silent | python3 "$here/xwd-colour.py" 208 111 89)
+    echo "pixels in Claude's colour on the screen: $cursor"
+    if [ "${cursor:-0}" -lt 40 ]; then echo "FAILED: expected Claude's drawn cursor on the screen"; failed=1; fi
+    xwd -root -silent > shots/screen-with-cursor.xwd 2>/dev/null || true
+else
+    echo "SKIPPED the drawn cursor check: xwd is not installed"
 fi
 expect "bye" quit
 echo "--- what the window received:"
