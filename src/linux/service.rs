@@ -1,7 +1,8 @@
 // The background service on Linux (X11). It remembers each window's refs and runs agents side by
 // side. Controls are read and pressed through AT-SPI, which needs no focus and leaves the pointer
-// alone; points, keys and drawing go through XTest, which uses the display's one pointer and
-// keyboard, so for those the window is brought forward and agents take turns.
+// alone. Keys go through XTest to the window given the keyboard focus, which X lets happen without
+// raising it; points and drawing use the display's one pointer, so for those the window is brought
+// forward. Agents take turns with both.
 use super::{
     atspi::{self, Node, Obj},
     overlay::Overlay,
@@ -43,8 +44,8 @@ Any action: --expect \"text\" fails unless the text shows afterwards.
 launch app [args]     focus     close     place x,y,w,h|min|max|restore
 apps     screens     clip     clip set \"text\"     clip clear     status     resume     quit     setup (installs for your coding agents)     mcp (the same as MCP tools, over stdio)
 Every action replies with what changed, in the picture too. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
-Controls go through accessibility (AT-SPI) in the background. Points, keys and drawing use the X pointer and
-keyboard, bringing the window forward for a moment. Flags: -w window, --agent name, --fast, --force (allow risky keys).
+Controls go through accessibility (AT-SPI) in the background. Keys and typing take the window's keyboard
+for a moment without raising it; points and drawing use the X pointer, bringing the window forward. Flags: -w window, --agent name, --fast, --force (allow risky keys).
 Wayland is not supported: it does not let one app read or drive another.";
 
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
@@ -60,6 +61,8 @@ const MAX_WINDOWS: usize = 40;
 const MAX_GET_CHARS: usize = 20_000;
 const HOLD_MOST: Duration = Duration::from_secs(30);
 const FRONT_SETTLE: Duration = Duration::from_millis(120);
+/// How long a window takes to notice it has the keyboard, and to finish with the last key.
+const KEYS_SETTLE: Duration = Duration::from_millis(40);
 const PASTE_SETTLE: Duration = Duration::from_millis(150);
 const MENU_OPEN: Duration = Duration::from_millis(250);
 const MENU_DEPTH: usize = 4;
@@ -458,6 +461,21 @@ impl Service {
         }
     }
 
+    /// Give the window the keyboard for `work` without raising it, then give it back: the window in
+    /// front stays in front, and apps that ignore keys while in the back, as Chrome does, still take
+    /// them. Agents take turns here: the display has one keyboard.
+    fn keyboard<T>(&self, tracked: &Tracked, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+        let _turn = self.real_input.lock().unwrap();
+        let before = x::focus_keys(tracked.window)?;
+        thread::sleep(KEYS_SETTLE);
+        let result = work();
+        thread::sleep(KEYS_SETTLE);
+        if before != tracked.window {
+            x::restore_keys(before);
+        }
+        result
+    }
+
     /// Bring the window forward for `work` with the X pointer or keyboard, then give the front
     /// and the pointer back. Agents take turns here: the display has one of each.
     fn front<T>(&self, tracked: &Tracked, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
@@ -638,7 +656,7 @@ impl Service {
                     return Ok("select".into());
                 }
             }
-            let _ = self.front(tracked, || x::press(&x::chord("esc")?, Duration::ZERO));
+            let _ = self.keyboard(tracked, || x::press(&x::chord("esc")?, Duration::ZERO));
         }
         Err(format!("no entry named '{item}'"))
     }
@@ -674,14 +692,14 @@ impl Service {
             let saved = x::clipboard().ok().flatten();
             x::set_clipboard(Some(text))?;
             thread::sleep(PASTE_SETTLE);
-            let sent = self.front(tracked, || x::press(&x::chord("ctrl+v")?, Duration::ZERO));
+            let sent = self.keyboard(tracked, || x::press(&x::chord("ctrl+v")?, Duration::ZERO));
             thread::sleep(PASTE_SETTLE);
             let _ = x::set_clipboard(saved.as_deref());
             sent?;
             return Ok("paste".into());
         }
         let stop = || STOP.load(Ordering::Relaxed);
-        let typed = self.front(tracked, || x::type_text(text, &stop))?;
+        let typed = self.keyboard(tracked, || x::type_text(text, &stop))?;
         if typed < text.chars().count() {
             return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
         }
@@ -695,7 +713,7 @@ impl Service {
         }
         chord.modifiers.retain(|m| !self.held_keys(who).contains(m));
         let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
-        self.front(tracked, || x::press(&chord, hold))?;
+        self.keyboard(tracked, || x::press(&chord, hold))?;
         Ok("keys".into())
     }
 

@@ -691,12 +691,36 @@ impl Service {
         }
         let before = field.as_ref().and_then(|f| ax::text(f, "AXValue"));
         let stop = || STOP.load(Ordering::Relaxed);
+        // Chromium and Electron apps ignore keys while they are behind other windows. The first
+        // letter shows whether this one does; if so, the text goes in letter by letter through
+        // accessibility, which needs no focus, at the same speed as typing.
+        let mut rest = text;
+        if let Some(field) = &field
+            && !flags.real
+            && let Some(first) = text.chars().next()
+        {
+            input::type_text(input::To::App(tracked.pid), &first.to_string(), &stop)?;
+            thread::sleep(SETTLE_FIRST);
+            if ax::text(field, "AXValue") == before && ax::settable(field, "AXValue") {
+                let mut value = before.clone().unwrap_or_default();
+                for (count, letter) in text.chars().enumerate() {
+                    if stop() {
+                        return Err(format!("{STOPPED} (typed {count} of {} characters)", text.chars().count()));
+                    }
+                    value.push(letter);
+                    ax::set_text(field, &value)?;
+                    thread::sleep(crate::motion::KEY_EVERY);
+                }
+                return Ok("value".into());
+            }
+            rest = &text[first.len_utf8()..];
+        }
         let typed = if flags.real {
-            self.front(tracked, || input::type_text(input::To::Front, text, &stop))?
+            self.front(tracked, || input::type_text(input::To::Front, rest, &stop))?
         } else {
-            input::type_text(input::To::App(tracked.pid), text, &stop)?
+            input::type_text(input::To::App(tracked.pid), rest, &stop)?
         };
-        if typed < text.chars().count() {
+        if typed < rest.chars().count() {
             return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
         }
         // Some apps only take keys while in front. A field that ignored them gets the text set instead.

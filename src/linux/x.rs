@@ -197,6 +197,27 @@ pub fn front() -> Option<u32> {
 }
 
 /// Raise the window and give it the keyboard, through the window manager when there is one.
+/// Give a window the keyboard without raising it or making it the active window: on X the keyboard
+/// focus and the stacking are separate, so the window in front stays in front. Returns the window
+/// that had the keyboard before.
+pub fn focus_keys(id: u32) -> Result<u32, String> {
+    let x = x()?;
+    let before = x.conn.get_input_focus().map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?.focus;
+    x.conn.set_input_focus(xproto::InputFocus::PARENT, id, x11rb::CURRENT_TIME).map_err(|e| e.to_string())?;
+    x.conn.flush().map_err(|e| e.to_string())?;
+    Ok(before)
+}
+
+/// Hand the keyboard back to the window that had it.
+pub fn restore_keys(window: u32) {
+    if let Ok(x) = x()
+        && window > 1
+    {
+        let _ = x.conn.set_input_focus(xproto::InputFocus::PARENT, window, x11rb::CURRENT_TIME);
+        let _ = x.conn.flush();
+    }
+}
+
 pub fn activate(id: u32) -> Result<(), String> {
     let x = x()?;
     if x.has_wm() && x.supports("_NET_ACTIVE_WINDOW") {
