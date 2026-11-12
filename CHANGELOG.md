@@ -6,6 +6,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.15] - 2026-11-12
+
+- Cursors look and move like Claude Whiteboards: a white-ringed dart with the name in Arial Bold on a tag of the agent's colour (Claude is now its own orange). Moves follow a curve, and the arrow leans into sideways travel. While typing, the cursor becomes a caret that follows the text with the tag above it, and the tag pulses with the keys. All typing runs at 600 words a minute, and --real typing into a named field adds to the end. A window the person clicks, drags or Alt-Tabs into is no longer taken back. New demo video.
+
 ## [0.1.14] - 2026-11-11
 
 - Write the README in plain sentences, and bring its comparison with agent-desktop up to date now that deskcrew runs on macOS and Linux and as an MCP server. The crates.io page shows the new README.
