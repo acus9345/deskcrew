@@ -6,6 +6,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.16] - 2026-11-12
+
+- Linux draws each agent's cursor too, with the same look, curve, lean and typing pulse as Windows and the Mac. On the Mac and Linux, typing reaches Chrome, Electron and other apps that ignore keys while behind other windows, without bringing them forward: letter by letter through accessibility on the Mac, and by lending the window the keyboard without raising it on Linux. On Windows this is not possible for Chromium apps, and the README says why.
+
 ## [0.1.15] - 2026-11-12
 
 - Cursors look and move like Claude Whiteboards: a white-ringed dart with the name in Arial Bold on a tag of the agent's colour (Claude is now its own orange). Moves follow a curve, and the arrow leans into sideways travel. While typing, the cursor becomes a caret that follows the text with the tag above it, and the tag pulses with the keys. All typing runs at 600 words a minute, and --real typing into a named field adds to the end. A window the person clicks, drags or Alt-Tabs into is no longer taken back. New demo video.
