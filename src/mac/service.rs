@@ -691,8 +691,8 @@ impl Service {
         }
         let before = field.as_ref().and_then(|f| ax::text(f, "AXValue"));
         let stop = || STOP.load(Ordering::Relaxed);
-        // Chromium and Electron apps ignore keys while they are behind other windows. The first
-        // letter shows whether this one does; if so, the text goes in letter by letter through
+        // Chromium and Electron apps ignore keys while they are behind other windows, or take only
+        // the first. A field that did not get every letter gets the rest letter by letter through
         // accessibility, which needs no focus, at the same speed as typing.
         let mut rest = text;
         if let Some(field) = &field
@@ -701,17 +701,9 @@ impl Service {
         {
             input::type_text(input::To::App(tracked.pid), &first.to_string(), &stop)?;
             thread::sleep(SETTLE_FIRST);
+            let wanted = before.clone().unwrap_or_default() + text;
             if ax::text(field, "AXValue") == before && ax::settable(field, "AXValue") {
-                let mut value = before.clone().unwrap_or_default();
-                for (count, letter) in text.chars().enumerate() {
-                    if stop() {
-                        return Err(format!("{STOPPED} (typed {count} of {} characters)", text.chars().count()));
-                    }
-                    value.push(letter);
-                    ax::set_text(field, &value)?;
-                    thread::sleep(crate::motion::KEY_EVERY);
-                }
-                return Ok("value".into());
+                return fill(field, before.clone().unwrap_or_default(), &wanted, &stop);
             }
             rest = &text[first.len_utf8()..];
         }
@@ -723,15 +715,16 @@ impl Service {
         if typed < rest.chars().count() {
             return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
         }
-        // Some apps only take keys while in front. A field that ignored them gets the text set instead.
         if let Some(field) = field
             && !flags.real
         {
             thread::sleep(SETTLE_FIRST);
-            let after = ax::text(&field, "AXValue");
-            if after == before && ax::settable(&field, "AXValue") {
-                ax::set_text(&field, &(before.unwrap_or_default() + text))?;
-                return Ok("value".into());
+            let wanted = before.clone().unwrap_or_default() + text;
+            let now = ax::text(&field, "AXValue").unwrap_or_default();
+            if now != wanted && ax::settable(&field, "AXValue") {
+                // Keep what did land, as far as it matches, and put the rest in.
+                let kept: String = now.chars().zip(wanted.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a).collect();
+                return fill(&field, kept, &wanted, &stop);
             }
         }
         Ok(if flags.real { "keyboard".into() } else { "keys".into() })
@@ -1437,4 +1430,19 @@ pub fn run() {
     // Give the last reply a moment to leave before the process goes.
     thread::sleep(Duration::from_millis(100));
     pipe::remove();
+}
+
+/// Put text into a field one letter at a time through accessibility, from what it holds now to
+/// what it should hold, at the typing speed.
+fn fill(field: &Owned, mut value: String, wanted: &str, stop: &dyn Fn() -> bool) -> Reply {
+    let total = wanted.chars().count();
+    for letter in wanted.chars().skip(value.chars().count()) {
+        if stop() {
+            return Err(format!("{STOPPED} (typed {} of {total} characters)", value.chars().count()));
+        }
+        value.push(letter);
+        ax::set_text(field, &value)?;
+        thread::sleep(motion::KEY_EVERY);
+    }
+    Ok("value".into())
 }

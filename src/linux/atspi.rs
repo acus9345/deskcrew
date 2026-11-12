@@ -441,6 +441,11 @@ pub fn has_value(obj: &Obj) -> bool {
     interfaces(obj).iter().any(|i| i == "org.a11y.atspi.Value")
 }
 
+/// True if the control already has the keyboard focus inside its app.
+pub fn focused(obj: &Obj) -> bool {
+    has(states(obj), FOCUSED)
+}
+
 pub fn focus(obj: &Obj) -> Result<(), String> {
     let done: bool = call(obj, "org.a11y.atspi.Component", "GrabFocus", &())?;
     if done { Ok(()) } else { Err("that control would not take focus".into()) }

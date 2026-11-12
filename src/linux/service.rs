@@ -685,7 +685,12 @@ impl Service {
         {
             return Ok("text".into());
         }
-        if let Some(field) = &field {
+        // Focusing a field makes some apps, Chrome among them, raise their window, so a field that
+        // already has the focus is left as it is.
+        let person = x::front();
+        if let Some(field) = &field
+            && !atspi::focused(field)
+        {
             let _ = atspi::focus(field);
         }
         if flags.paste {
@@ -699,7 +704,15 @@ impl Service {
             return Ok("paste".into());
         }
         let stop = || STOP.load(Ordering::Relaxed);
-        let typed = self.keyboard(tracked, || x::type_text(text, &stop))?;
+        let typed = self.keyboard(tracked, || x::type_text(text, &stop));
+        // If the app pulled itself over the person's window, theirs goes back on top.
+        if let Some(person) = person
+            && person != tracked.window
+            && x::front() != Some(person)
+        {
+            let _ = x::activate(person);
+        }
+        let typed = typed?;
         if typed < text.chars().count() {
             return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
         }
