@@ -37,6 +37,21 @@ STEPS = {
 }
 
 
+def close_leftovers(titles):
+    """Ask every window with one of these titles to close, and wait until they have."""
+    if sys.platform != 'win32':
+        return
+    import ctypes
+    user = ctypes.windll.user32
+    for _ in range(50):
+        found = [h for h in (user.FindWindowW(None, title) for title in titles) if h]
+        if not found:
+            return
+        for h in found:
+            user.PostMessageW(h, 0x10, 0, 0)
+        time.sleep(0.2)
+
+
 def ffmpeg():
     found = shutil.which('ffmpeg')
     if found:
@@ -68,7 +83,13 @@ def main():
         run = lambda words: subprocess.run([exe] + words, capture_output=True, text=True, encoding='utf-8').stdout
 
     ps = 'powershell.exe -NoProfile -ExecutionPolicy Bypass -STA -File'
-    windows = [
+    # Any window left from an earlier run would share a title with the new ones.
+    close_leftovers(['Sketch', 'Note', 'Bench Order', 'Backdrop'])
+    # The backdrop goes first, so the demo windows open on top of it and nothing else shows.
+    windows = [start(f'{ps} "{os.path.join(HERE, "windows.ps1")}" -Kind backdrop')]
+    time.sleep(3)
+    run(['place', '{},{},{},{}'.format(*REGION), '-w', 'Backdrop', '--agent', 'setup'])
+    windows += [
         start(f'{ps} "{os.path.join(HERE, "windows.ps1")}" -Kind sketch'),
         start(f'{ps} "{os.path.join(HERE, "windows.ps1")}" -Kind notes'),
         start(f'{ps} "{os.path.join(REPO, "bench", "app.ps1")}" -Task order -Log "{log}" -Seed 3'),

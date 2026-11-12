@@ -1,5 +1,5 @@
 ﻿# Throwaway windows for the demo video: a sketch pad and a note. Nothing they get is saved.
-param([ValidateSet('sketch', 'notes')][string]$Kind, [int]$X = 40, [int]$Y = 40, [int]$W = 560, [int]$H = 420)
+param([ValidateSet('sketch', 'notes', 'backdrop')][string]$Kind, [int]$X = 40, [int]$Y = 40, [int]$W = 560, [int]$H = 420)
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 [System.Windows.Forms.Application]::EnableVisualStyles()
@@ -10,7 +10,13 @@ $form.Size = New-Object System.Drawing.Size($W, $H)
 $form.Font = New-Object System.Drawing.Font('Segoe UI', 13)
 $form.BackColor = [System.Drawing.Color]::White
 
-if ($Kind -eq 'sketch') {
+if ($Kind -eq 'backdrop') {
+    # A plain surface behind the demo windows, so nothing else on the screen gets recorded.
+    $form.Text = 'Backdrop'
+    $form.FormBorderStyle = 'None'
+    $form.ShowInTaskbar = $false
+    $form.BackColor = [System.Drawing.Color]::FromArgb(236, 234, 228)
+} elseif ($Kind -eq 'sketch') {
     $form.Text = 'Sketch'
     $canvas = New-Object System.Windows.Forms.Panel
     $canvas.Dock = 'Fill'
