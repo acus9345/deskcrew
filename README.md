@@ -97,7 +97,7 @@ Each client shows up as its own cursor, named from what the client calls itself 
 It has the same commands and replies, built on Mac parts:
 
 - Controls are read through the accessibility API and pressed with their own actions, such as `AXPress`, so a click works behind other windows without taking focus.
-- Clicks on points, drags, scrolls and keys are posted to the one app being worked on, so your pointer does not move and your front app keeps its keys. Apps that only take keys while in front get a field's text set instead.
+- Clicks on points, drags, scrolls and keys are posted to the one app being worked on, so your pointer does not move and your front app keeps its keys. Chrome, Electron apps and others that only take keys while in front get a named field's text put in letter by letter through accessibility instead, so they stay in the back.
 - Pictures come from the window itself, and text in parts with no controls is read with Apple's Vision.
 - Cursors are see-through windows ordered just above the agent's window, so your other windows can cover them.
 - Ctrl+Option+Esc stops every agent.
@@ -127,10 +127,12 @@ Run `deskcrew help` for every command. A background service starts itself on fir
 The Linux version is the newest and least tried. CI runs it on Ubuntu under Xvfb on every push, against a GTK window and against a toolkit-free test window (`examples/linux_form.rs`) on a bare accessibility bus.
 
 - Controls are read and pressed through AT-SPI, the accessibility bus GTK, Qt, Firefox, Chromium and LibreOffice speak, so `see`, `set`, `check`, `select` and pressing buttons work in the background, behind other windows, without the pointer. GTK apps take part once the bus is running. Qt apps need `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, and Chrome `--force-renderer-accessibility`.
-- Clicks on x,y points, keys, drags, drawing, scrolling and typing with no field named go through XTest. X has one pointer and one keyboard, so deskcrew brings the window forward for a moment, uses them, then puts the pointer and the front window back. On a virtual display no one notices; on a person's own desktop the pointer moves briefly.
+- Keys and typing go through XTest to the agent's window, which gets the keyboard for a moment without being raised: X keeps the keyboard focus apart from which window is on top, so your window stays in front. This also reaches apps that ignore keys while behind others, such as Chrome. Anything you type during those moments goes to the agent's window.
+- Clicks on x,y points, drags, drawing and scrolling use the X pointer, so deskcrew brings the window forward for a moment, uses it, then puts the pointer and the front window back. On a virtual display no one notices; on a person's own desktop the pointer moves briefly.
 - The window list comes from the window manager, or straight from the X server on a bare Xvfb with none.
 - The accessibility bus is the one `AT_SPI_BUS_ADDRESS` or the display names, or else the one at-spi2-core starts. Without at-spi2-core's registry, deskcrew finds the apps on the bus itself.
-- There are no drawn cursors per agent on Linux yet, and no `table`, `pick-file` or `notifications`. The clipboard needs `xclip` or `xsel`.
+- Each agent has its drawn cursor, as on Windows and the Mac. Its edges are smooth with a compositor, and cut to its outline on a bare Xvfb. The name is drawn in Liberation Sans Bold, or DejaVu Sans Bold, whichever is installed. deskcrew's own shots leave the cursors out.
+- There are no `table`, `pick-file` or `notifications` on Linux yet, and no typing caret: the name tag pulses instead. The clipboard needs `xclip` or `xsel`.
 
 To try it on a virtual display:
 
@@ -370,6 +372,7 @@ desk-pilot always moved your real pointer; deskcrew only does with `--real` or `
 - Keyboard shortcuts need `--real`, because they have to go to the window in front. While a `--real` action runs, anything you type goes to that window.
 - Text boxes drawn by XAML take `set`, but `type` needs `--real`.
 - Browser and Electron windows are clicked, typed into, set and drawn in by window messages, covered or not, because accessibility makes them pull their window over yours. A covered browser stops repainting, so `shot` can show an old picture of it until it is uncovered.
+- Chromium on Windows takes keys only while it is the active window, and Windows always brings the active window forward. So typing into a browser or Electron app in the back may need `--real`, which brings it forward for the typing and gives the front back. Every other route was tried: window messages, faked activation and focus, and accessibility, which pulls the window forward on every letter. The Mac and Linux versions do not have this limit.
 - Windows of the same browser share one process, and activate each other when worked at the same time, which loses input. Parallel agents need separate apps or separate browser profiles.
 - Rich text boxes, such as Notepad's, need `--real`.
 - The pen needs the window in front, so a `draw` borrows your focus for as long as it runs.
