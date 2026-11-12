@@ -60,7 +60,11 @@ fn main() {
             let number = |flag: &str, default: u64| {
                 args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(default)
             };
-            demo::run(number("--seconds", 12), number("--linger", 0));
+            if args.iter().any(|a| a == "--typing") {
+                demo::typing();
+            } else {
+                demo::run(number("--seconds", 12), number("--linger", 0));
+            }
         }
         Some("--version") => println!("deskcrew {}", env!("CARGO_PKG_VERSION")),
         None | Some("help" | "--help" | "-h") => println!("{}

@@ -257,7 +257,7 @@ unsafe extern "C" {
 unsafe extern "C" {
     pub static kCTFontAttributeName: CFStringRef;
     pub static kCTForegroundColorFromContextAttributeName: CFStringRef;
-    pub fn CTFontCreateUIFontForLanguage(kind: u32, size: f64, language: CFStringRef) -> CFTypeRef;
+    pub fn CTFontCreateWithName(name: CFStringRef, size: f64, matrix: *const std::ffi::c_void) -> CFTypeRef;
     pub fn CTLineCreateWithAttributedString(text: CFTypeRef) -> CFTypeRef;
     pub fn CTLineGetTypographicBounds(line: CFTypeRef, ascent: *mut f64, descent: *mut f64, leading: *mut f64) -> f64;
     pub fn CTLineDraw(line: CFTypeRef, context: CGContextRef);

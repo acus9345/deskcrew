@@ -614,6 +614,8 @@ pub fn type_text(text: &str, stop: &dyn Fn() -> bool) -> Result<usize, String> {
         }
         tap(x, &map, keysym_of(c), &[])?;
         typed += 1;
+        // A tap already waits a moment; the rest of the gap keeps the typing speed.
+        thread::sleep(crate::motion::KEY_EVERY.saturating_sub(KEY_GAP));
     }
     Ok(typed)
 }

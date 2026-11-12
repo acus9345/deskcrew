@@ -325,6 +325,10 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
 const CONTAINERS: [&str; 8] = ["list", "tree", "table", "menu", "tabs", "toolbar", "pane", "group"];
 // A change thinner than this is a blinking caret, not a result.
 const LEAST_CHANGE: u32 = 4;
+/// How often a caret is looked for while typing into a control that is not a classic edit box.
+const CARET_WATCH: Duration = Duration::from_millis(15);
+/// The longest a caret waits for a typed letter to land in its box.
+const CARET_SETTLE: Duration = Duration::from_millis(30);
 const MARKED: [&str; 11] = ["button", "edit", "menuitem", "checkbox", "radio", "combobox", "tab", "item", "link", "slider", "spinner"];
 
 fn expected(flags: &Flags) -> Option<Vec<String>> {
@@ -582,7 +586,18 @@ impl Service {
             };
             match held {
                 Some((guard, pids)) => {
-                    guard.restore(&pids);
+                    // A window of the app the person picks themself becomes theirs; anything the
+                    // app pulls forward on its own goes back behind.
+                    match guard.chosen(&pids) {
+                        Some(theirs) => {
+                            let mut home = self.home.lock().unwrap();
+                            home.guard = Some(FocusGuard::of(theirs));
+                            home.person = Some(theirs);
+                        }
+                        None => {
+                            guard.restore(&pids);
+                        }
+                    }
                     thread::sleep(FOCUS_WATCH);
                 }
                 None if self.home.lock().unwrap().on_loan => thread::sleep(FOCUS_WATCH),
@@ -973,6 +988,7 @@ impl Service {
         let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.value || n.can.range)? else { return Err("set needs a control".into()) };
         let (node, rect) = self.locate(id, tracked, view)?;
         self.cursor_on(who, flags, rect);
+        self.overlay.typing(who, value.chars().count());
         if flags.real {
             let (x, y) = act::centre(rect);
             let all = real::chord("ctrl+a")?;
@@ -1036,48 +1052,117 @@ impl Service {
             hwnd = act::native_window(&node, tracked.hwnd);
             field = Some(node);
         }
-        if flags.real {
-            let points: Vec<(i32, i32)> = place.into_iter().collect();
-            return self.with_front(tracked, view, &points, || {
-                if let Some((x, y)) = place {
-                    press_at(tracked.hwnd, x, y, flags)?;
-                }
-                if !real::type_text(text, tracked.hwnd, &view.surfaces, &self.stop)? {
-                    return Err(STOPPED.to_string());
-                }
-                Ok("keyboard".to_string())
-            })?;
-        }
-        if let (Some((x, y)), true) = (place, win::is_chromium(tracked.hwnd)) {
-            // The page has to know which field has focus, and a click inside it says so.
-            act::post_click(tracked.hwnd, x, y, false, false)?;
-            thread::sleep(FIELD_SETTLE);
-            // Every window of a browser shares a thread, so "the focused window" could be another
-            // agent's. This field's own window keeps the text here.
-            let before = field.as_ref().filter(|node| node.can.value).map(|node| node.element.value_text());
-            let route = act::post_text(win::child_at(tracked.hwnd, x, y).0, text, &self.stop)?;
-            // Chromium can drop characters while its window is not active, and says nothing. A
-            // field that can be read is read back, and set directly if the text did not land.
-            if let (Some(before), Some(node)) = (before, &field) {
-                let wanted = format!("{before}{text}");
-                let until = Instant::now() + TYPE_CHECK;
-                while node.element.value_text() != wanted && Instant::now() < until {
-                    thread::sleep(SETTLE_STEP);
-                }
-                if node.element.value_text() != wanted {
-                    return act::set(node, tracked.hwnd, &wanted);
-                }
+        // A classic edit box follows its caret exactly as each letter goes in; anything else that
+        // says where its caret is gets watched while the text goes in.
+        let classic = hwnd.and_then(win::caret_in).is_some();
+        let watched = (!classic).then(|| field.as_ref().map(|node| node.element.clone()));
+        self.watching_caret(who, tracked.hwnd, watched, || {
+            if hwnd.and_then(win::caret_in).is_none() {
+                self.overlay.typing(who, text.chars().count());
             }
-            return Ok(route);
-        }
-        match (target, hwnd) {
-            (Some(_), None) => Err(NEEDS_REAL.into()),
-            (Some(_), Some(hwnd)) => act::post_text(hwnd, text, &self.stop),
-            (None, _) if win::is_chromium(tracked.hwnd) => act::post_text(tracked.hwnd, text, &self.stop),
-            (None, _) => act::post_text(win::keyboard_target(tracked.hwnd), text, &self.stop),
-        }
+            if flags.real {
+                let points: Vec<(i32, i32)> = place.into_iter().collect();
+                let to_end = real::chord("ctrl+end")?;
+                return self.with_front(tracked, view, &points, || {
+                    if let Some((x, y)) = place {
+                        press_at(tracked.hwnd, x, y, flags)?;
+                        // A click lands mid-text; typing adds to the end, as it does without --real.
+                        real::press_chord(&to_end);
+                    }
+                    if !real::type_text(text, tracked.hwnd, &view.surfaces, &self.stop)? {
+                        return Err(STOPPED.to_string());
+                    }
+                    Ok("keyboard".to_string())
+                })?;
+            }
+            if let (Some((x, y)), true) = (place, win::is_chromium(tracked.hwnd)) {
+                // The page has to know which field has focus, and a click inside it says so.
+                act::post_click(tracked.hwnd, x, y, false, false)?;
+                thread::sleep(FIELD_SETTLE);
+                // Every window of a browser shares a thread, so "the focused window" could be another
+                // agent's. This field's own window keeps the text here.
+                let before = field.as_ref().filter(|node| node.can.value).map(|node| node.element.value_text());
+                let route = act::post_text(win::child_at(tracked.hwnd, x, y).0, text, &self.stop)?;
+                // Chromium can drop characters while its window is not active, and says nothing. A
+                // field that can be read is read back, and set directly if the text did not land.
+                if let (Some(before), Some(node)) = (before, &field) {
+                    let wanted = format!("{before}{text}");
+                    let until = Instant::now() + TYPE_CHECK;
+                    while node.element.value_text() != wanted && Instant::now() < until {
+                        thread::sleep(SETTLE_STEP);
+                    }
+                    if node.element.value_text() != wanted {
+                        return act::set(node, tracked.hwnd, &wanted);
+                    }
+                }
+                return Ok(route);
+            }
+            // In a classic edit box the cursor turns into a caret that follows the text in. It moves to
+            // where each letter will end just before the letter goes in, so it is never behind. A
+            // posted letter lands a moment later, so the box is given time to take the last one first.
+            let mut last: Option<Option<usize>> = None;
+            let follow = |box_hwnd: Hwnd, letter: u16| {
+                let until = Instant::now() + CARET_SETTLE;
+                while last.is_some_and(|was| win::caret_index(box_hwnd) == was) && Instant::now() < until {
+                    thread::sleep(Duration::from_millis(1));
+                }
+                last = Some(win::caret_index(box_hwnd));
+                let Some((x, y, h)) = win::caret_in(box_hwnd) else { return };
+                let ahead = if letter == 10 { 0 } else { win::letter_width(box_hwnd, letter).unwrap_or(0) };
+                self.overlay.caret(who, x + ahead, y, h);
+            };
+            match (target, hwnd) {
+                (Some(_), None) => Err(NEEDS_REAL.into()),
+                (Some(_), Some(hwnd)) => act::post_text_watched(hwnd, text, &self.stop, follow),
+                (None, _) if win::is_chromium(tracked.hwnd) => act::post_text(tracked.hwnd, text, &self.stop),
+                (None, _) => act::post_text_watched(win::keyboard_target(tracked.hwnd), text, &self.stop, follow),
+            }
+    
+        })
     }
 
+
+    /// Run some typing while the agent's cursor shows as a caret wherever the control says its caret
+    /// is: `Some(None)` watches whatever has focus in the window, `None` watches nothing.
+    fn watching_caret(&self, who: &str, window: Hwnd, control: Option<Option<uia::Element>>, work: impl FnOnce() -> Reply) -> Reply {
+        let Some(control) = control else { return work() };
+        let done = AtomicBool::new(false);
+        thread::scope(|scope| {
+            scope.spawn(|| {
+                uia::enter_com();
+                let mut shown = None;
+                loop {
+                    let finished = done.load(Ordering::Relaxed);
+                    // A named control gets text added at its end; otherwise the focused one's caret.
+                    let place = match &control {
+                        Some(element) => {
+                            // Its own caret when it has one inside it, else the end of its text,
+                            // kept within its edges when the text runs past them.
+                            let bounds = element.rect().ok();
+                            let inside = |&(x, y, _): &(i32, i32, i32)| bounds.is_none_or(|(bx, by, bw, bh)| x >= bx && x <= bx + bw && y >= by - 2 && y <= by + bh);
+                            let clamp = |(x, y, h): (i32, i32, i32)| match bounds {
+                                Some((bx, _, bw, _)) => (x.clamp(bx, bx + bw - 4), y, h),
+                                None => (x, y, h),
+                            };
+                            element.caret().filter(inside).or_else(|| element.text_end()).map(clamp)
+                        }
+                        None => self.uia.focused_in(window).and_then(|element| element.caret()),
+                    };
+                    if let Some((x, y, h)) = place.filter(|&at| Some(at) != shown) {
+                        self.overlay.caret(who, x, y, h);
+                        shown = Some((x, y, h));
+                    }
+                    if finished {
+                        break;
+                    }
+                    thread::sleep(CARET_WATCH);
+                }
+            });
+            let reply = work();
+            done.store(true, Ordering::Relaxed);
+            reply
+        })
+    }
     fn key(&self, flags: &Flags, tracked: &Tracked, view: &View, spec: &str) -> Reply {
         if real::is_risky(spec) && !flags.force {
             return Err(format!("{spec} is refused: it can end the session or open the shell (--force to allow)"));

@@ -7,8 +7,9 @@ use tiny_skia::Pixmap;
 use windows_sys::Win32::{
     Foundation::{HWND, POINT, SIZE},
     Graphics::Gdi::{
-        BITMAPINFO, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, CreateFontW, DIB_RGB_COLORS, DeleteDC,
-        DeleteObject, GdiFlush, GetTextExtentPoint32W, HBITMAP, HDC, SelectObject, SetBkMode, SetTextColor, TextOutW,
+        BITMAPINFO, BLENDFUNCTION, CreateCompatibleDC, CreateDIBSection, CreateFontW, DIB_RGB_COLORS,
+        DeleteDC, DeleteObject, GdiFlush, GetTextExtentPoint32W, HBITMAP, HDC, HFONT, SelectObject, SetBkMode,
+        SetTextColor, TextOutW,
     },
     System::LibraryLoader::GetModuleHandleW,
     UI::WindowsAndMessaging::{
@@ -19,7 +20,7 @@ use windows_sys::Win32::{
 };
 
 const CLASS: &[u16] = &[100, 101, 115, 107, 99, 114, 101, 119, 0]; // "deskcrew"
-const FONT: &str = "Segoe UI Semibold";
+const FONT: &str = "Arial";
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -84,9 +85,13 @@ impl Drop for Surface {
 
 /// Measure and draw a line of text white on black, and keep the coverage.
 pub fn text_mask(text: &str, px: i32) -> Mask {
+    coverage(text, unsafe { CreateFontW(-px, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 4, 0, wide(FONT).as_ptr()) })
+}
+
+/// The coverage of text drawn in this font, which it then deletes.
+fn coverage(text: &str, font: HFONT) -> Mask {
     let line: Vec<u16> = text.encode_utf16().collect();
     unsafe {
-        let font = CreateFontW(-px, 0, 0, 0, 400, 0, 0, 0, 1, 0, 0, 4, 0, wide(FONT).as_ptr());
         let probe = CreateCompatibleDC(null_mut());
         let old = SelectObject(probe, font);
         let mut size: SIZE = zeroed();
@@ -140,6 +145,15 @@ impl Layer {
 
     /// Swap in a new picture of the same size, for an animation drawn frame by frame.
     pub fn repaint(&self, picture: &Pixmap) {
+        self.surface.paint(picture);
+    }
+
+    /// Swap in a picture of any size.
+    pub fn reshape(&mut self, picture: &Pixmap) {
+        let (w, h) = (picture.width() as i32, picture.height() as i32);
+        if (w, h) != (self.surface.w, self.surface.h) {
+            self.surface = Surface::new(w, h);
+        }
         self.surface.paint(picture);
     }
 

@@ -31,7 +31,6 @@ use windows_sys::Win32::{
 const ARRIVE: Duration = Duration::from_millis(25);
 const PRESS: Duration = Duration::from_millis(40);
 const HOLD_LIMIT: Duration = Duration::from_secs(30);
-const KEY_GAP: Duration = Duration::from_millis(6);
 /// A window just brought forward drops the first press if it comes too soon.
 const FOCUS_SETTLE: Duration = Duration::from_millis(350);
 /// Input already sent still has to reach the app before focus can move away from it.
@@ -338,7 +337,7 @@ pub fn type_text(text: &str, root: Hwnd, surfaces: &[Hwnd], stop: &AtomicBool) -
             send(&[key(0, unit, KEYEVENTF_UNICODE)]);
             send(&[key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]);
         }
-        thread::sleep(KEY_GAP);
+        thread::sleep(crate::motion::KEY_EVERY);
     }
     Ok(true)
 }

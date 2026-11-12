@@ -113,6 +113,32 @@ unsafe fn runtime_id(el: &IUIAutomationElement) -> Vec<i32> {
     }
 }
 
+/// The rectangles a text range covers on the screen, as left, top, width and height.
+fn rects_of(range: &IUIAutomationTextRange) -> Vec<(i32, i32, i32, i32)> {
+    unsafe {
+        let Ok(array) = range.GetBoundingRectangles() else { return Vec::new() };
+        if array.is_null() {
+            return Vec::new();
+        }
+        let mut numbers: Vec<f64> = Vec::new();
+        if let (Ok(low), Ok(high)) = (SafeArrayGetLBound(array, 1), SafeArrayGetUBound(array, 1)) {
+            let mut data = std::ptr::null_mut();
+            if SafeArrayAccessData(array, &mut data).is_ok() {
+                numbers.extend_from_slice(std::slice::from_raw_parts(data as *const f64, (high - low + 1).max(0) as usize));
+                let _ = SafeArrayUnaccessData(array);
+            }
+        }
+        let _ = SafeArrayDestroy(array);
+        numbers
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|r| (r[0].round() as i32, r[1].round() as i32, r[2].round() as i32, r[3].round() as i32))
+            .filter(|r| r.3 > 0)
+            .collect()
+    }
+}
+
 fn rect_of(r: RECT) -> (i32, i32, i32, i32) {
     (r.left, r.top, r.right - r.left, r.bottom - r.top)
 }
@@ -127,6 +153,14 @@ fn say(error: windows::core::Error) -> String {
 }
 
 impl Uia {
+    /// The control with keyboard focus, if it belongs to this window's program.
+    pub fn focused_in(&self, hwnd: Hwnd) -> Option<Element> {
+        unsafe {
+            let element = self.auto.GetFocusedElement().ok()?;
+            (element.CurrentProcessId().ok()? as u32 == crate::win::pid(hwnd)).then_some(Element(element))
+        }
+    }
+
     pub fn new() -> Result<Uia, String> {
         unsafe {
             let auto: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).map_err(say)?;
@@ -515,6 +549,54 @@ pub struct Table {
 }
 
 impl Element {
+    /// Where this control's text ends, as a caret's top left on the screen and its height: where
+    /// typed text goes in. An empty control puts it at its left edge.
+    pub fn text_end(&self) -> Option<(i32, i32, i32)> {
+        unsafe {
+            let pattern = self.0.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).ok()?;
+            let all = pattern.DocumentRange().ok()?;
+            if let Some(&(left, top, width, height)) = rects_of(&all).last() {
+                return Some((left + width, top, height));
+            }
+            let (x, y, _, h) = self.rect().ok()?;
+            Some((x + h / 4, y + h / 5, (h * 3 / 5).max(8)))
+        }
+    }
+
+    /// Where the text caret sits in this control, as its top left on the screen and its height.
+    /// The caret is an empty range with no size, so the letter after it is measured, or failing
+    /// that, at the end of the text, the letter before it.
+    pub fn caret(&self) -> Option<(i32, i32, i32)> {
+        unsafe {
+            let range = match self.0.GetCurrentPatternAs::<IUIAutomationTextPattern2>(UIA_TextPattern2Id) {
+                Ok(newer) => {
+                    let mut active = windows::core::BOOL(0);
+                    newer.GetCaretRange(&mut active).ok()?
+                }
+                Err(_) => {
+                    let pattern = self.0.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).ok()?;
+                    let chosen = pattern.GetSelection().ok()?;
+                    if chosen.Length().ok()? < 1 {
+                        return None;
+                    }
+                    chosen.GetElement(0).ok()?
+                }
+            };
+            let after = range.Clone().ok()?;
+            let _ = after.MoveEndpointByRange(TextPatternRangeEndpoint_Start, &range, TextPatternRangeEndpoint_End);
+            if after.MoveEndpointByUnit(TextPatternRangeEndpoint_End, TextUnit_Character, 1).unwrap_or(0) == 1
+                && let Some(&(left, top, _, height)) = rects_of(&after).first()
+            {
+                return Some((left, top, height));
+            }
+            let before = range.Clone().ok()?;
+            let _ = before.MoveEndpointByRange(TextPatternRangeEndpoint_End, &range, TextPatternRangeEndpoint_Start);
+            before.MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -1).ok()?;
+            let &(left, top, width, height) = rects_of(&before).last()?;
+            Some((left + width, top, height))
+        }
+    }
+
     pub fn rect(&self) -> Result<(i32, i32, i32, i32), String> {
         unsafe { self.0.CurrentBoundingRectangle().map(rect_of).map_err(say) }
     }

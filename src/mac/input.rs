@@ -136,7 +136,7 @@ pub fn type_text(to: To, text: &str, stop: &dyn Fn() -> bool) -> Result<usize, S
             post(to, event)?;
         }
         sent += piece.len();
-        thread::sleep(KEY_GAP);
+        thread::sleep(crate::motion::KEY_EVERY * piece.len() as u32);
     }
     Ok(String::from_utf16_lossy(&units[..sent]).chars().count())
 }

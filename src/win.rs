@@ -604,6 +604,40 @@ impl FocusGuard {
     }
 }
 
+impl FocusGuard {
+    /// The window the person has just switched to themself, when it belongs to the app agents work
+    /// in: clicked on it or its taskbar button, or reached it with Alt or the Windows key. It is
+    /// theirs from then on, to use and move, and is not taken away from them.
+    pub fn chosen(&self, target_pids: &[u32]) -> Option<Hwnd> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, WindowFromPoint};
+        let now = foreground();
+        let outer = unsafe { GetAncestor(raw(now), GA_ROOT) } as Hwnd;
+        let theirs = if outer != 0 { outer } else { now };
+        if now == 0 || now == self.front || outer == self.front {
+            return None;
+        }
+        if !target_pids.contains(&pid(now)) && !target_pids.contains(&content_pid(now)) {
+            return None;
+        }
+        let held = |keys: &[u16]| keys.iter().any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0);
+        if held(&[VK_MENU, VK_LWIN, VK_RWIN]) {
+            return Some(theirs);
+        }
+        if !held(&[VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]) {
+            return None;
+        }
+        // The press has to be on that window, or on the taskbar that switches to it: a button
+        // held down somewhere else while an app jumps forward is not a choice.
+        let mut point = POINT { x: 0, y: 0 };
+        let under = unsafe {
+            GetCursorPos(&mut point);
+            GetAncestor(WindowFromPoint(point), GA_ROOT) as Hwnd
+        };
+        (under == theirs || matches!(class(under).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(theirs)
+    }
+}
+
 /// The person is pressing a mouse button, or holding Alt or the Windows key to switch apps.
 fn person_switching() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
@@ -614,3 +648,115 @@ pub fn lparam(x: i32, y: i32) -> LPARAM {
     (((y as u32 & 0xFFFF) << 16) | (x as u32 & 0xFFFF)) as i32 as LPARAM
 }
 
+
+/// Where the next letter goes in a classic edit box, as the caret's top left on the screen and its
+/// height. The box need not have focus. None for other kinds of field.
+pub fn caret_in(hwnd: Hwnd) -> Option<(i32, i32, i32)> {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::{ClientToScreen, CreateFontIndirectW, DeleteObject, GetDC, GetObjectW, GetTextExtentPoint32W, HFONT, LOGFONTW, ReleaseDC, SelectObject};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WM_GETTEXT, WM_GETTEXTLENGTH};
+    const LINE_PER_EM: f32 = 1.33;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW};
+    const EM_GETSEL: u32 = 0x00B0;
+    const EM_POSFROMCHAR: u32 = 0x00D6;
+    const WM_GETFONT: u32 = 0x0031;
+    let kind = class(hwnd).to_lowercase();
+    if kind != "edit" && !kind.contains(".edit.") {
+        return None;
+    }
+    let ask = |message: u32, wparam: usize| -> Option<isize> {
+        let mut result = 0;
+        let sent = unsafe { SendMessageTimeoutW(raw(hwnd), message, wparam, 0, SMTO_ABORTIFHUNG, 200, &mut result) };
+        (sent != 0).then_some(result as isize)
+    };
+    let selection = ask(EM_GETSEL, 0)?;
+    let end = ((selection >> 16) & 0xFFFF) as usize;
+    let unpack = |packed: isize| ((packed & 0xFFFF) as i16 as i32, ((packed >> 16) & 0xFFFF) as i16 as i32);
+    // The box's font belongs to its own program, so its size is read rather than measured.
+    let font = ask(WM_GETFONT, 0).unwrap_or(0);
+    let mut logfont: LOGFONTW = unsafe { zeroed() };
+    let read = unsafe { GetObjectW(font as HFONT, size_of::<LOGFONTW>() as i32, (&mut logfont as *mut LOGFONTW).cast()) };
+    let em = if read > 0 && logfont.lfHeight != 0 { logfont.lfHeight.abs() } else { 16 };
+    // A negative size is the letters' own height; the caret spans the whole line around them.
+    let height = if logfont.lfHeight < 0 { (em as f32 * LINE_PER_EM).round() as i32 } else { em };
+    // The last letter's width, measured in the box's font, for a caret just past it.
+    let last_width = |index: usize| -> i32 {
+        let mut text = [0u16; 2];
+        let mut result = 0;
+        // EM_GETLINE can't pick one letter, so the whole text is read and the letter picked out.
+        let length = unsafe { SendMessageTimeoutW(raw(hwnd), WM_GETTEXTLENGTH, 0, 0, SMTO_ABORTIFHUNG, 200, &mut result) };
+        if length == 0 || result == 0 {
+            return em / 2;
+        }
+        let mut all = vec![0u16; result + 1];
+        let mut got = 0;
+        unsafe { SendMessageTimeoutW(raw(hwnd), WM_GETTEXT, all.len(), all.as_mut_ptr() as isize, SMTO_ABORTIFHUNG, 200, &mut got) };
+        let Some(&letter) = all.get(index) else { return em / 2 };
+        text[0] = letter;
+        unsafe {
+            let made = CreateFontIndirectW(&logfont);
+            let dc = GetDC(null_mut());
+            let old = SelectObject(dc, made);
+            let mut size: SIZE = zeroed();
+            GetTextExtentPoint32W(dc, text.as_ptr(), 1, &mut size);
+            SelectObject(dc, old);
+            ReleaseDC(null_mut(), dc);
+            DeleteObject(made);
+            if size.cx > 0 { size.cx } else { em / 2 }
+        }
+    };
+    // Past the last letter a box may not answer, so the last letter's place and width stand in.
+    let (x, y) = match ask(EM_POSFROMCHAR, end).filter(|&at| at != -1) {
+        Some(at) => unpack(at),
+        None if end > 0 => {
+            let (x, y) = unpack(ask(EM_POSFROMCHAR, end - 1).filter(|&at| at != -1)?);
+            (x + last_width(end - 1), y)
+        }
+        None => (2, 2),
+    };
+    // A window Windows enlarges for a high-DPI screen answers in its own small units: the corner is
+    // found on the screen, and the rest scaled up from there.
+    let scale = app_scale(hwnd);
+    let mut corner = POINT { x: 0, y: 0 };
+    unsafe { ClientToScreen(raw(hwnd), &mut corner) };
+    let grow = |n: i32| (n as f32 * scale).round() as i32;
+    Some((corner.x + grow(x), corner.y + grow(y), grow(height.max(8))))
+}
+
+
+/// Where the caret is in a classic edit box, counted in letters, or None for other fields.
+pub fn caret_index(hwnd: Hwnd) -> Option<usize> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW};
+    const EM_GETSEL: u32 = 0x00B0;
+    let mut result = 0;
+    let sent = unsafe { SendMessageTimeoutW(raw(hwnd), EM_GETSEL, 0, 0, SMTO_ABORTIFHUNG, 200, &mut result) };
+    (sent != 0).then_some((result >> 16) & 0xFFFF)
+}
+
+/// How wide one letter is in a classic edit box's font, in screen pixels.
+pub fn letter_width(hwnd: Hwnd, letter: u16) -> Option<i32> {
+    use windows_sys::Win32::Foundation::SIZE;
+    use windows_sys::Win32::Graphics::Gdi::{CreateFontIndirectW, DeleteObject, GetDC, GetObjectW, GetTextExtentPoint32W, HFONT, LOGFONTW, ReleaseDC, SelectObject};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW};
+    const WM_GETFONT: u32 = 0x0031;
+    let mut font = 0;
+    if unsafe { SendMessageTimeoutW(raw(hwnd), WM_GETFONT, 0, 0, SMTO_ABORTIFHUNG, 200, &mut font) } == 0 {
+        return None;
+    }
+    let mut logfont: LOGFONTW = unsafe { zeroed() };
+    if unsafe { GetObjectW(font as HFONT, size_of::<LOGFONTW>() as i32, (&mut logfont as *mut LOGFONTW).cast()) } == 0 {
+        return None;
+    }
+    let width = unsafe {
+        let made = CreateFontIndirectW(&logfont);
+        let dc = GetDC(null_mut());
+        let old = SelectObject(dc, made);
+        let mut size: SIZE = zeroed();
+        GetTextExtentPoint32W(dc, &letter, 1, &mut size);
+        SelectObject(dc, old);
+        ReleaseDC(null_mut(), dc);
+        DeleteObject(made);
+        size.cx
+    };
+    Some((width as f32 * app_scale(hwnd)).round() as i32)
+}

@@ -17,10 +17,11 @@ use std::time::{Duration, Instant};
 
 const FRAME: Duration = Duration::from_millis(16);
 const RESTACK_EVERY: Duration = Duration::from_millis(100);
-const LABEL_PX: f64 = 12.0;
+const LABEL_PX: f64 = 11.0;
 const PRESS_LINGER_MS: f32 = 450.0;
 const IMAGE_ALPHA_LAST: u32 = 1;
-const UI_FONT_SYSTEM: u32 = 2;
+/// The name tag's font, as on Windows; CoreText falls back to Helvetica without it.
+const LABEL_FONT: &str = "Arial-BoldMT";
 const BEHAVIOUR: usize = 1 | 16 | 64 | 256;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
@@ -35,6 +36,7 @@ pub enum Command {
     Move { agent: String, x: i32, y: i32, instant: bool, done: Option<Sender<()>> },
     Over { agent: String, window: u32 },
     Press { agent: String, target: Rect },
+    Type { agent: String, keys: usize },
     Aside(bool),
 }
 
@@ -69,6 +71,11 @@ impl Overlay {
         let _ = self.commands.send(Command::Press { agent: agent.into(), target });
     }
 
+    /// Pulse this agent's name tag as it types this many keys.
+    pub fn typing(&self, agent: &str, keys: usize) {
+        let _ = self.commands.send(Command::Type { agent: agent.into(), keys });
+    }
+
     /// Hide every cursor while the screen is copied.
     pub fn aside(&self, on: bool) {
         let _ = self.commands.send(Command::Aside(on));
@@ -76,10 +83,11 @@ impl Overlay {
     }
 }
 
-/// White text on nothing, as coverage, in the system font.
+/// White text on nothing, as coverage, in the name tag's font.
 pub fn text_mask(text: &str, px: f64) -> Mask {
     unsafe {
-        let font = Owned::new(CTFontCreateUIFontForLanguage(UI_FONT_SYSTEM, px, null()));
+        let name = cf_string(LABEL_FONT);
+        let font = Owned::new(CTFontCreateWithName(name.0, px, null()));
         let Some(font) = font else { return Mask { w: 1, h: 1, alpha: vec![0] } };
         let attributes = dictionary_of(&[kCTFontAttributeName, kCTForegroundColorFromContextAttributeName], &[font.0, kCFBooleanTrue]);
         let string = cf_string(text);
@@ -207,6 +215,9 @@ struct Glide {
 
 struct Agent {
     colour: Rgb,
+    label: Mask,
+    pose: motion::Pose,
+    look: (i32, i32),
     layer: Layer,
     tip: (f64, f64),
     at: motion::Point,
@@ -257,13 +268,13 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                         let entry = agents.entry(agent.clone()).or_insert_with(|| {
                             let colour = motion::colour_for(&agent, &taken);
                             let mut layer = Layer::new();
-                            let mask = text_mask(&agent, LABEL_PX * scale);
+                            let label = text_mask(&agent, LABEL_PX * scale);
                             let mut tip = (0.0, 0.0);
-                            if let Some((picture, tx, ty)) = draw::cursor(colour, &mask, scale as f32) {
+                            if let Some((picture, tx, ty)) = draw::posed(colour, &label, scale as f32, 0.0, 1.0) {
                                 tip = (tx as f64 / scale, ty as f64 / scale);
                                 layer.show(&picture, scale, x as f64 - tip.0, y as f64 - tip.1, screen_h);
                             }
-                            Agent { colour, layer, tip, at: (x as f32, y as f32), glide: None, above: 0, side }
+                            Agent { colour, label, pose: motion::Pose::new(), look: (0, 0), layer, tip, at: (x as f32, y as f32), glide: None, above: 0, side }
                         });
                         let to = (x as f32, y as f32);
                         if instant {
@@ -295,6 +306,11 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                             presses.push(Press { colour: entry.colour, target, layer: Layer::new(), started: Instant::now(), above: entry.above });
                         }
                     }
+                    Command::Type { agent, keys } => {
+                        if let Some(entry) = agents.get_mut(&agent) {
+                            entry.pose.type_keys(Instant::now(), keys);
+                        }
+                    }
                     Command::Aside(on) => {
                         aside = on;
                         for agent in agents.values() {
@@ -303,16 +319,32 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                     }
                 }
             }
+            let now = Instant::now();
             for agent in agents.values_mut() {
-                let Some(glide) = &mut agent.glide else { continue };
-                let t = (glide.started.elapsed().as_millis() as f32 / glide.ms.max(1) as f32).min(1.0);
-                agent.at = motion::along(glide.from, glide.middle, glide.to, motion::ease(t));
-                agent.layer.place(agent.at.0 as f64 - agent.tip.0, agent.at.1 as f64 - agent.tip.1, screen_h);
-                if t >= 1.0 {
-                    if let Some(done) = glide.done.take() {
-                        let _ = done.send(());
+                let mut moved = false;
+                if let Some(glide) = &mut agent.glide {
+                    let t = (glide.started.elapsed().as_millis() as f32 / glide.ms.max(1) as f32).min(1.0);
+                    agent.at = motion::along(glide.from, glide.middle, glide.to, motion::ease(t));
+                    moved = true;
+                    if t >= 1.0 {
+                        if let Some(done) = glide.done.take() {
+                            let _ = done.send(());
+                        }
+                        agent.glide = None;
                     }
-                    agent.glide = None;
+                }
+                // Points are already a 100% screen's pixels, so the lean needs no rescaling.
+                agent.pose.follow(now, agent.at, 1.0);
+                let (left, top) = (agent.at.0 as f64 - agent.tip.0, agent.at.1 as f64 - agent.tip.1);
+                let look = agent.pose.look(now);
+                if look != agent.look {
+                    agent.look = look;
+                    let (lean, squeeze) = agent.pose.shown(now);
+                    if let Some((picture, _, _)) = draw::posed(agent.colour, &agent.label, scale as f32, lean, squeeze) {
+                        agent.layer.show(&picture, scale, left, top, screen_h);
+                    }
+                } else if moved {
+                    agent.layer.place(left, top, screen_h);
                 }
             }
             presses.retain_mut(|press| {

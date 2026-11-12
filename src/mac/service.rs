@@ -584,6 +584,7 @@ impl Service {
         if !ax::settable(&element, "AXValue") {
             return Err("that control's text can't be set: try type".into());
         }
+        self.overlay.typing(who, value.chars().count());
         ax::set_text(&element, value)?;
         self.pressed(who, rect);
         Ok("value".into())
@@ -673,6 +674,7 @@ impl Service {
             let _ = ax::focus(&element);
             field = Some(element);
         }
+        self.overlay.typing(who, text.chars().count());
         if flags.paste {
             let saved = apps::clipboard();
             apps::set_clipboard(Some(text))?;

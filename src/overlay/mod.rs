@@ -6,7 +6,7 @@ mod layer;
 use crate::motion::{self, Point, Rgb};
 use crate::real;
 use crate::win::Hwnd;
-use draw::{PRESS_SETTLE_MS, cursor, outline_margin, press};
+use draw::{Mask, PRESS_SETTLE_MS, caret, outline_margin, posed, press};
 use layer::{Layer, text_mask};
 use std::{
     mem::zeroed,
@@ -48,7 +48,9 @@ const REST_FADE_MS: f32 = 160.0;
 const ARRIVE_FROM: f32 = 90.0;
 const APPEAR_MS: f32 = 140.0;
 const SHIELD_LINGER: Duration = Duration::from_millis(30);
-const LABEL_PIXELS: f32 = 12.5;
+/// The longest typing waits for its caret to reach the screen.
+const CARET_WAIT: Duration = Duration::from_millis(50);
+const LABEL_PIXELS: f32 = 11.0;
 const WH_MOUSE_LL: i32 = 14;
 const LLMHF_INJECTED: u32 = 1;
 
@@ -82,6 +84,8 @@ enum Command {
     Jump { agent: String, to: Point },
     Over { agent: String, window: Hwnd },
     Press { agent: String, target: Rect },
+    Type { agent: String, keys: usize },
+    Caret { agent: String, x: i32, y: i32, h: i32, shown: Sender<()> },
     Aside { on: bool, cleared: Sender<()> },
     Shield { on: bool, ready: Sender<()> },
     Quit,
@@ -170,6 +174,20 @@ impl Overlay {
         self.send(Command::Press { agent: agent.to_string(), target });
     }
 
+    /// Pulse this agent's name tag as it types this many keys.
+    pub fn typing(&self, agent: &str, keys: usize) {
+        self.send(Command::Type { agent: agent.to_string(), keys });
+    }
+
+    /// Show this agent as a caret `h` pixels tall with its top at x,y, where its text goes in, and
+    /// pulse its tag for the key just typed. Its next move brings the arrow back. Returns once
+    /// the caret is on the screen, so typing never runs ahead of it.
+    pub fn caret(&self, agent: &str, x: i32, y: i32, h: i32) {
+        let (shown, wait) = mpsc::channel();
+        self.send(Command::Caret { agent: agent.to_string(), x, y, h, shown });
+        let _ = wait.recv_timeout(CARET_WAIT);
+    }
+
     pub fn stop(self) -> Stats {
         self.send(Command::Quit);
         self.worker.join().unwrap_or_default()
@@ -207,6 +225,11 @@ struct Flight {
 struct Agent {
     name: String,
     colour: Rgb,
+    label: Mask,
+    scale: f32,
+    pose: motion::Pose,
+    look: (i32, i32),
+    typing_at: Option<i32>,
     layer: Layer,
     tip: (i32, i32),
     at: Point,
@@ -224,10 +247,15 @@ impl Agent {
     fn new(name: &str, to: Point, taken: &[Rgb], scale: f32) -> Option<Agent> {
         let colour = motion::colour_for(name, taken);
         let label = text_mask(name, (LABEL_PIXELS * scale) as i32);
-        let (picture, x, y) = cursor(colour, &label, scale)?;
+        let (picture, x, y) = posed(colour, &label, scale, 0.0, 1.0)?;
         Some(Agent {
             name: name.to_string(),
             colour,
+            label,
+            scale,
+            pose: motion::Pose::new(),
+            look: (0, 0),
+            typing_at: None,
             layer: Layer::new(&picture),
             tip: (x, y),
             at: (to.0 + ARRIVE_FROM * scale, to.1 + ARRIVE_FROM * scale),
@@ -276,6 +304,10 @@ impl Agent {
             self.visible = true;
         }
         self.side = -self.side;
+        if self.typing_at.take().is_some() {
+            self.pose.reset();
+            self.redraw(Instant::now());
+        }
         let from = self.at;
         let ms = motion::travel_ms(from, to) as f32;
         self.flight = Some(Flight { from, middle: motion::bow(from, to, self.side), to, started: Instant::now(), ms, arrived });
@@ -294,6 +326,35 @@ impl Agent {
         let _ = flight.arrived.send(());
         self.flight = None;
         false
+    }
+
+    /// Lean the arrow into its travel and pulse the tag while typing, redrawing only when the look
+    /// changes. True while the pose is still changing.
+    fn hold(&mut self, now: Instant) -> bool {
+        if !self.visible {
+            return false;
+        }
+        // A caret jumps along as letters go in; that is not travel to lean into.
+        let busy = if self.typing_at.is_some() { self.pose.squeeze(now) < 1.0 } else { self.pose.follow(now, self.at, self.scale) };
+        if self.pose.look(now) != self.look {
+            self.redraw(now);
+        }
+        busy
+    }
+
+    /// Draw the pose as it is now: the arrow, or the caret while typing.
+    fn redraw(&mut self, now: Instant) {
+        self.look = self.pose.look(now);
+        let (lean, squeeze) = self.pose.shown(now);
+        let drawn = match self.typing_at {
+            Some(height) => caret(self.colour, &self.label, self.scale, height, squeeze),
+            None => posed(self.colour, &self.label, self.scale, lean, squeeze),
+        };
+        if let Some((picture, x, y)) = drawn {
+            self.layer.reshape(&picture);
+            self.tip = (x, y);
+            self.draw();
+        }
     }
 
     /// Fade away once nothing has happened for a while. True while fading.
@@ -455,6 +516,29 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
                         found.stack(true);
                     }
                 }
+                Command::Type { agent, keys } => {
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        found.last_active = Instant::now();
+                        found.pose.type_keys(Instant::now(), keys);
+                    }
+                }
+                Command::Caret { agent, x, y, h, shown } => {
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        let now = Instant::now();
+                        found.last_active = now;
+                        found.alpha = 255;
+                        found.at = (x as f32, y as f32);
+                        found.typing_at = Some(h);
+                        found.pose.key(now);
+                        found.redraw(now);
+                        if !found.visible {
+                            found.layer.show();
+                            found.visible = true;
+                        }
+                        unsafe { DwmFlush() };
+                    }
+                    let _ = shown.send(());
+                }
                 Command::Shield { on, ready } => {
                     shields = if on { shields + 1 } else { shields - 1 };
                     unsafe {
@@ -500,8 +584,10 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
         }
         let mut flying = false;
         let mut fading = false;
+        let mut posing = false;
         for agent in &mut agents {
             flying |= agent.step(now);
+            posing |= agent.hold(now);
             fading |= agent.rest(now);
         }
         flashes.retain_mut(|flash| flash.step(now));
@@ -518,7 +604,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
             last_frame = None;
         }
 
-        if flying || fading || !flashes.is_empty() {
+        if flying || fading || posing || !flashes.is_empty() {
             unsafe { DwmFlush() };
             continue;
         }
