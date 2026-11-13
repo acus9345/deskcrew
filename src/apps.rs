@@ -99,8 +99,34 @@ fn start(app: &str, args: &str) -> Result<(), String> {
 
 /// Start an app and return its first new window, if one appears in time. Unless `front` is set,
 /// the person keeps their window: the new one goes behind it, however often it tries to come up.
+/// Chromium browsers by name or path.
+fn is_chromium_browser(app: &str) -> bool {
+    let name = app.to_lowercase();
+    let name = name.rsplit(['\\', '/']).next().unwrap_or(&name);
+    ["msedge", "microsoft edge", "chrome", "chromium", "brave", "vivaldi", "opera"].iter().any(|browser| name.starts_with(browser))
+}
+
+/// A Chromium browser keeps every click and key while its window is covered all over, and runs
+/// them only once part of it shows. Started with its cover check off, it takes them behind the
+/// person's windows as it does in front.
+fn taking_input_covered(args: &str) -> String {
+    const SWITCH: &str = "--disable-features=CalculateNativeWinOcclusion";
+    if args.contains("CalculateNativeWinOcclusion") {
+        return args.to_string();
+    }
+    match args.find("--disable-features=") {
+        Some(at) => format!("{}{SWITCH},{}", &args[..at], &args[at + "--disable-features=".len()..]),
+        None if args.trim().is_empty() => SWITCH.to_string(),
+        None => format!("{SWITCH} {args}"),
+    }
+}
+
 pub fn launch(app: &str, args: &str, front: bool) -> Result<Option<Hwnd>, String> {
+    let browser = is_chromium_browser(app);
+    let args = if browser { taking_input_covered(args) } else { args.to_string() };
+    let args = args.as_str();
     let before: HashSet<Hwnd> = win::top_level().into_iter().collect();
+    let pids_before: HashSet<u32> = before.iter().map(|hwnd| win::pid(*hwnd)).collect();
     let person = win::FocusGuard::take();
     // Agents run under the app in front, and Windows lets that app's descendants take focus once:
     // the service would pass that on to the first app it opens. A lock stops it ever happening,
@@ -122,6 +148,10 @@ pub fn launch(app: &str, args: &str, front: bool) -> Result<Option<Hwnd>, String
     let Some(hwnd) = opened else { return Ok(None) };
     // The new window is the agent's: its taskbar button is not left flashing for the person.
     win::note_worked_in(hwnd);
+    // A browser already running opened this window in its old process, which kept its cover check.
+    if browser && win::is_chromium(hwnd) && !pids_before.contains(&win::pid(hwnd)) {
+        win::note_takes_input_covered(win::pid(hwnd));
+    }
     if !front {
         // Apps keep reaching for the front for a while after their window appears.
         let appeared = Instant::now();
@@ -274,5 +304,19 @@ impl SavedClipboard {
             formats.push((quiet, vec![0; 4]));
         }
         put_on_clipboard(&formats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browsers_get_their_cover_check_turned_off() {
+        assert!(is_chromium_browser("msedge") && is_chromium_browser(r"C:\Program Files\Google\Chrome\Application\chrome.exe"));
+        assert!(!is_chromium_browser("notepad"));
+        assert_eq!(taking_input_covered(""), "--disable-features=CalculateNativeWinOcclusion");
+        assert_eq!(taking_input_covered("--new-window x"), "--disable-features=CalculateNativeWinOcclusion --new-window x");
+        assert_eq!(taking_input_covered("--disable-features=Foo x"), "--disable-features=CalculateNativeWinOcclusion,Foo x");
     }
 }

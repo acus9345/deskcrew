@@ -66,6 +66,9 @@ const MAX_TABLE_ROWS: usize = 500;
 const MAX_TABLE_COLUMNS: usize = 20;
 const MAX_CELL_CHARS: usize = 60;
 const STOPPED: &str = "stopped by the person with Ctrl+Alt+Esc: ask them before doing more (deskcrew resume clears it)";
+const COVERED: &str = "refused: this window is covered all over or minimized, and browser and Electron apps keep clicks and keys until part of them shows, then run them all at once. Ask the person to uncover part of it, or add --real. A browser opened with deskcrew launch takes input while covered";
+/// Commands that act on a window, as opposed to reading it.
+const ACTIONS: [&str; 18] = ["click", "hover", "set", "type", "key", "check", "uncheck", "toggle", "expand", "collapse", "clear", "select", "scroll", "show", "drag", "draw", "down", "pick-file"];
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
 
 pub const HELP: &str = r#"deskcrew drives Windows apps in the background. Fastest: see a window once, then do every step in one call.
@@ -1328,6 +1331,9 @@ impl Service {
             return Err(STOPPED.into());
         }
         let tracked = self.pick(who, flags.window.as_deref())?;
+        if win::holds_input(tracked.hwnd) {
+            return Err(COVERED.into());
+        }
         let (strokes, pids) = {
             let mut guard = tracked.view.lock().unwrap();
             let view = &mut *guard;
@@ -1469,6 +1475,11 @@ impl Service {
         };
         let verb = words.first().map_or("", String::as_str);
         let rest = words.get(1..).unwrap_or(&[]);
+        // A browser or Electron window that does not show at all keeps its input and runs it all
+        // once part of it shows, so input sent now would only happen later, unseen.
+        if !flags.real && !flags.mouse && ACTIONS.contains(&verb) && win::is_chromium(tracked.hwnd) && win::holds_input(tracked.hwnd) {
+            return Err(COVERED.into());
+        }
         match (verb, rest) {
             ("click", [word]) => self.click(who, &flags, tracked, view, word),
             ("hover", [word]) => self.hover(who, &flags, tracked, view, word),

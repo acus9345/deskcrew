@@ -214,6 +214,35 @@ pub fn find_menu(menu: isize, wanted: &str) -> Option<MenuEntry> {
     entries.into_iter().find(|e| e.label.to_lowercase() == wanted).or_else(|| submenus.into_iter().find_map(|s| find_menu(s, &wanted)))
 }
 
+/// Browser processes deskcrew started with their cover check off.
+static TAKES_INPUT_COVERED: std::sync::Mutex<Vec<u32>> = std::sync::Mutex::new(Vec::new());
+
+pub fn note_takes_input_covered(pid: u32) {
+    TAKES_INPUT_COVERED.lock().unwrap().push(pid);
+}
+
+/// True if this browser window would hold input sent to it now: no part of it shows, and it is
+/// not one deskcrew started to take input while covered.
+pub fn holds_input(hwnd: Hwnd) -> bool {
+    !TAKES_INPUT_COVERED.lock().unwrap().contains(&pid(hwnd)) && fully_covered(hwnd)
+}
+
+/// True if no part of this window shows: it is minimized, or other windows cover it all over.
+/// A grid of points across it is checked, and any one that reaches it or a popup it owns counts.
+pub fn fully_covered(hwnd: Hwnd) -> bool {
+    const ACROSS: i32 = 14;
+    if unsafe { IsIconic(raw(hwnd)) } != 0 {
+        return true;
+    }
+    let (left, top, width, height) = rect(hwnd);
+    if width < 1 || height < 1 {
+        return true;
+    }
+    let inset = 6;
+    let at = |from: i32, size: i32, step: i32| from + inset + (size - 2 * inset).max(1) * step / (ACROSS - 1);
+    !(0..ACROSS).any(|i| (0..ACROSS).any(|j| owns_point(&[hwnd], at(left, width, i), at(top, height, j))))
+}
+
 /// True if a real click at this point would reach one of these windows, or a popup one of them
 /// owns, and nothing else.
 pub fn owns_point(family: &[Hwnd], x: i32, y: i32) -> bool {
