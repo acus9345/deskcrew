@@ -114,8 +114,59 @@ pub fn post_command(root: Hwnd, id: usize) -> Result<String, String> {
     post(root, WM_COMMAND, id & 0xFFFF, 0).map(|_| "command".to_string())
 }
 
-/// A whole press, drag and release as window messages, into the window under the first point.
-pub fn post_stroke(root: Hwnd, path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> Result<bool, String> {
+/// How long an app gets to take posted messages while keys are held down for it.
+const HELD_SETTLE: std::time::Duration = std::time::Duration::from_millis(60);
+
+/// Run `work` with these keys or mouse buttons down in the app's own copy of the keyboard state,
+/// for apps that ask that state whether Ctrl or the left button is down rather than reading the
+/// message, as WinForms does. The app's thread is joined to this one for those moments; the
+/// person's own keyboard and mouse belong to another thread and are not touched. An app whose
+/// window is in front shares its state with the person, so it is left alone.
+fn with_state_held<T>(hwnd: Hwnd, keys: &[u16], work: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    if keys.is_empty() {
+        return work();
+    }
+    unsafe {
+        let theirs = GetWindowThreadProcessId(hwnd as HWND, std::ptr::null_mut());
+        let mine = GetCurrentThreadId();
+        if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) || AttachThreadInput(mine, theirs, 1) == 0 {
+            return work();
+        }
+        let mut saved = [0u8; 256];
+        GetKeyboardState(saved.as_mut_ptr());
+        let mut state = saved;
+        for vk in keys {
+            state[*vk as usize] |= 0x80;
+            let side = match *vk {
+                VK_CONTROL => VK_LCONTROL,
+                VK_SHIFT => VK_LSHIFT,
+                VK_MENU => VK_LMENU,
+                other => other,
+            };
+            state[side as usize] |= 0x80;
+        }
+        SetKeyboardState(state.as_ptr());
+        let result = work();
+        std::thread::sleep(HELD_SETTLE);
+        SetKeyboardState(saved.as_ptr());
+        AttachThreadInput(mine, theirs, 0);
+        result
+    }
+}
+
+/// A whole press, drag and release as window messages, into the window under the first point,
+/// with the left button down in the app's keyboard state while it lasts.
+pub fn post_stroke(root: Hwnd, path: &[(f32, f32)], stop: &AtomicBool, moved: impl FnMut(i32, i32)) -> Result<bool, String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LBUTTON;
+    let Some(first) = path.first() else { return Ok(true) };
+    let hwnd = win::child_at(root, first.0 as i32, first.1 as i32).0;
+    with_state_held(hwnd, &[VK_LBUTTON], || post_stroke_now(root, path, stop, moved))
+}
+
+fn post_stroke_now(root: Hwnd, path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> Result<bool, String> {
     let Some(first) = path.first() else { return Ok(true) };
     let (hwnd, x, y) = win::child_at(root, first.0 as i32, first.1 as i32);
     post(hwnd, WM_MOUSEMOVE, 0, win::lparam(x, y))?;
@@ -155,8 +206,9 @@ pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Resu
     Ok("message".into())
 }
 
-/// A middle click or a triple click, which have no accessibility equivalent.
-pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: usize) -> Result<String, String> {
+/// A middle click or a triple click, which have no accessibility equivalent, or a click with Shift,
+/// Ctrl or Alt held: those are set down in the app's keyboard state too, for apps that ask it.
+pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: usize, modifiers: &[u16]) -> Result<String, String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP};
     const MK_MBUTTON: usize = 0x10;
     const MK_XBUTTON1: usize = 0x20;
@@ -166,19 +218,21 @@ pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: 
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);
-    let (down, up, again, held, which) = match button {
+    let (down, up, again, button_bit, which) = match button {
         Button::Left => (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON, 0),
         Button::Right => (WM_RBUTTONDOWN, WM_RBUTTONUP, WM_RBUTTONDBLCLK, MK_RBUTTON, 0),
         Button::Middle => (WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MBUTTONDBLCLK, MK_MBUTTON, 0),
         Button::Back => (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK, MK_XBUTTON1, 1usize << 16),
         Button::Forward => (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK, MK_XBUTTON2, 2usize << 16),
     };
-    post(hwnd, WM_MOUSEMOVE, 0, at)?;
-    for time in 0..times {
-        post(hwnd, if time == 1 { again } else { down }, held | which | keys, at)?;
-        post(hwnd, up, which | keys, at)?;
-    }
-    Ok("message".into())
+    with_state_held(hwnd, modifiers, || {
+        post(hwnd, WM_MOUSEMOVE, 0, at)?;
+        for time in 0..times {
+            post(hwnd, if time == 1 { again } else { down }, button_bit | which | keys, at)?;
+            post(hwnd, up, which | keys, at)?;
+        }
+        Ok("message".into())
+    })
 }
 
 /// The pointer resting on a spot, without pressing.
@@ -250,7 +304,41 @@ fn is_classic_text(node: &Node, root: Hwnd) -> bool {
     node.native != 0 && !win::draws_itself(root) && class.contains("EDIT") && !class.contains("RICH")
 }
 
+/// A rich text box with a window of its own, such as WordPad's or a WinForms RichTextBox.
+pub fn is_rich_text(hwnd: Hwnd) -> bool {
+    hwnd != 0 && win::class(hwnd).to_uppercase().contains("RICHEDIT")
+}
+
+fn send(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> Result<isize, String> {
+    let mut result = 0;
+    let sent = unsafe { SendMessageTimeoutW(hwnd as HWND, message, wparam, lparam, SMTO_ABORTIFHUNG, 1000, &mut result) };
+    if sent != 0 { Ok(result as isize) } else { Err("that window stopped taking messages".into()) }
+}
+
+/// Put a text box's caret after its last letter, so typing adds to the end.
+pub fn caret_to_end(hwnd: Hwnd) -> Result<(), String> {
+    const WM_GETTEXTLENGTH: u32 = 0x000E;
+    const EM_SETSEL: u32 = 0x00B1;
+    let length = send(hwnd, WM_GETTEXTLENGTH, 0, 0)?.max(0) as usize;
+    send(hwnd, EM_SETSEL, length, length as isize).map(|_| ())
+}
+
+/// Replace all the text of a rich text box as an edit of its own, the way typing over it would:
+/// the app is told the text changed and that there are changes to save, and can undo it.
+fn replace_rich_text(hwnd: Hwnd, value: &str) -> Result<String, String> {
+    const EM_SETSEL: u32 = 0x00B1;
+    const EM_REPLACESEL: u32 = 0x00C2;
+    send(hwnd, EM_SETSEL, 0, -1)?;
+    let wide: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+    send(hwnd, EM_REPLACESEL, 1, wide.as_ptr() as isize)?;
+    win::remember_field(hwnd);
+    Ok("message".into())
+}
+
 pub fn set(node: &Node, root: Hwnd, value: &str) -> Result<String, String> {
+    if is_rich_text(node.native) && !win::draws_itself(root) {
+        return replace_rich_text(node.native, value);
+    }
     // Accessibility would focus a classic text box first, which activates its window.
     if is_classic_text(node, root) {
         win::remember_field(node.native);
@@ -311,6 +399,88 @@ pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
     }
     post(target, WM_KEYUP, vk as usize, 1 | (scan << 16) | (1 << 30) | (1 << 31))?;
     Ok("message".into())
+}
+
+/// Pick an entry of an open classic popup menu by its keyboard: the arrow keys down to it, then
+/// Enter, as window messages. The menu reads its keys from its own thread's queue, so this works
+/// with the app in the back, where a click on the menu needs the real mouse. None if the menu has
+/// no entry by that name.
+pub fn choose_in_popup(popup: Hwnd, label: &str) -> Option<Result<String, String>> {
+    let entries = win::menu_entries(win::menu_of_popup(popup));
+    let wanted = label.to_lowercase();
+    let at = entries.iter().position(|entry| entry.label.to_lowercase() == wanted)?;
+    if entries[at].greyed {
+        return Some(Err(format!("'{}' is disabled", entries[at].label)));
+    }
+    const VK_DOWN: usize = 0x28;
+    const VK_RETURN: usize = 0x0D;
+    let key = |vk: usize, release: bool| {
+        let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as isize;
+        1 | (scan << 16) | if release { (1 << 30) | (1 << 31) } else { 0 }
+    };
+    let pressed = (|| {
+        // Separators are skipped by the arrow keys, and menu_entries leaves them out too.
+        for _ in 0..=at {
+            post(popup, WM_KEYDOWN, VK_DOWN, key(VK_DOWN, false))?;
+            post(popup, WM_KEYUP, VK_DOWN, key(VK_DOWN, true))?;
+        }
+        post(popup, WM_KEYDOWN, VK_RETURN, key(VK_RETURN, false))?;
+        post(popup, WM_KEYUP, VK_RETURN, key(VK_RETURN, true))?;
+        Ok("menu keys".to_string())
+    })();
+    Some(pressed)
+}
+
+/// How long a held key waits before it repeats, and how often it repeats then, as a keyboard does.
+const REPEAT_DELAY: std::time::Duration = std::time::Duration::from_millis(500);
+const REPEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(33);
+
+/// A key held down for a while as window messages: down, repeats as a keyboard sends them, then up,
+/// with it set down in the app's keyboard state the whole time for apps that ask that state.
+pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
+    let target = win::keyboard_target(root);
+    if !win::takes_posted_keys(target) || win::is_wpf(root) {
+        return Err(NEEDS_REAL.into());
+    }
+    let Some(((key, extended), modifiers)) = chord.keys.split_last() else { return Err("no key given".into()) };
+    let bits = |vk: u16, extended: bool, again: bool, release: bool| {
+        let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as isize;
+        let mut lparam = 1 | (scan << 16);
+        if extended {
+            lparam |= 1 << 24;
+        }
+        if again {
+            lparam |= 1 << 30;
+        }
+        if release {
+            lparam |= (1 << 30) | (1 << 31);
+        }
+        lparam
+    };
+    let all: Vec<u16> = chord.keys.iter().map(|(vk, _)| *vk).collect();
+    with_state_held(target, &all, || {
+        for (vk, e) in modifiers {
+            post(target, WM_KEYDOWN, *vk as usize, bits(*vk, *e, false, false))?;
+        }
+        post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, false, false))?;
+        let started = std::time::Instant::now();
+        let mut next = REPEAT_DELAY;
+        while started.elapsed() < hold {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if started.elapsed() >= next {
+                post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, true, false))?;
+                next += REPEAT_EVERY;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        post(target, WM_KEYUP, *key as usize, bits(*key, *extended, false, true))?;
+        for (vk, e) in modifiers.iter().rev() {
+            post(target, WM_KEYUP, *vk as usize, bits(*vk, *e, false, true))?;
+        }
+        Ok("message".to_string())
+    })
 }
 
 /// How long an app gets to take each half of a posted shortcut while its Ctrl, Shift or Alt is

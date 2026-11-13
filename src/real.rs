@@ -258,6 +258,11 @@ pub struct Chord {
 
 impl Chord {
     /// The modifier bits a mouse message carries, for a modified click with no keyboard.
+    /// Its Shift, Ctrl and Alt, as virtual keys.
+    pub fn modifiers(&self) -> Vec<u16> {
+        self.keys.iter().map(|(vk, _)| *vk).filter(|vk| matches!(*vk, VK_SHIFT | VK_CONTROL | VK_MENU)).collect()
+    }
+
     pub fn mouse_keys(&self) -> usize {
         const MK_SHIFT: usize = 0x04;
         const MK_CONTROL: usize = 0x08;

@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Fewer things need --real on Windows. click --with ctrl and drags also set the keys and the left button down in the app's own keyboard state for that moment, so WinForms sees modifier clicks and canvas drags. key x --hold ms holds a key in the background, with repeats. An entry of an open classic right-click menu is picked with the menu's own keys. Classic rich text boxes are set as an edit the app knows to save, and typing goes to their end. In browsers and Electron apps, type --paste posts Ctrl+V instead of taking focus, and a field Chromium dropped letters in is filled by a posted Ctrl+A and Ctrl+V. Minimized browser and Electron windows take input too: they are shown far off screen for the moment, under the foreground lock, and minimized again. On Linux, a click at x,y on a button, check box, tab, link, menu entry or list item presses it through AT-SPI instead of the pointer.
+
 ## [0.1.19] - 2026-11-13
 
 - Browser and Electron windows that other windows cover all over take clicks, keys and reads in the background again, without --real and without coming forward: while an agent works in one, deskcrew tells Chromium a task switcher view is open, which makes it draw every window it has, and Chromium hides the window again afterwards. Minimized ones are still refused. A click at x,y on an app that draws itself, such as a WPF or Store app, presses the button, check box, tab or list item drawn there through accessibility, instead of asking for --real. Keys and shortcuts such as Enter and Ctrl+S reach WPF apps in the background: their window gets keyboard focus inside its own app for a moment, with the foreground lock held so it stays behind.

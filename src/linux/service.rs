@@ -562,6 +562,23 @@ impl Service {
         {
             return Ok(action);
         }
+        // A click at x,y lands on whatever is drawn there: a button, check box, tab, link or list
+        // item there is pressed by its own action, which needs neither the pointer nor the front.
+        if element.is_none() && plain {
+            let (px, py) = centre(rect);
+            self.read(tracked, view, false)?;
+            let inside = |&(left, top, width, height): &Bounds| width > 0 && height > 0 && px >= left && px < left + width && py >= top && py < top + height;
+            let under = view
+                .nodes
+                .values()
+                .filter(|node| inside(&node.rect) && matches!(node.parts.role.as_str(), "button" | "checkbox" | "radio" | "menuitem" | "tab" | "item" | "link"))
+                .min_by_key(|node| node.rect.2 as i64 * node.rect.3 as i64);
+            if let Some(node) = under
+                && let Ok(action) = atspi::press(&node.element)
+            {
+                return Ok(format!("{action} on '{}' under {word}", node.parts.name));
+            }
+        }
         let (px, py) = centre(rect);
         let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
         self.front(tracked, || {

@@ -203,6 +203,35 @@ pub fn menu_entries(menu: isize) -> Vec<MenuEntry> {
     out
 }
 
+/// Classic popup menus open now in these processes, newest first.
+pub fn popup_menus(pids: &[u32]) -> Vec<Hwnd> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::FindWindowExW;
+    let class: Vec<u16> = "#32768".encode_utf16().chain(Some(0)).collect();
+    let mut found = Vec::new();
+    let mut after = null_mut();
+    unsafe {
+        loop {
+            after = FindWindowExW(null_mut(), after, class.as_ptr(), std::ptr::null());
+            if after.is_null() {
+                break;
+            }
+            if IsWindowVisible(after) != 0 && pids.contains(&pid(after as Hwnd)) {
+                found.push(after as Hwnd);
+            }
+        }
+    }
+    found
+}
+
+/// The menu a popup menu window shows.
+pub fn menu_of_popup(popup: Hwnd) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SMTO_ABORTIFHUNG, SendMessageTimeoutW};
+    const MN_GETHMENU: u32 = 0x01E1;
+    let mut menu = 0;
+    unsafe { SendMessageTimeoutW(raw(popup), MN_GETHMENU, 0, 0, SMTO_ABORTIFHUNG, 500, &mut menu) };
+    menu as isize
+}
+
 /// The entry with this label anywhere in a menu.
 pub fn find_menu(menu: isize, wanted: &str) -> Option<MenuEntry> {
     if menu == 0 {
@@ -271,12 +300,65 @@ fn announce(stand_in: Hwnd, shown: bool) {
     unsafe { NotifyWinEvent(if shown { EVENT_OBJECT_SHOW } else { EVENT_OBJECT_HIDE }, raw(stand_in), OBJID_WINDOW, CHILDID_SELF as i32) };
 }
 
+/// A minimized window shown off screen for a while, and how to put it back.
+struct OffScreen {
+    hwnd: Hwnd,
+    placement: windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT,
+    _lock: ForegroundLock,
+}
+
 /// While held, covered browser and Electron windows are drawn and take input. Dropping it lets
-/// Chromium hide them again once no agent is working in one.
-pub struct KeptDrawn(Option<Hwnd>);
+/// Chromium hide them again once no agent is working in one, and minimizes again one that was.
+pub struct KeptDrawn(Option<Hwnd>, Option<OffScreen>);
+
+/// Turn a window's minimize and restore animations off or back on.
+fn animations(hwnd: Hwnd, on: bool) {
+    use windows_sys::Win32::Graphics::Dwm::{DWMWA_TRANSITIONS_FORCEDISABLED, DwmSetWindowAttribute};
+    let off: i32 = if on { 0 } else { 1 };
+    unsafe { DwmSetWindowAttribute(raw(hwnd), DWMWA_TRANSITIONS_FORCEDISABLED as u32, &off as *const i32 as *const _, size_of::<i32>() as u32) };
+}
+
+/// Show a minimized window, far off every screen and without activating it, while Windows lets no
+/// app take the foreground: Chromium tries to when its window is restored.
+fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, SW_SHOWNOACTIVATE, SetWindowPlacement, WINDOWPLACEMENT};
+    const FAR: i32 = -31_000;
+    let lock = ForegroundLock::try_take()?;
+    unsafe {
+        let mut placement: WINDOWPLACEMENT = zeroed();
+        placement.length = size_of::<WINDOWPLACEMENT>() as u32;
+        if GetWindowPlacement(raw(hwnd), &mut placement) == 0 {
+            return None;
+        }
+        let normal = placement.rcNormalPosition;
+        let mut away = placement;
+        away.flags = 0;
+        away.showCmd = SW_SHOWNOACTIVATE as u32;
+        away.rcNormalPosition = RECT { left: FAR, top: FAR, right: FAR + (normal.right - normal.left), bottom: FAR + (normal.bottom - normal.top) };
+        animations(hwnd, false);
+        if SetWindowPlacement(raw(hwnd), &away) == 0 {
+            animations(hwnd, true);
+            return None;
+        }
+        Some(OffScreen { hwnd, placement, _lock: lock })
+    }
+}
+
+impl Drop for OffScreen {
+    fn drop(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWMINNOACTIVE, SetWindowPlacement, WPF_RESTORETOMAXIMIZED};
+        let mut back = self.placement;
+        back.showCmd = SW_SHOWMINNOACTIVE as u32;
+        back.flags &= WPF_RESTORETOMAXIMIZED;
+        unsafe { SetWindowPlacement(raw(self.hwnd), &back) };
+        animations(self.hwnd, true);
+    }
+}
 
 impl Drop for KeptDrawn {
     fn drop(&mut self) {
+        // Minimized again first, while the foreground lock is still held.
+        self.1.take();
         let Some(stand_in) = self.0 else { return };
         let mut working = KEPT_DRAWN.lock().unwrap();
         working.0 -= 1;
@@ -291,11 +373,23 @@ impl Drop for KeptDrawn {
 /// switcher thumbnails, Chromium draws every window it has, so deskcrew tells it a thumbnail view
 /// opened for as long as an agent works in a covered window. Nothing shows on screen, nothing
 /// moves, and the person's windows stay in front.
+///
+/// A minimized one is shown far off screen for that time, without being activated, and minimized
+/// again afterwards. Chromium tries to come forward when restored, so this is done only while
+/// Windows' foreground lock is held; if it cannot be, the window stays minimized and is refused.
 pub fn keep_drawn(hwnd: Hwnd) -> KeptDrawn {
-    if !is_chromium(hwnd) || minimized(hwnd) || !holds_input(hwnd) {
-        return KeptDrawn(None);
+    if !is_chromium(hwnd) || !holds_input(hwnd) {
+        return KeptDrawn(None, None);
     }
-    let Some(stand_in) = thumbnail_stand_in() else { return KeptDrawn(None) };
+    let off_screen = if minimized(hwnd) {
+        match show_off_screen(hwnd) {
+            Some(shown) => Some(shown),
+            None => return KeptDrawn(None, None),
+        }
+    } else {
+        None
+    };
+    let Some(stand_in) = thumbnail_stand_in() else { return KeptDrawn(None, off_screen) };
     let ready = {
         let mut working = KEPT_DRAWN.lock().unwrap();
         if working.0 == 0 {
@@ -308,7 +402,11 @@ pub fn keep_drawn(hwnd: Hwnd) -> KeptDrawn {
     if let Some(ready) = ready {
         thread::sleep(ready.saturating_duration_since(Instant::now()));
     }
-    KeptDrawn(Some(stand_in))
+    // A window just shown needs its own moment to draw, even when the view was already open.
+    if off_screen.is_some() {
+        thread::sleep(REDRAW_WAIT);
+    }
+    KeptDrawn(Some(stand_in), off_screen)
 }
 
 /// True if no part of this window shows: it is minimized, or other windows cover it all over.
@@ -653,6 +751,11 @@ impl ForegroundLock {
     pub fn take() -> ForegroundLock {
         unsafe { LockSetForegroundWindow(LSFW_LOCK) };
         ForegroundLock
+    }
+
+    /// The lock, if Windows gave it: it only does to a process that could take the foreground.
+    pub fn try_take() -> Option<ForegroundLock> {
+        (unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0).then_some(ForegroundLock)
     }
 }
 

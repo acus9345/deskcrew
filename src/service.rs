@@ -66,7 +66,7 @@ const MAX_TABLE_ROWS: usize = 500;
 const MAX_TABLE_COLUMNS: usize = 20;
 const MAX_CELL_CHARS: usize = 60;
 const STOPPED: &str = "stopped by the person with Ctrl+Alt+Esc: ask them before doing more (deskcrew resume clears it)";
-const COVERED: &str = "refused: this window is minimized, and browser and Electron apps take no clicks or keys until they are shown again. Ask the person to restore it, or add --real";
+const COVERED: &str = "refused: this window is minimized, and browser and Electron apps take no clicks or keys until they are shown again. Windows would not let deskcrew show it without it coming forward just now. Ask the person to restore it, or add --real";
 /// Commands that act on a window, as opposed to reading it.
 const ACTIONS: [&str; 18] = ["click", "hover", "set", "type", "key", "check", "uncheck", "toggle", "expand", "collapse", "clear", "select", "scroll", "show", "drag", "draw", "down", "pick-file"];
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
@@ -107,6 +107,27 @@ fn append_value(node: &Node, root: Hwnd, text: &str) -> Option<Reply> {
     Some(act::set(node, root, &wanted).and_then(|route| {
         if node.element.value_text() == wanted { Ok(route) } else { Err("the text did not land: try --real".into()) }
     }))
+}
+
+/// Replace all the text of the browser field that has the page's focus with Ctrl+A and a lent
+/// clipboard's Ctrl+V, as window messages, and read it back. Chromium can drop typed characters
+/// while its window is in the back; accessibility would bring the window forward instead. None if
+/// the text did not land.
+fn replace_in_page(root: Hwnd, node: &Node, wanted: &str) -> Option<Reply> {
+    let mut saved = apps::SavedClipboard::take().ok()?;
+    saved.lend(wanted).ok()?;
+    let sent = real::chord("ctrl+a").ok().and_then(|all| act::post_key(root, &all, "ctrl+a").ok())
+        .and_then(|_| real::chord("ctrl+v").ok())
+        .and_then(|paste| act::post_key(root, &paste, "ctrl+v").ok());
+    let until = Instant::now() + TYPE_CHECK;
+    while sent.is_some() && node.element.value_text() != wanted && Instant::now() < until {
+        thread::sleep(SETTLE_STEP);
+    }
+    let landed = sent.is_some() && node.element.value_text() == wanted;
+    if let Err(error) = saved.put_back() {
+        return Some(Err(error));
+    }
+    landed.then(|| Ok("paste message".to_string()))
 }
 
 /// The smallest control under a screen point that can be pressed: a button, check box, tab, list
@@ -802,13 +823,13 @@ impl Service {
             let chord = real::chord(with)?;
             let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
             if !flags.real {
-                return act::post_press(tracked.hwnd, x, y, flags.button(), times, chord.mouse_keys());
+                return act::post_press(tracked.hwnd, x, y, flags.button(), times, chord.mouse_keys(), &chord.modifiers());
             }
             return self.with_front(tracked, view, &[(x, y)], || {
                 real::set_keys(&chord, true);
                 // Posted messages overtake real input, so the app has to see the modifier first.
                 thread::sleep(MODIFIER_SETTLE);
-                let result = act::post_press(tracked.hwnd, x, y, flags.button(), times, 0);
+                let result = act::post_press(tracked.hwnd, x, y, flags.button(), times, 0, &[]);
                 thread::sleep(MODIFIER_SETTLE);
                 real::set_keys(&chord, false);
                 result
@@ -816,7 +837,7 @@ impl Service {
         }
         if extra {
             let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
-            let post = || act::post_press(tracked.hwnd, x, y, flags.button(), times, 0);
+            let post = || act::post_press(tracked.hwnd, x, y, flags.button(), times, 0, &[]);
             return if flags.real { self.with_front(tracked, view, &[(x, y)], post)? } else { post() };
         }
         if flags.real {
@@ -834,6 +855,13 @@ impl Service {
             }
             if plain && node.parts.role == "menuitem" && let Some(entry) = win::find_menu(win::menu_bar(tracked.hwnd), &node.parts.name) {
                 return run_menu_entry(tracked.hwnd, &entry);
+            }
+            // An entry of an open classic popup menu, such as a right-click menu, is picked with
+            // the menu's own keys: a click on it would need the real mouse.
+            if plain && node.parts.role == "menuitem"
+                && let Some(result) = win::popup_menus(&view.pids).into_iter().find_map(|popup| act::choose_in_popup(popup, &node.parts.name))
+            {
+                return result;
             }
         }
         // Accessibility makes a browser, and any app seen to do the same, pull its window over the
@@ -911,6 +939,13 @@ impl Service {
         let mut saved = apps::SavedClipboard::take()?;
         saved.lend(text)?;
         let route = (|| {
+            // A browser takes Ctrl+V as window messages too, once a click has put its page's focus in
+            // the field. The field is read back where it can be, and the keyboard is the fallback.
+            if !flags.real && win::is_chromium(tracked.hwnd)
+                && let Some(route) = self.paste_in_page(who, tracked, view, target, text)
+            {
+                return Ok(route);
+            }
             if let Some(hwnd) = field {
                 let route = act::post_paste(hwnd)?;
                 thread::sleep(PASTE_SETTLE);
@@ -940,6 +975,36 @@ impl Service {
         })();
         saved.put_back()?;
         route
+    }
+
+    /// Ctrl+End and Ctrl+V as window messages into a browser page, after a posted click in the
+    /// field if one is named. None if the paste could not be sent or did not show in the field.
+    fn paste_in_page(&self, who: &str, tracked: &Tracked, view: &mut View, target: Option<&String>, text: &str) -> Option<String> {
+        let mut node = None;
+        if let Some(word) = target {
+            let Ok(Target::Control(id)) = self.resolve(word, who, tracked, view) else { return None };
+            let (found, rect) = self.locate(id, tracked, view).ok()?;
+            let (x, y) = act::centre(rect);
+            act::post_click(tracked.hwnd, x, y, false, false).ok()?;
+            thread::sleep(FIELD_SETTLE);
+            node = Some(found);
+        }
+        let before = node.as_ref().filter(|n| n.can.value).map(|n| n.element.value_text());
+        if node.is_some() {
+            act::post_key(tracked.hwnd, &real::chord("ctrl+end").ok()?, "ctrl+end").ok()?;
+        }
+        let route = act::post_key(tracked.hwnd, &real::chord("ctrl+v").ok()?, "ctrl+v").ok()?;
+        thread::sleep(PASTE_SETTLE);
+        if let (Some(before), Some(node)) = (before, &node) {
+            let until = Instant::now() + TYPE_CHECK;
+            while node.element.value_text() == before && Instant::now() < until {
+                thread::sleep(SETTLE_STEP);
+            }
+            if !node.element.value_text().contains(text) {
+                return None;
+            }
+        }
+        Some(route)
     }
 
     fn press_down(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
@@ -1062,10 +1127,14 @@ impl Service {
         }
         // A browser raises its window when accessibility changes a field, so the field is filled
         // the way a person would, by window messages. Accessibility is only the last resort.
-        if win::is_chromium(tracked.hwnd) && (node.can.value || node.can.range) && !node.element.value_read_only()
-            && let Some(done) = self.fill_in_page(tracked, &node, rect, value) {
+        if win::is_chromium(tracked.hwnd) && (node.can.value || node.can.range) && !node.element.value_read_only() {
+            if let Some(done) = self.fill_in_page(tracked, &node, rect, value) {
                 return done;
             }
+            if let Some(done) = replace_in_page(tracked.hwnd, &node, value) {
+                return done;
+            }
+        }
         act::set(&node, tracked.hwnd, value)
     }
 
@@ -1073,7 +1142,7 @@ impl Service {
     /// None if the text did not land.
     fn fill_in_page(&self, tracked: &Tracked, node: &Node, rect: Bounds, value: &str) -> Option<Reply> {
         let (x, y) = act::centre(rect);
-        act::post_press(tracked.hwnd, x, y, Button::Left, 3, 0).ok()?;
+        act::post_press(tracked.hwnd, x, y, Button::Left, 3, 0, &[]).ok()?;
         thread::sleep(FIELD_SETTLE);
         let field = win::child_at(tracked.hwnd, x, y).0;
         if let Err(error) = act::post_text(field, value, &self.stop) {
@@ -1150,6 +1219,9 @@ impl Service {
                         thread::sleep(SETTLE_STEP);
                     }
                     if node.element.value_text() != wanted {
+                        if let Some(done) = replace_in_page(tracked.hwnd, node, &wanted) {
+                            return done;
+                        }
                         return act::set(node, tracked.hwnd, &wanted);
                     }
                 }
@@ -1176,7 +1248,14 @@ impl Service {
                     Some(done) => done,
                     None => Err(NEEDS_REAL.into()),
                 },
-                (Some(_), Some(hwnd)) => act::post_text_watched(hwnd, text, &self.stop, follow),
+                (Some(_), Some(hwnd)) => {
+                    // A rich text box keeps its caret where it was, often at the start: typing adds to
+                    // the end, as it does elsewhere.
+                    if act::is_rich_text(hwnd) {
+                        act::caret_to_end(hwnd)?;
+                    }
+                    act::post_text_watched(hwnd, text, &self.stop, follow)
+                }
                 (None, _) if win::is_chromium(tracked.hwnd) => act::post_text(tracked.hwnd, text, &self.stop),
                 (None, _) => act::post_text_watched(win::keyboard_target(tracked.hwnd), text, &self.stop, follow),
             }
@@ -1233,7 +1312,7 @@ impl Service {
         let chord = real::chord(spec)?;
         if let Some(ms) = flags.hold {
             if !flags.real {
-                return Err("--hold needs --real: only the keyboard can keep a key down".into());
+                return act::post_hold(tracked.hwnd, &chord, Duration::from_millis(ms.min(HOLD_MOST_MS)), &self.stop);
             }
             self.with_front(tracked, view, &[], || real::hold_chord(&chord, Duration::from_millis(ms.min(HOLD_MOST_MS))))?;
             return Ok("keyboard".into());

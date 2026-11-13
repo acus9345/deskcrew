@@ -22,7 +22,7 @@ Use this on your own whenever a task needs the desktop; the person does not need
 
 Background first. A failure saying `add --real` means the action needs the window in front: `--real` borrows the person's focus briefly and uses the keyboard or a pen, so their cursor stays put. `drag` and `draw` pick the quietest way themselves. Agents take turns on `--real`, and it is refused if a point is not on the target window.
 
-Work in your own window: agents in different apps run at the same time, and agents sharing a window take turns. In browsers and Electron apps, `type e3 "text"`, `click` and `draw` run in the background, even while other windows cover them; a minimized one is refused.
+Work in your own window: agents in different apps run at the same time, and agents sharing a window take turns. In browsers and Electron apps, `type e3 "text"`, `click` and `draw` run in the background, even while other windows cover them or they are minimized.
 
 Leave the person's cursor alone. A control that only answers the real mouse is refused: use the keyboard or `click x,y` instead. `--mouse` is the last resort: it asks the person to borrow their cursor, and is refused unless they allowed asking. Never try to get around a refusal, and never run `deskcrew cursor` except `off`, unless the person asks you to. Use `--real` only when a reply asks for it, because it takes focus.
 
