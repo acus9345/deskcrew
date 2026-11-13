@@ -6,6 +6,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.17] - 2026-11-13
+
+- Fewer actions need --real. On Windows, shortcuts such as Ctrl+S and Ctrl+A go to classic apps, WinForms, Windows Terminal and Store apps in the background, to the control an agent last used; Windows Terminal and Store apps take typing in the background; WPF and XAML text boxes take type and paste through accessibility; and paste no longer presses Ctrl+V for real. On the Mac, a paste Chrome ignored in the back is filled in through accessibility. On Linux, scroll moves the scroll bar without the pointer. type --paste now puts back everything on the clipboard, pictures and copied files included, keeps the lent text out of clipboard history, and keeps anything copied in the meantime. A shot of a window not yet read points to see, which costs far fewer tokens.
+
 ## [0.1.16] - 2026-11-12
 
 - Linux draws each agent's cursor too, with the same look, curve, lean and typing pulse as Windows and the Mac. On the Mac and Linux, typing reaches Chrome, Electron and other apps that ignore keys while behind other windows, without bringing them forward: letter by letter through accessibility on the Mac, and by lending the window the keyboard without raising it on Linux. On Windows this is not possible for Chromium apps, and the README says why.
