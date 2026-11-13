@@ -92,7 +92,10 @@ if command -v xclip >/dev/null && [ -n "$picture" ]; then
     xclip -selection clipboard -t image/png -i "$picture" &
     sleep 0.5
     expect "paste" type Name " pasted" --paste -w "Deskcrew Form"
-    expect "pasted" get Name -w "Deskcrew Form"
+    # The toolkit-free window has no clipboard of its own, so only GTK takes the paste.
+    if [ -z "$plain" ]; then
+        expect "pasted" get Name -w "Deskcrew Form"
+    fi
     sleep 0.5
     if xclip -selection clipboard -t image/png -o 2>/dev/null | cmp -s - "$picture"; then
         echo "the clipboard picture came back"

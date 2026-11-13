@@ -33,12 +33,15 @@ def chunk(kind, data): return struct.pack('>I', len(data)) + kind + data + struc
 rows = b''.join(b'\x00' + bytes([208, 111, 89]) * 8 for _ in range(8))
 open(sys.argv[1], 'wb').write(b'\x89PNG\r\n\x1a\n' + chunk(b'IHDR', struct.pack('>IIBBBBB', 8, 8, 8, 2, 0, 0, 0)) + chunk(b'IDAT', zlib.compress(rows)) + chunk(b'IEND', b''))
 " "$picture"
-osascript -e "set the clipboard to (read (POSIX file \"$picture\") as <<class PNGf>>)"
+board="ObjC.import('AppKit'); var board = \$.NSPasteboard.generalPasteboard;"
+osascript -l JavaScript -e "$board board.clearContents; board.setDataForType(\$.NSData.dataWithContentsOfFile('$picture'), 'public.png')"
+before=$(osascript -l JavaScript -e "$board board.dataForType('public.png').length" 2>&1)
+echo "picture on the clipboard before the paste: $before bytes"
 expect "paste" type " pasted" --paste -w TextEdit
 expect "pasted" get e1 -w TextEdit
-kinds=$(osascript -e 'clipboard info' 2>&1)
-echo "clipboard after the paste: $kinds"
-if ! grep -q "PNGf" <<<"$kinds"; then echo "FAILED: the clipboard picture was not put back"; failed=1; fi
+after=$(osascript -l JavaScript -e "$board board.dataForType('public.png').length" 2>&1)
+echo "picture on the clipboard after the paste: $after bytes"
+if [ -z "$before" ] || [ "$before" = "0" ] || [ "$after" != "$before" ]; then echo "FAILED: the clipboard picture was not put back"; failed=1; fi
 expect "bye" quit
 pkill -x TextEdit || true
 exit $failed
