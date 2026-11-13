@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.20] - 2026-11-13
+
 - Fewer things need --real on Windows. click --with ctrl and drags also set the keys and the left button down in the app's own keyboard state for that moment, so WinForms sees modifier clicks and canvas drags. key x --hold ms holds a key in the background, with repeats. An entry of an open classic right-click menu is picked with the menu's own keys. Classic rich text boxes are set as an edit the app knows to save, and typing goes to their end. In browsers and Electron apps, type --paste posts Ctrl+V instead of taking focus, and a field Chromium dropped letters in is filled by a posted Ctrl+A and Ctrl+V. Minimized browser and Electron windows take input too: they are shown far off screen for the moment, under the foreground lock, and minimized again. On Linux, a click at x,y on a button, check box, tab, link, menu entry or list item presses it through AT-SPI instead of the pointer.
 
 ## [0.1.19] - 2026-11-13
