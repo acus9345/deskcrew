@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.19] - 2026-11-13
+
 - Browser and Electron windows that other windows cover all over take clicks, keys and reads in the background again, without --real and without coming forward: while an agent works in one, deskcrew tells Chromium a task switcher view is open, which makes it draw every window it has, and Chromium hides the window again afterwards. Minimized ones are still refused. A click at x,y on an app that draws itself, such as a WPF or Store app, presses the button, check box, tab or list item drawn there through accessibility, instead of asking for --real. Keys and shortcuts such as Enter and Ctrl+S reach WPF apps in the background: their window gets keyboard focus inside its own app for a moment, with the foreground lock held so it stays behind.
 
 ## [0.1.18] - 2026-11-13
