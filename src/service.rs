@@ -66,7 +66,7 @@ const MAX_TABLE_ROWS: usize = 500;
 const MAX_TABLE_COLUMNS: usize = 20;
 const MAX_CELL_CHARS: usize = 60;
 const STOPPED: &str = "stopped by the person with Ctrl+Alt+Esc: ask them before doing more (deskcrew resume clears it)";
-const COVERED: &str = "refused: this window is covered all over or minimized, and browser and Electron apps keep clicks and keys until part of them shows, then run them all at once. Ask the person to uncover part of it, or add --real. A browser opened with deskcrew launch takes input while covered";
+const COVERED: &str = "refused: this window is minimized, and browser and Electron apps take no clicks or keys until they are shown again. Ask the person to restore it, or add --real";
 /// Commands that act on a window, as opposed to reading it.
 const ACTIONS: [&str; 18] = ["click", "hover", "set", "type", "key", "check", "uncheck", "toggle", "expand", "collapse", "clear", "select", "scroll", "show", "drag", "draw", "down", "pick-file"];
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
@@ -107,6 +107,17 @@ fn append_value(node: &Node, root: Hwnd, text: &str) -> Option<Reply> {
     Some(act::set(node, root, &wanted).and_then(|route| {
         if node.element.value_text() == wanted { Ok(route) } else { Err("the text did not land: try --real".into()) }
     }))
+}
+
+/// The smallest control under a screen point that can be pressed: a button, check box, tab, list
+/// item or the like. None where the spot holds only a drawing surface.
+fn control_at(view: &View, x: i32, y: i32) -> Option<&Node> {
+    let inside = |&(left, top, width, height): &Bounds| width > 0 && height > 0 && x >= left && x < left + width && y >= top && y < top + height;
+    view.nodes
+        .values()
+        .filter(|node| inside(&node.rect) && (node.can.invoke || node.can.toggle || node.can.select || node.can.expand))
+        .filter(|node| !node.parts.states.contains(&"disabled"))
+        .min_by_key(|node| node.rect.2 as i64 * node.rect.3 as i64)
 }
 
 /// A press that needs the window in front, by the quietest way this spot of the app accepts.
@@ -842,6 +853,16 @@ impl Service {
                 _ => {}
             }
         }
+        // A spot in an app that draws itself takes no posted click, but the control drawn there
+        // can still be pressed through its own action.
+        if node.is_none() && plain && act::draws_at(tracked.hwnd, x, y) {
+            self.read(tracked, view, false)?;
+            if let Some(found) = control_at(view, x, y)
+                && let Some(pressed) = act::press(found)
+            {
+                return pressed.map(|route| format!("{route} on '{}' under {word}", found.parts.name));
+            }
+        }
         act::post_click(tracked.hwnd, x, y, flags.right, flags.double)
     }
 
@@ -994,6 +1015,8 @@ impl Service {
     fn is(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let [word, state] = words else { return Err("is e3 on|off|open|closed|selected|enabled|disabled".into()) };
         let tracked = self.pick(who, flags.window.as_deref())?;
+        // A covered browser window is drawn and takes input while an agent works in it.
+        let _drawn = win::keep_drawn(tracked.hwnd);
         let mut view = tracked.view.lock().unwrap();
         self.first_read(&tracked, &mut view, false)?;
         let Target::Control(id) = self.resolve(word, who, &tracked, &mut view)? else { return Err("is needs a control".into()) };
@@ -1331,7 +1354,9 @@ impl Service {
             return Err(STOPPED.into());
         }
         let tracked = self.pick(who, flags.window.as_deref())?;
-        if win::holds_input(tracked.hwnd) {
+        // A covered browser window is drawn and takes input while an agent works in it.
+        let _drawn = win::keep_drawn(tracked.hwnd);
+        if win::minimized(tracked.hwnd) && win::holds_input(tracked.hwnd) {
             return Err(COVERED.into());
         }
         let (strokes, pids) = {
@@ -1475,9 +1500,9 @@ impl Service {
         };
         let verb = words.first().map_or("", String::as_str);
         let rest = words.get(1..).unwrap_or(&[]);
-        // A browser or Electron window that does not show at all keeps its input and runs it all
-        // once part of it shows, so input sent now would only happen later, unseen.
-        if !flags.real && !flags.mouse && ACTIONS.contains(&verb) && win::is_chromium(tracked.hwnd) && win::holds_input(tracked.hwnd) {
+        // A minimized browser or Electron window drops or holds its input until it is shown again.
+        // A covered one is kept drawn while an agent works in it, so it takes input.
+        if !flags.real && !flags.mouse && ACTIONS.contains(&verb) && win::is_chromium(tracked.hwnd) && win::minimized(tracked.hwnd) && win::holds_input(tracked.hwnd) {
             return Err(COVERED.into());
         }
         match (verb, rest) {
@@ -1515,6 +1540,8 @@ impl Service {
             return Err(STOPPED.into());
         }
         let tracked = self.pick(who, flags.window.as_deref())?;
+        // A covered browser window is drawn and takes input while an agent works in it.
+        let _drawn = win::keep_drawn(tracked.hwnd);
         let mut guard = tracked.view.lock().unwrap();
         let view = &mut *guard;
         if !view.read_once {
@@ -1609,6 +1636,8 @@ impl Service {
     fn see(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let spec = words.first().map(String::as_str).or(flags.window.as_deref());
         let tracked = self.pick(who, spec)?;
+        // A covered browser window is drawn and takes input while an agent works in it.
+        let _drawn = win::keep_drawn(tracked.hwnd);
         let mut guard = tracked.view.lock().unwrap();
         let view = &mut *guard;
         self.first_read(&tracked, view, flags.all)?;
@@ -1719,6 +1748,8 @@ impl Service {
     fn table(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let word = words.first().ok_or("table needs a control")?;
         let tracked = self.pick(who, flags.window.as_deref())?;
+        // A covered browser window is drawn and takes input while an agent works in it.
+        let _drawn = win::keep_drawn(tracked.hwnd);
         let mut view = tracked.view.lock().unwrap();
         if !view.read_once {
             self.first_read(&tracked, &mut view, false)?;
@@ -1784,6 +1815,8 @@ impl Service {
     fn get(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let word = words.first().ok_or("get needs a control")?;
         let tracked = self.pick(who, flags.window.as_deref())?;
+        // A covered browser window is drawn and takes input while an agent works in it.
+        let _drawn = win::keep_drawn(tracked.hwnd);
         let mut view = tracked.view.lock().unwrap();
         if !view.read_once {
             self.first_read(&tracked, &mut view, false)?;
@@ -1834,6 +1867,8 @@ impl Service {
         let word = words.first();
         let control = word.and_then(|w| is_ref(w));
         let tracked = self.pick(who, if control.is_some() { flags.window.as_deref() } else { word.map(String::as_str).or(flags.window.as_deref()) })?;
+        // A covered browser window is drawn and takes input while an agent works in it.
+        let _drawn = win::keep_drawn(tracked.hwnd);
         let (left, top, ..) = win::rect(tracked.hwnd);
         let mut note = "";
         let (mut frame, mut units) = shot::window(tracked.hwnd)?;

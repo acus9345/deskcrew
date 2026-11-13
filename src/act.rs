@@ -291,12 +291,16 @@ pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: im
 
 /// One key or shortcut as window messages, to the control with focus in the app's window.
 pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String> {
+    // WPF reads keys only while its window has keyboard focus.
+    if win::is_wpf(root) {
+        return post_chord(root, chord, spec, true);
+    }
     let target = win::keyboard_target(root);
     if !win::takes_posted_keys(target) {
         return Err(NEEDS_REAL.into());
     }
     if chord.modified {
-        return post_chord(target, chord, spec);
+        return post_chord(target, chord, spec, false);
     }
     let vk = chord.keys[0].0 as u32;
     let scan = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) } as isize;
@@ -317,10 +321,14 @@ const CHORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
 /// and apps ask that state whether Ctrl is down, so the app's thread is joined to this one for a
 /// moment and its Ctrl, Shift or Alt set down while the keys go in. The person's own keyboard is
 /// another thread's, and is not touched.
-fn post_chord(target: Hwnd, chord: &Chord, spec: &str) -> Result<String, String> {
+///
+/// With `focus`, the window is also given keyboard focus inside its own app for those moments, as
+/// WPF needs. That makes it the active window of its app only: the lock keeps Windows from
+/// bringing it forward, and the person's window keeps their keys.
+fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<String, String> {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT,
+        GetFocus, GetKeyboardState, SetFocus, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, WM_SYSKEYDOWN, WM_SYSKEYUP};
     let Some(((key, extended), held)) = chord.keys.split_last() else { return Err("no key given".into()) };
@@ -358,9 +366,17 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
         if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
             return Err(format!("{spec} goes to the window in front: add --real"));
         }
+        let _lock = focus.then(win::ForegroundLock::take);
         let mine = GetCurrentThreadId();
         if AttachThreadInput(mine, theirs, 1) == 0 {
             return Err(NEEDS_REAL.into());
+        }
+        if focus {
+            SetFocus(target as HWND);
+            if GetFocus() != target as HWND {
+                AttachThreadInput(mine, theirs, 0);
+                return Err(NEEDS_REAL.into());
+            }
         }
         let mut saved = [0u8; 256];
         GetKeyboardState(saved.as_mut_ptr());
@@ -386,6 +402,10 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
             Ok::<(), String>(())
         })();
         SetKeyboardState(saved.as_ptr());
+        if focus {
+            // The app keeps no focused window, as before: its window stays in the back.
+            SetFocus(std::ptr::null_mut());
+        }
         AttachThreadInput(mine, theirs, 0);
         sent?;
     }

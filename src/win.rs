@@ -227,6 +227,90 @@ pub fn holds_input(hwnd: Hwnd) -> bool {
     !TAKES_INPUT_COVERED.lock().unwrap().contains(&pid(hwnd)) && fully_covered(hwnd)
 }
 
+/// How long Chromium takes to draw a covered window again once told to, and to take input there.
+const REDRAW_WAIT: Duration = Duration::from_millis(300);
+
+/// How many agents are working in covered browser windows right now, and from when Chromium is
+/// drawing them.
+static KEPT_DRAWN: std::sync::Mutex<(usize, Option<Instant>)> = std::sync::Mutex::new((0, None));
+
+/// A window of the kind Windows shows its task switcher thumbnails in, never put on screen.
+fn thumbnail_stand_in() -> Option<Hwnd> {
+    static STAND_IN: std::sync::OnceLock<Hwnd> = std::sync::OnceLock::new();
+    let made = *STAND_IN.get_or_init(|| {
+        let (tell, heard) = std::sync::mpsc::channel();
+        // A window ends with the thread that made it, so it gets a thread of its own.
+        thread::spawn(move || unsafe {
+            use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, WNDCLASSW};
+            let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+            let module = GetModuleHandleW(null_mut());
+            let class = wide("TaskListThumbnailWnd");
+            let mut kind: WNDCLASSW = zeroed();
+            kind.lpfnWndProc = Some(DefWindowProcW);
+            kind.hInstance = module;
+            kind.lpszClassName = class.as_ptr();
+            RegisterClassW(&kind);
+            let window = CreateWindowExW(WS_EX_TOOLWINDOW, class.as_ptr(), null_mut(), 0, 0, 0, 0, 0, null_mut(), null_mut(), module, null_mut());
+            let _ = tell.send(window as Hwnd);
+            let mut message: MSG = zeroed();
+            while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+                DispatchMessageW(&message);
+            }
+        });
+        heard.recv_timeout(Duration::from_secs(2)).unwrap_or(0)
+    });
+    (made != 0).then_some(made)
+}
+
+fn announce(stand_in: Hwnd, shown: bool) {
+    use windows_sys::Win32::UI::{
+        Accessibility::NotifyWinEvent,
+        WindowsAndMessaging::{CHILDID_SELF, EVENT_OBJECT_HIDE, EVENT_OBJECT_SHOW, OBJID_WINDOW},
+    };
+    unsafe { NotifyWinEvent(if shown { EVENT_OBJECT_SHOW } else { EVENT_OBJECT_HIDE }, raw(stand_in), OBJID_WINDOW, CHILDID_SELF as i32) };
+}
+
+/// While held, covered browser and Electron windows are drawn and take input. Dropping it lets
+/// Chromium hide them again once no agent is working in one.
+pub struct KeptDrawn(Option<Hwnd>);
+
+impl Drop for KeptDrawn {
+    fn drop(&mut self) {
+        let Some(stand_in) = self.0 else { return };
+        let mut working = KEPT_DRAWN.lock().unwrap();
+        working.0 -= 1;
+        if working.0 == 0 {
+            announce(stand_in, false);
+        }
+    }
+}
+
+/// Chromium stops drawing a browser or Electron window that other windows cover all over: it
+/// leaves it out of accessibility and drops the clicks sent to it. While Windows shows its task
+/// switcher thumbnails, Chromium draws every window it has, so deskcrew tells it a thumbnail view
+/// opened for as long as an agent works in a covered window. Nothing shows on screen, nothing
+/// moves, and the person's windows stay in front.
+pub fn keep_drawn(hwnd: Hwnd) -> KeptDrawn {
+    if !is_chromium(hwnd) || minimized(hwnd) || !holds_input(hwnd) {
+        return KeptDrawn(None);
+    }
+    let Some(stand_in) = thumbnail_stand_in() else { return KeptDrawn(None) };
+    let ready = {
+        let mut working = KEPT_DRAWN.lock().unwrap();
+        if working.0 == 0 {
+            announce(stand_in, true);
+            working.1 = Some(Instant::now() + REDRAW_WAIT);
+        }
+        working.0 += 1;
+        working.1
+    };
+    if let Some(ready) = ready {
+        thread::sleep(ready.saturating_duration_since(Instant::now()));
+    }
+    KeptDrawn(Some(stand_in))
+}
+
 /// True if no part of this window shows: it is minimized, or other windows cover it all over.
 /// A grid of points across it is checked, and any one that reaches it or a popup it owns counts.
 pub fn fully_covered(hwnd: Hwnd) -> bool {
@@ -426,6 +510,10 @@ pub fn keyboard_target(hwnd: Hwnd) -> Hwnd {
         // An app with its own engine takes keys in one window of its own.
         children(hwnd).into_iter().find(|child| key_site(*child)).unwrap_or(hwnd)
     }
+}
+
+pub fn is_wpf(hwnd: Hwnd) -> bool {
+    class(hwnd).starts_with("HwndWrapper")
 }
 
 /// The window a Store app or hosted XAML (Windows Terminal, for one) reads its keys from.
