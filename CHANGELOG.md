@@ -6,6 +6,10 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.18] - 2026-11-13
+
+- deskcrew log shows every command agents gave it: when, which agent, the command, whether it worked and the first line of the reply, with typed text, clipboard text and file contents shown only as their length. Taskbar buttons no longer stay flashing after agents work in an app: deskcrew puts out the flash Windows starts when such an app tries to come forward. Browser and Electron windows that are covered all over or minimized hold clicks and keys until they show again, so deskcrew now refuses input to them instead of reporting clicks that have not happened, and browsers opened with deskcrew launch take input behind other windows. The focus keeper counts a window as the person's choice only if their mouse press began on it.
+
 ## [0.1.17] - 2026-11-13
 
 - Fewer actions need --real. On Windows, shortcuts such as Ctrl+S and Ctrl+A go to classic apps, WinForms, Windows Terminal and Store apps in the background, to the control an agent last used; Windows Terminal and Store apps take typing in the background; WPF and XAML text boxes take type and paste through accessibility; and paste no longer presses Ctrl+V for real. On the Mac, a paste Chrome ignored in the back is filled in through accessibility. On Linux, scroll moves the scroll bar without the pointer. type --paste now puts back everything on the clipboard, pictures and copied files included, keeps the lent text out of clipboard history, and keeps anything copied in the meantime. A shot of a window not yet read points to see, which costs far fewer tokens.
