@@ -385,7 +385,40 @@ pub fn keyboard_target(hwnd: Hwnd) -> Hwnd {
         if GetGUIThreadInfo(thread, &mut info) != 0 && !info.hwndFocus.is_null() {
             return info.hwndFocus as Hwnd;
         }
-        hwnd
+        // A window in the back has no focused control, so keys go where an agent last clicked or
+        // typed in it, as they would after a real click there.
+        let field = FIELDS.lock().unwrap().get(&hwnd).copied();
+        if let Some(field) = field
+            && IsWindow(raw(field)) != 0
+            && GetAncestor(raw(field), GA_ROOT) as Hwnd == hwnd
+        {
+            return field;
+        }
+        // An app with its own engine takes keys in one window of its own.
+        children(hwnd).into_iter().find(|child| key_site(*child)).unwrap_or(hwnd)
+    }
+}
+
+/// The window a Store app or hosted XAML (Windows Terminal, for one) reads its keys from.
+pub fn key_site(hwnd: Hwnd) -> bool {
+    let name = class(hwnd);
+    name == "Windows.UI.Core.CoreWindow" || name.contains("InputSite")
+}
+
+/// Windows that take posted keys and characters: every classic window, and the key windows of
+/// apps that draw themselves. Their pointer input is another matter.
+pub fn takes_posted_keys(hwnd: Hwnd) -> bool {
+    !draws_itself(hwnd) || key_site(hwnd)
+}
+
+/// The control in each window that an agent last clicked or typed in.
+static FIELDS: std::sync::Mutex<std::collections::BTreeMap<Hwnd, Hwnd>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Note that an agent clicked or typed in this control, so later keys go to it.
+pub fn remember_field(control: Hwnd) {
+    let root = unsafe { GetAncestor(raw(control), GA_ROOT) } as Hwnd;
+    if root != 0 && root != control {
+        FIELDS.lock().unwrap().insert(root, control);
     }
 }
 

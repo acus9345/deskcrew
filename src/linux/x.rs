@@ -697,21 +697,91 @@ pub fn clipboard() -> Result<Option<String>, String> {
 pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
     let text = text.unwrap_or("");
     for (program, args) in [("xclip", &["-selection", "clipboard", "-i"][..]), ("xsel", &["--clipboard", "--input"][..])] {
-        let Ok(mut child) = Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn() else { continue };
-        if let Some(mut input) = child.stdin.take() {
-            input.write_all(text.as_bytes()).map_err(|e| e.to_string())?;
+        if let Some(done) = own_clipboard(program, args, text.as_bytes(), Some(text)) {
+            return done;
         }
-        // The program leaves a copy of itself behind to own the clipboard: wait until it does,
-        // so the next read sees the new text.
-        let started = Instant::now();
-        while started.elapsed() < Duration::from_secs(1) {
-            if child.try_wait().ok().flatten().is_some() && clipboard().ok().flatten().unwrap_or_default() == text {
-                return Ok(());
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-        thread::spawn(move || child.wait());
-        return Ok(());
     }
     Err("the clipboard needs xclip or xsel: install one (sudo apt install xclip)".into())
+}
+
+/// Hand the clipboard to xclip or xsel holding these bytes. None if the program is missing.
+fn own_clipboard(program: &str, args: &[&str], bytes: &[u8], text: Option<&str>) -> Option<Result<(), String>> {
+    let mut child = Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()?;
+    if let Some(mut input) = child.stdin.take()
+        && let Err(e) = input.write_all(bytes)
+    {
+        return Some(Err(e.to_string()));
+    }
+    // The program leaves a copy of itself behind to own the clipboard: wait until it does,
+    // so the next read sees the new contents.
+    let started = Instant::now();
+    while started.elapsed() < Duration::from_secs(1) {
+        if child.try_wait().ok().flatten().is_some() && text.is_none_or(|text| clipboard().ok().flatten().unwrap_or_default() == text) {
+            return Some(Ok(()));
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    thread::spawn(move || child.wait());
+    Some(Ok(()))
+}
+
+/// The kinds of data on the clipboard, as X apps name them.
+fn clipboard_kinds() -> Option<Vec<String>> {
+    let out = Command::new("xclip").args(["-selection", "clipboard", "-t", "TARGETS", "-o"]).stderr(Stdio::null()).output().ok()?;
+    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+}
+
+/// The kind of clipboard data worth keeping most: a picture, then copied files, then text.
+/// xclip can offer only one kind, so the others an app put there alongside it are not kept.
+fn main_kind(kinds: &[String]) -> Option<&String> {
+    const NOT_DATA: [&str; 6] = ["TARGETS", "TIMESTAMP", "MULTIPLE", "SAVE_TARGETS", "DELETE", "INCR"];
+    let first = |test: &dyn Fn(&str) -> bool| kinds.iter().find(|k| test(k));
+    first(&|k| k == "image/png")
+        .or_else(|| first(&|k| k.starts_with("image/")))
+        .or_else(|| first(&|k| k == "x-special/gnome-copied-files"))
+        .or_else(|| first(&|k| k == "text/uri-list"))
+        .or_else(|| first(&|k| k == "UTF8_STRING"))
+        .or_else(|| first(&|k| k.starts_with("text/plain")))
+        .or_else(|| first(&|k| !NOT_DATA.contains(&k)))
+}
+
+/// What was on the clipboard before an agent borrowed it to paste: its picture, copied files or
+/// text, whichever it held.
+pub struct SavedClipboard {
+    kept: Option<(String, Vec<u8>)>,
+    lent: Option<String>,
+}
+
+impl SavedClipboard {
+    pub fn take() -> SavedClipboard {
+        let kept = match clipboard_kinds() {
+            Some(kinds) => main_kind(&kinds).and_then(|kind| {
+                let out = Command::new("xclip").args(["-selection", "clipboard", "-t", kind, "-o"]).stderr(Stdio::null()).output().ok()?;
+                out.status.success().then(|| (kind.clone(), out.stdout))
+            }),
+            None => clipboard().ok().flatten().map(|text| ("UTF8_STRING".to_string(), text.into_bytes())),
+        };
+        SavedClipboard { kept, lent: None }
+    }
+
+    pub fn lend(&mut self, text: &str) -> Result<(), String> {
+        set_clipboard(Some(text))?;
+        self.lent = Some(text.to_string());
+        Ok(())
+    }
+
+    /// Put the person's clipboard back, unless they copied something new in the meantime.
+    pub fn put_back(self) -> Result<(), String> {
+        if let Some(lent) = &self.lent
+            && clipboard().ok().flatten().as_deref() != Some(lent.as_str())
+        {
+            return Ok(());
+        }
+        let Some((kind, bytes)) = self.kept else { return set_clipboard(None) };
+        if kind == "UTF8_STRING" || kind.starts_with("text/plain") {
+            return set_clipboard(Some(&String::from_utf8_lossy(&bytes)));
+        }
+        own_clipboard("xclip", &["-selection", "clipboard", "-t", &kind, "-i"], &bytes, None)
+            .unwrap_or_else(|| Err("the clipboard needs xclip to put a picture or files back".into()))
+    }
 }

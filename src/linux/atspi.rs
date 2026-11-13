@@ -25,6 +25,8 @@ const SENSITIVE: u32 = 24;
 const SHOWING: u32 = 25;
 const VISIBLE: u32 = 30;
 const INDETERMINATE: u32 = 32;
+const HORIZONTAL: u32 = 14;
+const VERTICAL: u32 = 29;
 const CHECKABLE: u32 = 41;
 
 /// One object on the accessibility bus.
@@ -449,6 +451,67 @@ pub fn focused(obj: &Obj) -> bool {
 pub fn focus(obj: &Obj) -> Result<(), String> {
     let done: bool = call(obj, "org.a11y.atspi.Component", "GrabFocus", &())?;
     if done { Ok(()) } else { Err("that control would not take focus".into()) }
+}
+
+fn parent(obj: &Obj) -> Option<Obj> {
+    let (bus, path): (String, OwnedObjectPath) = property(obj, ACCESSIBLE, "Parent").ok()?;
+    (path.as_str() != "/org/a11y/atspi/null" && path.as_str() != "/").then(|| Obj { bus, path: path.as_str().to_string() })
+}
+
+fn value_of(obj: &Obj, name: &str) -> Option<f64> {
+    property(obj, "org.a11y.atspi.Value", name).ok()
+}
+
+/// A scroll bar of this pane that runs this way and can be moved by its value.
+fn bar_of(pane: &Obj, vertical: bool) -> Option<Obj> {
+    children(pane).into_iter().find(|child| {
+        role_name(child) == "scroll bar" && has(states(child), if vertical { VERTICAL } else { HORIZONTAL }) && has_value(child)
+    })
+}
+
+/// The first pane with such a scroll bar, looking a little way into this control, breadth first.
+fn bar_inside(obj: &Obj, vertical: bool) -> Option<Obj> {
+    const LOOKED_AT_MOST: usize = 120;
+    let mut queue = std::collections::VecDeque::from([obj.clone()]);
+    let mut looked = 0;
+    while let Some(here) = queue.pop_front() {
+        looked += 1;
+        if looked > LOOKED_AT_MOST {
+            return None;
+        }
+        if let Some(bar) = bar_of(&here, vertical) {
+            return Some(bar);
+        }
+        queue.extend(children(&here));
+    }
+    None
+}
+
+/// Scroll by moving a scroll bar's value, which needs no pointer and no focus: the bar of this
+/// control or of the nearest pane around it, or the first one inside it, as for a whole window.
+/// Positive notches scroll down or right, each a tenth of the way or one step, whichever is more.
+pub fn scroll(obj: &Obj, vertical: bool, notches: i32) -> Result<(), String> {
+    let mut around = Some(obj.clone());
+    let mut bar = None;
+    for _ in 0..5 {
+        let Some(here) = around else { break };
+        bar = bar_of(&here, vertical);
+        if bar.is_some() {
+            break;
+        }
+        around = parent(&here);
+    }
+    let bar = bar.or_else(|| bar_inside(obj, vertical)).ok_or("no scroll bar here")?;
+    let (Some(now), Some(low), Some(high)) = (value_of(&bar, "CurrentValue"), value_of(&bar, "MinimumValue"), value_of(&bar, "MaximumValue")) else {
+        return Err("that scroll bar does not say where it is".into());
+    };
+    let step = ((high - low) / 10.0).max(value_of(&bar, "MinimumIncrement").unwrap_or(0.0));
+    let wanted = (now + step * notches as f64).clamp(low, high);
+    set_value(&bar, wanted)?;
+    if (value_of(&bar, "CurrentValue").unwrap_or(now) - now).abs() < f64::EPSILON && wanted != now {
+        return Err("that scroll bar did not move".into());
+    }
+    Ok(())
 }
 
 /// Scroll the control into view, where the toolkit supports it.

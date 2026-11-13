@@ -147,6 +147,7 @@ pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Resu
     post(hwnd, WM_MOUSEMOVE, 0, at)?;
     post(hwnd, down, held, at)?;
     post(hwnd, up, 0, at)?;
+    win::remember_field(hwnd);
     if double {
         post(hwnd, again, held, at)?;
         post(hwnd, up, 0, at)?;
@@ -252,6 +253,7 @@ fn is_classic_text(node: &Node, root: Hwnd) -> bool {
 pub fn set(node: &Node, root: Hwnd, value: &str) -> Result<String, String> {
     // Accessibility would focus a classic text box first, which activates its window.
     if is_classic_text(node, root) {
+        win::remember_field(node.native);
         return set_window_text(node.native, value).map(|_| "message".into());
     }
     if node.can.range
@@ -271,9 +273,10 @@ pub fn post_text(hwnd: Hwnd, text: &str, stop: &AtomicBool) -> Result<String, St
 
 /// Type as window messages, telling `next` before each key which window takes it and what it is.
 pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: impl FnMut(Hwnd, u16)) -> Result<String, String> {
-    if win::draws_itself(hwnd) {
+    if !win::takes_posted_keys(hwnd) {
         return Err(NEEDS_REAL.into());
     }
+    win::remember_field(hwnd);
     for unit in text.encode_utf16() {
         if stop.load(Ordering::Relaxed) {
             return Err("stopped by the person with Ctrl+Alt+Esc".into());
@@ -286,22 +289,106 @@ pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: im
     Ok("message".into())
 }
 
-/// One plain key as window messages. A held Ctrl or Shift cannot travel this way.
+/// One key or shortcut as window messages, to the control with focus in the app's window.
 pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String> {
-    if chord.modified {
-        return Err(format!("{spec} needs the real keyboard: add --real"));
-    }
     let target = win::keyboard_target(root);
-    if win::draws_itself(target) || win::draws_itself(root) {
+    if !win::takes_posted_keys(target) {
         return Err(NEEDS_REAL.into());
+    }
+    if chord.modified {
+        return post_chord(target, chord, spec);
     }
     let vk = chord.keys[0].0 as u32;
     let scan = unsafe { MapVirtualKeyW(vk, MAPVK_VK_TO_VSC) } as isize;
     post(target, WM_KEYDOWN, vk as usize, 1 | (scan << 16))?;
-    if matches!(vk, 0x08 | 0x09 | 0x0D | 0x1B | 0x20) {
+    // XAML makes the character from the key itself, so it would get Enter twice.
+    if matches!(vk, 0x08 | 0x09 | 0x0D | 0x1B | 0x20) && !win::key_site(target) {
         post(target, WM_CHAR, vk as usize, 1 | (scan << 16))?;
     }
     post(target, WM_KEYUP, vk as usize, 1 | (scan << 16) | (1 << 30) | (1 << 31))?;
+    Ok("message".into())
+}
+
+/// How long an app gets to take each half of a posted shortcut while its Ctrl, Shift or Alt is
+/// held down for it.
+const CHORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
+
+/// A shortcut such as ctrl+s as window messages. A posted key does not move the keyboard's state,
+/// and apps ask that state whether Ctrl is down, so the app's thread is joined to this one for a
+/// moment and its Ctrl, Shift or Alt set down while the keys go in. The person's own keyboard is
+/// another thread's, and is not touched.
+fn post_chord(target: Hwnd, chord: &Chord, spec: &str) -> Result<String, String> {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+        GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId, WM_SYSKEYDOWN, WM_SYSKEYUP};
+    let Some(((key, extended), held)) = chord.keys.split_last() else { return Err("no key given".into()) };
+    let left = |vk: u16| match vk {
+        VK_CONTROL => Some(VK_LCONTROL),
+        VK_SHIFT => Some(VK_LSHIFT),
+        VK_MENU => Some(VK_LMENU),
+        _ => None,
+    };
+    // The Windows key belongs to the shell, and a second ordinary key cannot be held this way.
+    if held.iter().any(|(vk, _)| left(*vk).is_none()) {
+        return Err(format!("{spec} needs the real keyboard: add --real"));
+    }
+    let alt = held.iter().any(|(vk, _)| *vk == VK_MENU);
+    let ctrl = held.iter().any(|(vk, _)| *vk == VK_CONTROL);
+    // Alt on its own makes system keys, which is how menus and Alt shortcuts are found.
+    let (down, up) = if alt && !ctrl { (WM_SYSKEYDOWN, WM_SYSKEYUP) } else { (WM_KEYDOWN, WM_KEYUP) };
+    let bits = |vk: u16, extended: bool, release: bool| {
+        let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as isize;
+        let mut lparam = 1 | (scan << 16);
+        if extended {
+            lparam |= 1 << 24;
+        }
+        if alt {
+            lparam |= 1 << 29;
+        }
+        if release {
+            lparam |= (1 << 30) | (1 << 31);
+        }
+        lparam
+    };
+    unsafe {
+        let theirs = GetWindowThreadProcessId(target as HWND, std::ptr::null_mut());
+        // An app the person is using shares its keyboard state with them: leave that one alone.
+        if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
+            return Err(format!("{spec} goes to the window in front: add --real"));
+        }
+        let mine = GetCurrentThreadId();
+        if AttachThreadInput(mine, theirs, 1) == 0 {
+            return Err(NEEDS_REAL.into());
+        }
+        let mut saved = [0u8; 256];
+        GetKeyboardState(saved.as_mut_ptr());
+        let mut state = saved;
+        for (vk, _) in held {
+            state[*vk as usize] |= 0x80;
+            if let Some(side) = left(*vk) {
+                state[side as usize] |= 0x80;
+            }
+        }
+        SetKeyboardState(state.as_ptr());
+        let sent = (|| {
+            for (vk, e) in held {
+                post(target, down, *vk as usize, bits(*vk, *e, false))?;
+            }
+            post(target, down, *key as usize, bits(*key, *extended, false))?;
+            std::thread::sleep(CHORD_SETTLE);
+            post(target, up, *key as usize, bits(*key, *extended, true))?;
+            for (vk, e) in held.iter().rev() {
+                post(target, up, *vk as usize, bits(*vk, *e, true))?;
+            }
+            std::thread::sleep(CHORD_SETTLE);
+            Ok::<(), String>(())
+        })();
+        SetKeyboardState(saved.as_ptr());
+        AttachThreadInput(mine, theirs, 0);
+        sent?;
+    }
     Ok("message".into())
 }
 

@@ -5,7 +5,7 @@ gi.require_version('Gtk', '3.0')
 from gi.repository import Gtk
 
 win = Gtk.Window(title='Deskcrew Form')
-win.set_default_size(420, 260)
+win.set_default_size(420, 360)
 win.move(60, 60)
 grid = Gtk.Grid(row_spacing=8, column_spacing=8, margin=12)
 win.add(grid)
@@ -33,6 +33,14 @@ def submit(_):
     text = f'Ordered for {name.get_text()} to {country.get_active_text()}, gift wrap {"yes" if gift.get_active() else "no"}'
     result.set_text(text)
     print(text, flush=True)
+
+# A pane that scrolls, which says where it got to.
+notes = named(Gtk.TextView(), 'Notes')
+notes.get_buffer().set_text(chr(10).join(f'line {n}' for n in range(1, 61)))
+pane = Gtk.ScrolledWindow(min_content_height=80)
+pane.add(notes)
+pane.get_vadjustment().connect('value-changed', lambda a: print(f'scrolled to {int(a.get_value())}', flush=True))
+grid.attach(pane, 1, 5, 1, 1)
 
 button = Gtk.Button(label='Submit')
 button.connect('clicked', submit)

@@ -16,8 +16,11 @@ use windows::{
 use windows_sys::Win32::{
     Foundation::GlobalFree,
     System::{
-        DataExchange::{CloseClipboard, EmptyClipboard, GetClipboardData, IsClipboardFormatAvailable, OpenClipboard, SetClipboardData},
-        Memory::{GHND, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
+        DataExchange::{
+            CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+            RegisterClipboardFormatW, SetClipboardData,
+        },
+        Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock},
     },
     UI::{Shell::ShellExecuteW, WindowsAndMessaging::SW_SHOWNOACTIVATE},
 };
@@ -165,24 +168,107 @@ pub fn clipboard_text() -> Result<String, String> {
 }
 
 pub fn set_clipboard(text: &str) -> Result<(), String> {
-    let units = wide(text);
+    put_on_clipboard(&[(CF_UNICODETEXT, units_as_bytes(&wide(text)))])
+}
+
+fn units_as_bytes(units: &[u16]) -> Vec<u8> {
+    units.iter().flat_map(|u| u.to_le_bytes()).collect()
+}
+
+/// Empty the clipboard and put these formats on it, opening it once so no one sees half of it.
+fn put_on_clipboard(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
     unsafe {
         open_clipboard()?;
-        let memory = GlobalAlloc(GHND, units.len() * 2);
-        if memory.is_null() {
-            CloseClipboard();
-            return Err("not enough memory for the clipboard".into());
-        }
-        let locked = GlobalLock(memory) as *mut u16;
-        copy_nonoverlapping(units.as_ptr(), locked, units.len());
-        GlobalUnlock(memory);
         EmptyClipboard();
-        if SetClipboardData(CF_UNICODETEXT, memory).is_null() {
-            GlobalFree(memory);
-            CloseClipboard();
-            return Err("Windows refused the clipboard text".into());
+        for (format, bytes) in formats {
+            let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1));
+            if memory.is_null() {
+                CloseClipboard();
+                return Err("not enough memory for the clipboard".into());
+            }
+            let locked = GlobalLock(memory) as *mut u8;
+            copy_nonoverlapping(bytes.as_ptr(), locked, bytes.len());
+            GlobalUnlock(memory);
+            if SetClipboardData(*format, memory).is_null() {
+                GlobalFree(memory);
+                CloseClipboard();
+                return Err("Windows refused the clipboard text".into());
+            }
         }
         CloseClipboard();
         Ok(())
+    }
+}
+
+/// Clipboard formats that are a handle to something other than a block of memory (a bitmap, a
+/// metafile, a palette, or a private handle), which cannot be copied as bytes. Windows makes the
+/// bitmap ones again from the DIB that is kept.
+fn handle_format(format: u32) -> bool {
+    matches!(format, 2 | 3 | 9 | 14 | 0x80 | 0x82 | 0x83 | 0x8E) || (0x200..=0x3FF).contains(&format)
+}
+
+/// Clipboard text that clipboard history, cloud clipboard and clipboard managers leave out.
+fn quiet_format() -> u32 {
+    let name = wide("ExcludeClipboardContentFromMonitorProcessing");
+    unsafe { RegisterClipboardFormatW(name.as_ptr()) }
+}
+
+/// Everything that was on the clipboard before an agent borrowed it to paste: text, pictures,
+/// copied files, all of it.
+pub struct SavedClipboard {
+    formats: Vec<(u32, Vec<u8>)>,
+    /// Which change of the clipboard the agent's own text was, once it is put there.
+    lent: Option<u32>,
+}
+
+impl SavedClipboard {
+    pub fn take() -> Result<SavedClipboard, String> {
+        let mut formats = Vec::new();
+        unsafe {
+            open_clipboard()?;
+            let mut format = 0;
+            loop {
+                format = EnumClipboardFormats(format);
+                if format == 0 {
+                    break;
+                }
+                if handle_format(format) {
+                    continue;
+                }
+                let data = GetClipboardData(format);
+                if data.is_null() {
+                    continue;
+                }
+                let locked = GlobalLock(data) as *const u8;
+                if locked.is_null() {
+                    continue;
+                }
+                formats.push((format, std::slice::from_raw_parts(locked, GlobalSize(data)).to_vec()));
+                GlobalUnlock(data);
+            }
+            CloseClipboard();
+        }
+        Ok(SavedClipboard { formats, lent: None })
+    }
+
+    /// Put the agent's text on the clipboard, kept out of the person's clipboard history.
+    pub fn lend(&mut self, text: &str) -> Result<(), String> {
+        put_on_clipboard(&[(CF_UNICODETEXT, units_as_bytes(&wide(text))), (quiet_format(), vec![0; 4])])?;
+        self.lent = Some(unsafe { GetClipboardSequenceNumber() });
+        Ok(())
+    }
+
+    /// Put the person's clipboard back, unless they copied something new in the meantime.
+    pub fn put_back(self) -> Result<(), String> {
+        if self.lent.is_some_and(|lent| unsafe { GetClipboardSequenceNumber() } != lent) {
+            return Ok(());
+        }
+        // Putting it back is not a new copy, so history does not get it twice.
+        let quiet = quiet_format();
+        let mut formats = self.formats;
+        if !formats.iter().any(|(format, _)| *format == quiet) {
+            formats.push((quiet, vec![0; 4]));
+        }
+        put_on_clipboard(&formats)
     }
 }

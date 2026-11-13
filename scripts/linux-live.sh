@@ -78,10 +78,28 @@ fi
 expect "Ada Lovelace" do "type Name ' Lovelace'" -w "Deskcrew Form"
 expect "Ada Lovelace" get Name -w "Deskcrew Form"
 expect ".png" shot "Deskcrew Form"
+if [ -z "$plain" ]; then
+    # Scrolling moves the pane's scroll bar through accessibility: no pointer, no raising.
+    expect "scroll bar" scroll Notes down 2 -w "Deskcrew Form"
+fi
 if command -v xclip >/dev/null || command -v xsel >/dev/null; then
     expect "ok" clip set "deskcrew clip"
     expect "deskcrew clip" clip
-else
+fi
+picture="$(ls ~/.cache/deskcrew/shots/*.png 2>/dev/null | head -1)"
+if command -v xclip >/dev/null && [ -n "$picture" ]; then
+    # A picture on the clipboard is still there after an agent pastes text.
+    xclip -selection clipboard -t image/png -i "$picture" &
+    sleep 0.5
+    expect "paste" type Name " pasted" --paste -w "Deskcrew Form"
+    expect "pasted" get Name -w "Deskcrew Form"
+    sleep 0.5
+    if xclip -selection clipboard -t image/png -o 2>/dev/null | cmp -s - "$picture"; then
+        echo "the clipboard picture came back"
+    else
+        echo "FAILED: the clipboard picture was not put back"; failed=1
+    fi
+elif ! command -v xclip >/dev/null && ! command -v xsel >/dev/null; then
     echo "SKIPPED the clipboard checks: neither xclip nor xsel is installed"
 fi
 # Each agent's drawn cursor is on the screen, in its colour: Claude's is 208,111,89.

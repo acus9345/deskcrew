@@ -49,6 +49,8 @@ Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the app forward for a moment and uses the system keyboard: a last resort).
 macOS asks once for Accessibility, and for Screen Recording before the first picture.";
 
+/// What a picture of a window the agent has not read yet says: reading is far cheaper.
+const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 const SETTLE_FIRST: Duration = Duration::from_millis(60);
 const SETTLE_STEP: Duration = Duration::from_millis(80);
@@ -676,17 +678,30 @@ impl Service {
         }
         self.overlay.typing(who, text.chars().count());
         if flags.paste {
-            let saved = apps::clipboard();
-            apps::set_clipboard(Some(text))?;
-            let paste = input::chord("cmd+v")?;
-            let sent = if flags.real {
-                self.front(tracked, || input::press(input::To::Front, &paste, 0, Duration::ZERO))
-            } else {
-                input::press(input::To::App(tracked.pid), &paste, 0, Duration::ZERO)
-            };
+            let before = field.as_ref().and_then(|f| ax::text(f, "AXValue"));
+            let mut saved = apps::SavedClipboard::take();
+            saved.lend(text)?;
+            let paste = input::chord("cmd+v");
+            let sent = paste.and_then(|paste| {
+                if flags.real {
+                    self.front(tracked, || input::press(input::To::Front, &paste, 0, Duration::ZERO))
+                } else {
+                    input::press(input::To::App(tracked.pid), &paste, 0, Duration::ZERO)
+                }
+            });
             thread::sleep(PASTE_SETTLE);
-            let _ = apps::set_clipboard(saved.as_deref());
+            saved.put_back()?;
             sent?;
+            // Chromium and Electron apps ignore Cmd+V while they are behind other windows: a field
+            // that did not get the text gets it through accessibility, which needs no focus.
+            if let (Some(field), Some(before)) = (&field, before)
+                && !flags.real
+                && ax::text(field, "AXValue").as_deref() == Some(before.as_str())
+                && ax::settable(field, "AXValue")
+            {
+                ax::set_text(field, &(before + text))?;
+                return Ok("value".into());
+            }
             return Ok("paste".into());
         }
         let before = field.as_ref().and_then(|f| ax::text(f, "AXValue"));
@@ -1176,8 +1191,10 @@ impl Service {
         } else {
             state.shots.insert(tracked.window, LastShot { hash: 0, frame: Frame { w: 0, h: 0, pixels: Vec::new() }, frames });
         }
+        // An agent taking pictures of a window it has never read is pointed to the cheaper way.
+        let unread = if control.is_none() && !flags.marks && !state.seen.contains_key(&tracked.window) { READ_FIRST } else { "" };
         let part = if crop.is_some() { " changed part" } else { "" };
-        Ok(format!("{} {}x{} scale {per_pixel:.2}{part}", path.display(), small.w, small.h))
+        Ok(format!("{} {}x{} scale {per_pixel:.2}{part}", path.display(), small.w, small.h) + unread)
     }
 
     fn launch(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {

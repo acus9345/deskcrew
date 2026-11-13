@@ -128,7 +128,8 @@ The Linux version is the newest and least tried. CI runs it on Ubuntu under Xvfb
 
 - Controls are read and pressed through AT-SPI, the accessibility bus GTK, Qt, Firefox, Chromium and LibreOffice speak, so `see`, `set`, `check`, `select` and pressing buttons work in the background, behind other windows, without the pointer. GTK apps take part once the bus is running. Qt apps need `QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1`, and Chrome `--force-renderer-accessibility`.
 - Keys and typing go through XTest to the agent's window, which gets the keyboard for a moment without being raised: X keeps the keyboard focus apart from which window is on top, so your window stays in front. This also reaches apps that ignore keys while behind others, such as Chrome. Anything you type during those moments goes to the agent's window.
-- Clicks on x,y points, drags, drawing and scrolling use the X pointer, so deskcrew brings the window forward for a moment, uses it, then puts the pointer and the front window back. On a virtual display no one notices; on a person's own desktop the pointer moves briefly.
+- Scrolling moves a scroll bar through AT-SPI where the app has one, so the window stays where it is.
+- Clicks on x,y points, drags, drawing and scrolling where there is no scroll bar use the X pointer, so deskcrew brings the window forward for a moment, uses it, then puts the pointer and the front window back. GTK, Qt and Chrome read the pointer through XInput 2 and ignore made-up X events, so there is no background way for these. On a virtual display no one notices; on a person's own desktop the pointer moves briefly.
 - The window list comes from the window manager, or straight from the X server on a bare Xvfb with none.
 - The accessibility bus is the one `AT_SPI_BUS_ADDRESS` or the display names, or else the one at-spi2-core starts. Without at-spi2-core's registry, deskcrew finds the apps on the bus itself.
 - Each agent has its drawn cursor, as on Windows and the Mac. Its edges are smooth with a compositor, and cut to its outline on a bare Xvfb. The name is drawn in Liberation Sans Bold, or DejaVu Sans Bold, whichever is installed. deskcrew's own shots leave the cursors out.
@@ -319,7 +320,7 @@ Some classic controls answer an accessibility request by quietly clicking with t
 
 **Cursors and press effects can be covered.** They sit directly above the window they work on, and above its menus and popups, not on top of everything. Put another window over that app and it covers the cursor and the effect too. `deskcrew demo` has no window to follow, so it stays on top.
 
-**Focus is a last resort.** Every action tries a background route first, and only `--real`, `down`, `notifications` and `launch --front` take focus on purpose. `type --paste` into a classic text box and `click --with ctrl` run in the background.
+**Focus is a last resort.** Every action tries a background route first, and only `--real`, `down`, `notifications` and `launch --front` take focus on purpose. `type --paste` and `click --with ctrl` run in the background, and so do keyboard shortcuts such as Ctrl+S and Ctrl+A in classic apps, Windows Terminal and Store apps.
 
 Anything that borrows focus waits for a pause in your own typing, is one agent at a time, and gives focus back afterwards. It is refused if a point is not on the target window, so it cannot land on something else you have open.
 
@@ -364,13 +365,15 @@ desk-pilot always moved your real pointer; deskcrew only does with `--real` or `
 - The Windows version is the tested one. The macOS version has never been run (see [macOS](#macos)), and Linux is not written.
 - On a Mac, pictures use `CGWindowListCreateImage`, which Apple has deprecated. A future macOS may stop it working, and then pictures would need ScreenCaptureKit.
 - On a Mac, typed text goes out as key events carrying the characters. An app that reads key codes instead may get the wrong letters.
-- `notifications`, `down` and `--real` take focus, so they can interrupt what you are doing, and so does `type --paste` outside a classic text box. A key held with `down` reaches whichever window has focus, and is let go after 30 s, on `quit` and on Ctrl+Alt+Esc. If deskcrew is killed outright it stays down until you press that key.
+- `notifications`, `down` and `--real` take focus, so they can interrupt what you are doing, and so does `type --paste` into a browser or Electron app. A key held with `down` reaches whichever window has focus, and is let go after 30 s, on `quit` and on Ctrl+Alt+Esc. If deskcrew is killed outright it stays down until you press that key.
 - `--real` typing stops if focus leaves the window, and reports how much it had typed.
 - `click --with ctrl` sends the modifier with the click. Apps that read the keyboard instead, such as WinForms, need `--real` as well.
 - `expand` needs a control that offers it: a WinForms combo box does not, so use `select` there.
 - The newest commands, such as `hover`, `down`, `check`, `is` and `notifications`, were tested by hand on throwaway windows and are not in the 65-check suite yet.
-- Keyboard shortcuts need `--real`, because they have to go to the window in front. While a `--real` action runs, anything you type goes to that window.
-- Text boxes drawn by XAML take `set`, but `type` needs `--real`.
+- Keyboard shortcuts go in the background as window messages: for that moment the app's own copy of the keyboard state has Ctrl, Shift or Alt held, and yours does not. They reach classic apps, WinForms, Windows Terminal and Store apps, to the control an agent last clicked or typed in. WPF apps, browsers and Electron apps read keys only while in front, so shortcuts there need `--real`, and so does the Windows key. While a `--real` action runs, anything you type goes to that window.
+- Windows Terminal and Store apps (Calculator, for one) take typing and keys in the background, but not posted clicks: their buttons are pressed through accessibility instead. Some Store apps, Calculator among them, read Enter and Escape only from the real keyboard.
+- Text boxes drawn by WPF or XAML are typed and pasted into through their accessibility value, in the background.
+- `type --paste` lends the clipboard for a moment and then puts back all of it: text, pictures, copied files. The lent text is marked so Windows clipboard history and Mac clipboard managers leave it out, and if you copy something while it is lent, yours is kept. On Linux, xclip keeps one kind of data, so a picture, copied files or text comes back, but not the other kinds an app put alongside it.
 - Browser and Electron windows are clicked, typed into, set and drawn in by window messages, covered or not, because accessibility makes them pull their window over yours. A covered browser stops repainting, so `shot` can show an old picture of it until it is uncovered.
 - Chromium on Windows takes keys only while it is the active window, and Windows always brings the active window forward. So typing into a browser or Electron app in the back may need `--real`, which brings it forward for the typing and gives the front back. Every other route was tried: window messages, faked activation and focus, and accessibility, which pulls the window forward on every letter. The Mac and Linux versions do not have this limit.
 - Windows of the same browser share one process, and activate each other when worked at the same time, which loses input. Parallel agents need separate apps or separate browser profiles.

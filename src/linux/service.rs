@@ -48,6 +48,8 @@ Controls go through accessibility (AT-SPI) in the background. Keys and typing ta
 for a moment without raising it; points and drawing use the X pointer, bringing the window forward. Flags: -w window, --agent name, --fast, --force (allow risky keys).
 Wayland is not supported: it does not let one app read or drive another.";
 
+/// What a picture of a window the agent has not read yet says: reading is far cheaper.
+const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 const SETTLE_FIRST: Duration = Duration::from_millis(60);
 const SETTLE_STEP: Duration = Duration::from_millis(80);
@@ -694,12 +696,12 @@ impl Service {
             let _ = atspi::focus(field);
         }
         if flags.paste {
-            let saved = x::clipboard().ok().flatten();
-            x::set_clipboard(Some(text))?;
+            let mut saved = x::SavedClipboard::take();
+            saved.lend(text)?;
             thread::sleep(PASTE_SETTLE);
             let sent = self.keyboard(tracked, || x::press(&x::chord("ctrl+v")?, Duration::ZERO));
             thread::sleep(PASTE_SETTLE);
-            let _ = x::set_clipboard(saved.as_deref());
+            saved.put_back()?;
             sent?;
             return Ok("paste".into());
         }
@@ -759,6 +761,20 @@ impl Service {
         };
         self.cursor_on(who, tracked, (px, py, 0, 0), false);
         let sideways = words[at] == "left" || words[at] == "right";
+        // A scroll bar moves through accessibility, with no pointer and the window left where it is.
+        let control = match words[..at].first() {
+            Some(word) => match self.resolve(word, who, tracked, view)? {
+                Target::Control(id) => view.nodes.get(&id).map(|node| node.element.clone()),
+                Target::Point(..) => None,
+            },
+            None => view.element.clone(),
+        };
+        let onward = if words[at] == "down" || words[at] == "right" { times } else { -times };
+        if let Some(control) = control
+            && atspi::scroll(&control, !sideways, onward).is_ok()
+        {
+            return Ok("scroll bar".into());
+        }
         let notches = if words[at] == "up" || words[at] == "right" { times } else { -times };
         let notches = if sideways { -notches } else { notches };
         self.front(tracked, || x::wheel(px, py, notches, sideways))?;
@@ -1117,8 +1133,10 @@ impl Service {
         } else {
             state.shots.insert(tracked.window, LastShot { hash: 0, frame: Frame { w: 0, h: 0, pixels: Vec::new() }, frames });
         }
+        // An agent taking pictures of a window it has never read is pointed to the cheaper way.
+        let unread = if control.is_none() && !flags.marks && !state.seen.contains_key(&tracked.window) { READ_FIRST } else { "" };
         let part = if crop.is_some() { " changed part" } else { "" };
-        Ok(format!("{} {}x{} scale {scale:.2}{part}", path.display(), small.w, small.h))
+        Ok(format!("{} {}x{} scale {scale:.2}{part}", path.display(), small.w, small.h) + unread)
     }
 
     fn launch(&self, who: &str, words: &[String]) -> Reply {

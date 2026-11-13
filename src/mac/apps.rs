@@ -203,6 +203,116 @@ pub fn clipboard() -> Option<String> {
     })
 }
 
+/// Everything on the clipboard before an agent borrowed it to paste: every item and every kind of
+/// data on each, so pictures and copied files come back as well as text.
+pub struct SavedClipboard {
+    items: Vec<Vec<(String, Vec<u8>)>>,
+    /// The clipboard's change count once the agent's own text is on it.
+    lent: Option<isize>,
+}
+
+/// Kinds that ask clipboard managers and Universal Clipboard to leave an entry alone (nspasteboard.org).
+const LEAVE_ALONE: [&str; 2] = ["org.nspasteboard.TransientType", "org.nspasteboard.ConcealedType"];
+
+fn mark_left_alone(board: *mut objc2::runtime::AnyObject) {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    unsafe {
+        for kind in LEAVE_ALONE {
+            let empty: *mut AnyObject = msg_send![class!(NSData), data];
+            let _: bool = msg_send![board, setData: empty, forType: ns_string(kind)];
+        }
+    }
+}
+
+impl SavedClipboard {
+    pub fn take() -> SavedClipboard {
+        use objc2::msg_send;
+        use objc2::runtime::AnyObject;
+        use std::ffi::{CStr, c_char, c_void};
+        let items = objc2::rc::autoreleasepool(|_| unsafe {
+            let mut items = Vec::new();
+            let list: *mut AnyObject = msg_send![pasteboard(), pasteboardItems];
+            if list.is_null() {
+                return items;
+            }
+            let count: usize = msg_send![list, count];
+            for at in 0..count {
+                let item: *mut AnyObject = msg_send![list, objectAtIndex: at];
+                let kinds: *mut AnyObject = msg_send![item, types];
+                let kinds_count: usize = if kinds.is_null() { 0 } else { msg_send![kinds, count] };
+                let mut kept = Vec::new();
+                for k in 0..kinds_count {
+                    let kind: *mut AnyObject = msg_send![kinds, objectAtIndex: k];
+                    let name: *const c_char = msg_send![kind, UTF8String];
+                    let data: *mut AnyObject = msg_send![item, dataForType: kind];
+                    if name.is_null() || data.is_null() {
+                        continue;
+                    }
+                    let length: usize = msg_send![data, length];
+                    let bytes: *const c_void = msg_send![data, bytes];
+                    let copy = if length == 0 || bytes.is_null() { Vec::new() } else { std::slice::from_raw_parts(bytes as *const u8, length).to_vec() };
+                    kept.push((CStr::from_ptr(name).to_string_lossy().into_owned(), copy));
+                }
+                if !kept.is_empty() {
+                    items.push(kept);
+                }
+            }
+            items
+        });
+        SavedClipboard { items, lent: None }
+    }
+
+    /// Put the agent's text on the clipboard, marked so clipboard managers leave it out.
+    pub fn lend(&mut self, text: &str) -> Result<(), String> {
+        use objc2::msg_send;
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let board = pasteboard();
+            let _: isize = msg_send![board, clearContents];
+            let kind = ns_string(PLAIN_TEXT.to_str().unwrap_or_default());
+            let done: bool = msg_send![board, setString: ns_string(text), forType: kind];
+            if !done {
+                return Err("macOS refused the clipboard text".into());
+            }
+            mark_left_alone(board);
+            self.lent = Some(msg_send![board, changeCount]);
+            Ok(())
+        })
+    }
+
+    /// Put the person's clipboard back, unless they copied something new in the meantime.
+    pub fn put_back(self) -> Result<(), String> {
+        use objc2::runtime::AnyObject;
+        use objc2::{class, msg_send};
+        use std::ffi::c_void;
+        objc2::rc::autoreleasepool(|_| unsafe {
+            let board = pasteboard();
+            if let Some(lent) = self.lent {
+                let now: isize = msg_send![board, changeCount];
+                if now != lent {
+                    return Ok(());
+                }
+            }
+            let _: isize = msg_send![board, clearContents];
+            if self.items.is_empty() {
+                return Ok(());
+            }
+            let list: *mut AnyObject = msg_send![class!(NSMutableArray), array];
+            for kept in &self.items {
+                let item: *mut AnyObject = msg_send![class!(NSPasteboardItem), new];
+                for (kind, bytes) in kept {
+                    let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() as *const c_void, length: bytes.len()];
+                    let _: bool = msg_send![item, setData: data, forType: ns_string(kind)];
+                }
+                let _: () = msg_send![list, addObject: item];
+                let _: () = msg_send![item, release];
+            }
+            let done: bool = msg_send![board, writeObjects: list];
+            if done { Ok(()) } else { Err("macOS would not take the clipboard back".into()) }
+        })
+    }
+}
+
 /// Replace the clipboard with text, or empty it with None.
 pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
     use objc2::msg_send;

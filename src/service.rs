@@ -26,6 +26,8 @@ use std::{
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE};
 
+/// What a picture of a window the agent has not read yet says: reading is far cheaper.
+const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
 const SETTLE_FIRST: Duration = Duration::from_millis(50);
 const SETTLE_STEP: Duration = Duration::from_millis(60);
@@ -91,6 +93,18 @@ Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen: a last resort),
 --mouse (asks the person to borrow their cursor, if they allow asking: only if nothing else works).
 cursor [off|ask|session|always]   who may borrow the cursor; off by default, and the person confirms anything else."#;
+
+/// Add text to the end of a control through the value it reports, for a control that takes no
+/// window messages. None if it has no value that can be set.
+fn append_value(node: &Node, root: Hwnd, text: &str) -> Option<Reply> {
+    if !node.can.value || node.element.value_read_only() {
+        return None;
+    }
+    let wanted = format!("{}{text}", node.element.value_text());
+    Some(act::set(node, root, &wanted).and_then(|route| {
+        if node.element.value_text() == wanted { Ok(route) } else { Err("the text did not land: try --real".into()) }
+    }))
+}
 
 /// A press that needs the window in front, by the quietest way this spot of the app accepts.
 fn press_at(root: Hwnd, x: i32, y: i32, flags: &Flags) -> Reply {
@@ -860,14 +874,32 @@ impl Service {
             let (node, rect) = self.locate(id, tracked, view)?;
             self.cursor_on(who, flags, rect);
             field = act::native_window(&node, tracked.hwnd).filter(|hwnd| !flags.real && !win::draws_itself(*hwnd) && !win::is_chromium(tracked.hwnd));
+            // A control the app draws itself gets the text added to the end of its own, with no
+            // clipboard and no keyboard. A browser would come forward for that, so it does not.
+            if field.is_none() && !flags.real && !win::is_chromium(tracked.hwnd)
+                && let Some(done) = append_value(&node, tracked.hwnd, text)
+            {
+                return done;
+            }
         }
-        let saved = apps::clipboard_text()?;
-        apps::set_clipboard(text)?;
-        let route = if let Some(hwnd) = field {
-            let route = act::post_paste(hwnd)?;
-            thread::sleep(PASTE_SETTLE);
-            route
-        } else {
+        let mut saved = apps::SavedClipboard::take()?;
+        saved.lend(text)?;
+        let route = (|| {
+            if let Some(hwnd) = field {
+                let route = act::post_paste(hwnd)?;
+                thread::sleep(PASTE_SETTLE);
+                return Ok(route);
+            }
+            // Ctrl+V as window messages, where the keys go without a click: the control the app or
+            // an agent last put the keyboard in, or the one window a terminal reads keys from.
+            let keys_reach = target.is_none() || win::key_site(win::keyboard_target(tracked.hwnd));
+            if !flags.real && keys_reach && !win::is_chromium(tracked.hwnd)
+                && let Ok(chord) = real::chord("ctrl+v")
+                && let Ok(route) = act::post_key(tracked.hwnd, &chord, "ctrl+v")
+            {
+                thread::sleep(PASTE_SETTLE);
+                return Ok(route);
+            }
             if let Some(word) = target {
                 self.click(who, &Flags { real: true, ..Flags::default() }, tracked, view, word)?;
             }
@@ -878,12 +910,10 @@ impl Service {
                 thread::sleep(PASTE_SETTLE);
                 Ok::<(), String>(())
             })??;
-            "paste".to_string()
-        };
-        if saved != apps::NO_CLIPBOARD_TEXT {
-            apps::set_clipboard(&saved)?;
-        }
-        Ok(route)
+            Ok("paste".to_string())
+        })();
+        saved.put_back()?;
+        route
     }
 
     fn press_down(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
@@ -1112,7 +1142,12 @@ impl Service {
                 self.overlay.caret(who, x + ahead, y, h);
             };
             match (target, hwnd) {
-                (Some(_), None) => Err(NEEDS_REAL.into()),
+                // A control the app draws itself takes no window messages, but one that says what
+                // its text is can be given its text with this added at the end.
+                (Some(_), None) => match field.as_ref().and_then(|node| append_value(node, tracked.hwnd, text)) {
+                    Some(done) => done,
+                    None => Err(NEEDS_REAL.into()),
+                },
                 (Some(_), Some(hwnd)) => act::post_text_watched(hwnd, text, &self.stop, follow),
                 (None, _) if win::is_chromium(tracked.hwnd) => act::post_text(tracked.hwnd, text, &self.stop),
                 (None, _) => act::post_text_watched(win::keyboard_target(tracked.hwnd), text, &self.stop, follow),
@@ -1851,8 +1886,10 @@ impl Service {
         } else {
             state.shots.insert(tracked.hwnd, LastShot { hash: 0, frame: Frame { w: 0, h: 0, pixels: Vec::new() }, frames });
         }
+        // An agent taking pictures of a window it has never read is pointed to the cheaper way.
+        let unread = if control.is_none() && !flags.marks && !state.seen.contains_key(&tracked.hwnd) { READ_FIRST } else { "" };
         let part = if crop.is_some() { " changed part" } else { "" };
-        Ok(format!("{} {}x{} scale {scale:.2}{part}{note}", path.display(), small.w, small.h))
+        Ok(format!("{} {}x{} scale {scale:.2}{part}{note}", path.display(), small.w, small.h) + unread)
     }
 
     fn launch(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
