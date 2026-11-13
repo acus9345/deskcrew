@@ -391,6 +391,7 @@ struct Home {
 
 impl Service {
     fn track(&self, hwnd: Hwnd) -> Arc<Tracked> {
+        win::note_worked_in(hwnd);
         let mut windows = self.windows.lock().unwrap();
         let identity = win::identity(hwnd);
         if let Some(found) = windows.1.get(&hwnd).filter(|found| found.identity == identity) {
@@ -557,6 +558,7 @@ impl Service {
         home.agents += 1;
         home.leaving = None;
         home.pids.extend_from_slice(pids);
+        win::note_worked(pids);
         if home.guard.is_none() {
             let mut guard = FocusGuard::take();
             // An app agents work in is never the person's window, even when it is in front: it
@@ -2059,6 +2061,7 @@ pub fn run() {
         active: AtomicUsize::new(0),
     });
 
+    win::watch_flashes();
     let keeper = service.clone();
     let _ = service.keeper.set(thread::spawn(move || keeper.keep_focus()).thread().clone());
 

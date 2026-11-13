@@ -120,6 +120,8 @@ ok invoke
 
 Run `deskcrew help` for every command. A background service starts itself on first use and exits after 30 idle minutes.
 
+`deskcrew log` shows the last 30 commands agents gave it (`deskcrew log 200` for more): when, which agent, the command, whether it worked and the first line of the reply. Typed text, clipboard text and file contents show only their length, since they may be passwords. The log is `deskcrew/log.txt` in your local app data (`~/Library/Caches` on a Mac, `~/.cache` on Linux) and keeps about the last 2 MB.
+
 ## Linux (X11 / Xvfb)
 
 **Linux (X11 / Xvfb); Wayland not supported.** Wayland does not let one app read or drive another's windows, so on a Wayland session deskcrew says so and stops. Log in to an X11 (Xorg) session, or run the apps on a virtual display such as Xvfb, which is how agents on cloud machines and in CI usually work.
@@ -385,6 +387,7 @@ desk-pilot always moved your real pointer; deskcrew only does with `--real` or `
 - Right click by pen has only been tried through its code path, not confirmed in an app.
 - A cursor working in a covered or fullscreen-covered window stays hidden until that window shows, even though the work carries on.
 - `launch` can reopen an app's saved session, so a new window is not always empty.
+- An app that tries to come forward after an agent's input, and is not allowed to, makes Windows flash its taskbar button and leave it highlighted. deskcrew puts out those flashes for apps agents worked in during the last 15 minutes. The first blink of a Store app just launched can still show.
 - A launched window opens behind yours, and may show on top for an instant first. `launch --front` leaves it in front. Because it starts behind you, a browser opened this way is covered until you move something.
 - Tested on one monitor at 150% scaling. A second monitor has not been tried.
 - Apps running as administrator can be read but not driven, unless deskcrew also runs as administrator.

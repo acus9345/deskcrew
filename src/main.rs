@@ -12,6 +12,7 @@ mod client;
 #[cfg(windows)]
 mod demo;
 mod lines;
+mod log;
 #[cfg_attr(target_os = "linux", allow(dead_code))]
 mod look;
 mod mcp;
@@ -70,12 +71,18 @@ fn main() {
             }
         }
         Some("--version") => println!("deskcrew {}", env!("CARGO_PKG_VERSION")),
+        Some("log") => println!("{}", log::show(&args)),
         None | Some("help" | "--help" | "-h") => println!("{}
 {}", service::HELP, system::HELP),
         _ => {
             // Processes, files, the shell and the like need no window, so they skip the service.
             let words: Vec<String> = args.iter().enumerate().filter(|(at, _)| !(args.get(at.wrapping_sub(1)).is_some_and(|w| w == "--agent") || args[*at] == "--agent")).map(|(_, w)| w.clone()).collect();
             if let Some(reply) = system::handle(&words) {
+                let who = client::agent(&mut args.clone());
+                match &reply {
+                    Ok(text) => log::record(&who, &words, true, text),
+                    Err(text) => log::record(&who, &words, false, text),
+                }
                 match reply {
                     Ok(text) => println!("{text}"),
                     Err(text) => {

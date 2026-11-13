@@ -644,6 +644,23 @@ impl FocusGuard {
     pub fn chosen(&self, target_pids: &[u32]) -> Option<Hwnd> {
         use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
         use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, WindowFromPoint};
+        let held = |keys: &[u16]| keys.iter().any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0);
+        // Where the person's current press began. An app that jumps forward under a button they
+        // are already holding is under the pointer now, but they did not press on it.
+        let pressing = held(&[VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]);
+        let began_on = {
+            let mut start = PRESS_BEGAN_ON.lock().unwrap();
+            if !pressing {
+                *start = None;
+            } else if start.is_none() {
+                let mut point = POINT { x: 0, y: 0 };
+                *start = Some(unsafe {
+                    GetCursorPos(&mut point);
+                    GetAncestor(WindowFromPoint(point), GA_ROOT) as Hwnd
+                });
+            }
+            *start
+        };
         let now = foreground();
         let outer = unsafe { GetAncestor(raw(now), GA_ROOT) } as Hwnd;
         let theirs = if outer != 0 { outer } else { now };
@@ -653,23 +670,18 @@ impl FocusGuard {
         if !target_pids.contains(&pid(now)) && !target_pids.contains(&content_pid(now)) {
             return None;
         }
-        let held = |keys: &[u16]| keys.iter().any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0);
         if held(&[VK_MENU, VK_LWIN, VK_RWIN]) {
             return Some(theirs);
         }
-        if !held(&[VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]) {
-            return None;
-        }
-        // The press has to be on that window, or on the taskbar that switches to it: a button
-        // held down somewhere else while an app jumps forward is not a choice.
-        let mut point = POINT { x: 0, y: 0 };
-        let under = unsafe {
-            GetCursorPos(&mut point);
-            GetAncestor(WindowFromPoint(point), GA_ROOT) as Hwnd
-        };
-        (under == theirs || matches!(class(under).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(theirs)
+        // The press has to have begun on that window, or on the taskbar that switches to it.
+        let began_on = began_on?;
+        (began_on == theirs || matches!(class(began_on).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(theirs)
     }
 }
+
+/// The top window under the pointer when the person's current mouse press began, as the focus
+/// keeper last saw it.
+static PRESS_BEGAN_ON: std::sync::Mutex<Option<Hwnd>> = std::sync::Mutex::new(None);
 
 /// The person is pressing a mouse button, or holding Alt or the Windows key to switch apps.
 fn person_switching() -> bool {
@@ -792,4 +804,86 @@ pub fn letter_width(hwnd: Hwnd, letter: u16) -> Option<i32> {
         size.cx
     };
     Some((width as f32 * app_scale(hwnd)).round() as i32)
+}
+
+/// The processes agents worked in, and when they last did.
+static WORKED: std::sync::Mutex<Vec<(u32, Instant)>> = std::sync::Mutex::new(Vec::new());
+/// How long after an agent's last action its app's taskbar flashes are still put out.
+const FLASHES_WATCHED_FOR: Duration = Duration::from_secs(15 * 60);
+/// A flash can start again a moment after it was stopped, as the app finishes what it was doing.
+const FLASH_AGAIN: Duration = Duration::from_millis(600);
+
+/// Note that agents are working in this window's app. A Store app's frame belongs to a process
+/// that frames every Store app, so only the app inside it counts.
+pub fn note_worked_in(hwnd: Hwnd) {
+    let app = content_pid(hwnd);
+    if class(hwnd) == "ApplicationFrameWindow" && app == pid(hwnd) {
+        return;
+    }
+    note_worked(&[app]);
+}
+
+/// Note that agents are working in these processes.
+pub fn note_worked(pids: &[u32]) {
+    let pids: Vec<u32> = pids.iter().copied().filter(|p| !image_name(*p).to_lowercase().ends_with("applicationframehost.exe")).collect();
+    let pids = &pids[..];
+    let mut worked = WORKED.lock().unwrap();
+    worked.retain(|(pid, at)| !pids.contains(pid) && at.elapsed() < FLASHES_WATCHED_FOR);
+    worked.extend(pids.iter().map(|pid| (*pid, Instant::now())));
+}
+
+fn worked_in(hwnd: Hwnd) -> bool {
+    let app = content_pid(hwnd);
+    WORKED.lock().unwrap().iter().any(|(pid, at)| *pid == app && at.elapsed() < FLASHES_WATCHED_FOR)
+}
+
+/// Windows flashes an app's taskbar button when the app tries to come forward and is not allowed
+/// to. Apps do that after an agent's input, though the person never asked for them, so those
+/// flashes are put out as soon as the shell reports them.
+pub fn watch_flashes() {
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        CreateWindowExW, DefWindowProcW, DispatchMessageW, GetMessageW, MSG, RegisterClassW, RegisterShellHookWindow, RegisterWindowMessageW,
+        TranslateMessage, WNDCLASSW, WS_EX_TOOLWINDOW, WS_POPUP,
+    };
+    static SHELL_MESSAGE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    const HSHELL_FLASH: usize = 0x8006;
+    unsafe extern "system" fn heard(hwnd: HWND, message: u32, w: usize, l: LPARAM) -> isize {
+        let shell = SHELL_MESSAGE.load(std::sync::atomic::Ordering::Relaxed);
+        if shell != 0 && message == shell && w == HSHELL_FLASH {
+            let flashing = l as Hwnd;
+            if worked_in(flashing) {
+                stop_flashing(flashing);
+                thread::spawn(move || {
+                    thread::sleep(FLASH_AGAIN);
+                    stop_flashing(flashing);
+                });
+            }
+            return 0;
+        }
+        unsafe { DefWindowProcW(hwnd, message, w, l) }
+    }
+    thread::spawn(|| unsafe {
+        let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let module = GetModuleHandleW(null_mut());
+        let class = wide("deskcrew-flash-watch");
+        let mut kind: WNDCLASSW = zeroed();
+        kind.lpfnWndProc = Some(heard);
+        kind.hInstance = module;
+        kind.lpszClassName = class.as_ptr();
+        RegisterClassW(&kind);
+        let window = CreateWindowExW(WS_EX_TOOLWINDOW, class.as_ptr(), class.as_ptr(), WS_POPUP, 0, 0, 0, 0, null_mut(), null_mut(), module, null_mut());
+        if window.is_null() {
+            return;
+        }
+        SHELL_MESSAGE.store(RegisterWindowMessageW(wide("SHELLHOOK").as_ptr()), std::sync::atomic::Ordering::Relaxed);
+        if RegisterShellHookWindow(window) == 0 {
+            return;
+        }
+        let mut message: MSG = zeroed();
+        while GetMessageW(&mut message, null_mut(), 0, 0) > 0 {
+            TranslateMessage(&message);
+            DispatchMessageW(&message);
+        }
+    });
 }

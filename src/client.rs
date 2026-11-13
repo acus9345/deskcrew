@@ -27,7 +27,7 @@ const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
 const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Who is asking, so each agent keeps its own cursor. A flag beats the environment.
-fn agent(args: &mut Vec<String>) -> String {
+pub fn agent(args: &mut Vec<String>) -> String {
     if let Some(at) = args.iter().position(|a| a == "--agent")
         && at + 1 < args.len() {
             let name = args.remove(at + 1);
@@ -204,8 +204,10 @@ pub fn run(mut args: Vec<String>) -> i32 {
         pipe.send(message.as_bytes()).map_err(|e| e.to_string())?;
         pipe.receive().map_err(|e| format!("the deskcrew service stopped answering: {e}"))
     });
+    let log_reply = |ok: bool, text: &str| crate::log::record(&words[0], &words[1..], ok, text);
     match answer {
         Ok(reply) if !reply.is_empty() => {
+            log_reply(reply[0] == 0, &String::from_utf8_lossy(&reply[1..]));
             let mut out = std::io::stdout().lock();
             let _ = out.write_all(&reply[1..]);
             let _ = out.write_all(b"\n");
@@ -213,6 +215,7 @@ pub fn run(mut args: Vec<String>) -> i32 {
         }
         Ok(_) => 1,
         Err(error) => {
+            log_reply(false, &error);
             eprintln!("{error}");
             1
         }

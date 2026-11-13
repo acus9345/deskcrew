@@ -30,7 +30,8 @@ pub const COMMANDS: [&str; 8] = ["processes", "kill", "run", "fetch", "file", "r
 pub const HELP: &str = "\
 Beyond windows: processes [filter]     kill pid|name [--force]     run \"command\" [--ms N]
 fetch URL [--raw]     notify \"title\" \"message\"     settings [page]     reg get|list|set (Windows)
-file list|read|write|append|find|copy|move|trash ...   write and copy refuse to overwrite without --force; trash uses the Recycle Bin";
+file list|read|write|append|find|copy|move|trash ...   write and copy refuse to overwrite without --force; trash uses the Recycle Bin
+log [n]     the last n commands agents gave deskcrew, with who, when and how each went (typed text shows only its length)";
 
 fn cut(text: &str) -> String {
     if text.chars().count() <= MAX_OUTPUT {

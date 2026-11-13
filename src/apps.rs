@@ -120,10 +120,14 @@ pub fn launch(app: &str, args: &str, front: bool) -> Result<Option<Hwnd>, String
         }
     }
     let Some(hwnd) = opened else { return Ok(None) };
+    // The new window is the agent's: its taskbar button is not left flashing for the person.
+    win::note_worked_in(hwnd);
     if !front {
         // Apps keep reaching for the front for a while after their window appears.
         let appeared = Instant::now();
         while appeared.elapsed() < LAUNCH_SETTLE {
+            // A Store app's own process shows up inside its frame a moment after the frame.
+            win::note_worked_in(hwnd);
             person.hold_against(&before);
             person.keep_behind(hwnd);
             thread::sleep(LAUNCH_WATCH);

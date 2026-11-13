@@ -294,6 +294,11 @@ impl Frame {
 /// Where this agent's picture of this window goes. Each new one replaces the last.
 pub fn path_for(agent: &str, window: u32) -> PathBuf {
     let slug: String = agent.chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    home().join("shots").join(format!("{slug}-w{window}.png"))
+}
+
+/// deskcrew's own folder for pictures and its log.
+pub fn home() -> PathBuf {
     #[cfg(windows)]
     let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
     #[cfg(target_os = "macos")]
@@ -303,7 +308,7 @@ pub fn path_for(agent: &str, window: u32) -> PathBuf {
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
         .unwrap_or_else(std::env::temp_dir);
-    root.join("deskcrew").join("shots").join(format!("{slug}-w{window}.png"))
+    root.join("deskcrew")
 }
 
 #[cfg(test)]
