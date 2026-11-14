@@ -25,11 +25,12 @@ const VITAL: [&str; 12] = ["launchd", "kernel_task", "windowserver", "loginwindo
 #[cfg(target_os = "linux")]
 const VITAL: [&str; 12] = ["systemd", "init", "kthreadd", "xorg", "xvfb", "xwayland", "gnome-shell", "dbus-daemon", "dbus-broker", "systemd-logind", "gdm", "lightdm"];
 
-pub const COMMANDS: [&str; 8] = ["processes", "kill", "run", "fetch", "file", "reg", "notify", "settings"];
+pub const COMMANDS: [&str; 9] = ["processes", "kill", "run", "fetch", "file", "reg", "notify", "settings", "browsers"];
 
 pub const HELP: &str = "\
 Beyond windows: processes [filter]     kill pid|name [--force]     run \"command\" [--ms N]
 fetch URL [--raw]     notify \"title\" \"message\"     settings [page]     reg get|list|set (Windows)
+browsers on|off|status   Edge, Chrome and Brave keep drawing windows others cover (a browser policy: on and off need an administrator; ask the person first)
 file list|read|write|append|find|copy|move|trash ...   write and copy refuse to overwrite without --force; trash uses the Recycle Bin
 log [n]     the last n commands agents gave deskcrew, with who, when and how each went (typed text shows only its length)";
 
@@ -458,6 +459,58 @@ DeletionDate={when}
     fs::rename(path, files.join(&kept)).map_err(|e| format!("could not move it to the trash: {e}"))
 }
 
+/// Let Edge, Chrome and Brave keep drawing a window that other windows cover, through their own
+/// WindowOcclusionEnabled policy. A covered window then takes clicks, keys and accessibility like
+/// any other, with no trick needed, and the browsers apply it while running. Windows lets only an
+/// administrator write browser policies, even the person's own, so `on` and `off` write the
+/// machine's and need a terminal opened as administrator; `status` reads both. `off` removes only
+/// this value, and the policy key too if nothing else is in it.
+#[cfg(windows)]
+fn browsers(words: &[String]) -> Result<String, String> {
+    let usage = "browsers on|off|status";
+    let verb = match words {
+        [verb] if matches!(verb.as_str(), "on" | "off" | "status") => verb.as_str(),
+        _ => return Err(usage.into()),
+    };
+    let script = format!(
+        "$ErrorActionPreference = 'Stop'; \
+         $browsers = @(@('Edge', 'Microsoft\\Edge', 'msedge.exe'), @('Chrome', 'Google\\Chrome', 'chrome.exe'), @('Brave', 'BraveSoftware\\Brave', 'brave.exe')); \
+         $verb = '{verb}'; $said = @(); \
+         $admin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator); \
+         if ($verb -ne 'status' -and -not $admin) {{ Write-Output 'NOT-ADMIN'; exit 3 }}; \
+         $read = {{ param($key) $v = Get-ItemProperty -Path $key -Name WindowOcclusionEnabled -ErrorAction SilentlyContinue; if ($v) {{ $v.WindowOcclusionEnabled }} }}; \
+         foreach ($b in $browsers) {{ \
+           $name, $sub, $exe = $b; \
+           $machineKey = \"HKLM:\\SOFTWARE\\Policies\\$sub\"; $userKey = \"HKCU:\\SOFTWARE\\Policies\\$sub\"; \
+           $installed = (Test-Path \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\$exe\") -or (Test-Path \"HKCU:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths\\$exe\"); \
+           if ($verb -eq 'on' -and $installed) {{ New-Item -Path $machineKey -Force | Out-Null; New-ItemProperty -Path $machineKey -Name WindowOcclusionEnabled -Value 0 -PropertyType DWord -Force | Out-Null }} \
+           if ($verb -eq 'off') {{ foreach ($key in $machineKey, $userKey) {{ if ($null -ne (& $read $key)) {{ Remove-ItemProperty -Path $key -Name WindowOcclusionEnabled; \
+             $left = Get-Item -Path $key; if ($left.ValueCount -eq 0 -and $left.SubKeyCount -eq 0) {{ Remove-Item -Path $key }} }} }} }} \
+           $machine = & $read $machineKey; $user = & $read $userKey; \
+           $set = if ($null -ne $machine) {{ $machine }} else {{ $user }}; \
+           if (-not $installed -and $null -eq $set) {{ continue }} \
+           $state = if ($set -eq 0) {{ 'keeps drawing covered windows' }} else {{ 'stops drawing covered windows' }}; \
+           if ($null -eq $set) {{ $state += ' (its default)' }}; \
+           $said += \"${{name}}: $state\" }}; \
+         if ($said.Count -eq 0) {{ 'no Edge, Chrome or Brave found' }} else {{ $said -join \"`n\" }}"
+    );
+    let (text, code) = shell(&script, Duration::from_secs(20))?;
+    let text = text.trim().to_string();
+    match (code, verb) {
+        (Some(3), _) => Err(format!(
+            "browsers {verb} needs an administrator: Windows lets only an administrator set browser policies. The person can run deskcrew browsers {verb} in a terminal opened as administrator"
+        )),
+        (Some(0), "on") => Ok(format!("{text}\nThe browsers take this while running. While a policy is set they say they are managed by an organization; browsers off takes it away.")),
+        (Some(0), _) => Ok(text),
+        _ => Err(format!("the registry refused: {}", crate::lines::clip(&text, 300))),
+    }
+}
+
+#[cfg(not(windows))]
+fn browsers(_words: &[String]) -> Result<String, String> {
+    Err("browsers on|off is for Windows: on a Mac and Linux, browsers keep drawing covered windows already".into())
+}
+
 #[cfg(not(windows))]
 fn reg(_words: &[String]) -> Result<String, String> {
     Err(if cfg!(target_os = "macos") { "a Mac has no registry: read settings with run \"defaults read ...\"" } else { "Linux has no registry: read settings with run \"gsettings get ...\"" }.into())
@@ -527,6 +580,7 @@ pub fn handle(words: &[String]) -> Option<Result<String, String>> {
         ("fetch", [url]) => fetch(url, raw),
         ("file", rest) => file(rest, force, number("--from").unwrap_or(0) as usize),
         ("reg", rest) => reg(rest),
+        ("browsers", rest) => browsers(rest),
         ("notify", [title, message]) => notify(title, message),
         ("notify", [message]) => notify("deskcrew", message),
         ("settings", rest) => settings(rest.first().map(String::as_str)),

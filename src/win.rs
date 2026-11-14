@@ -253,7 +253,30 @@ pub fn note_takes_input_covered(pid: u32) {
 /// True if this browser window would hold input sent to it now: no part of it shows, and it is
 /// not one deskcrew started to take input while covered.
 pub fn holds_input(hwnd: Hwnd) -> bool {
-    !TAKES_INPUT_COVERED.lock().unwrap().contains(&pid(hwnd)) && fully_covered(hwnd)
+    !TAKES_INPUT_COVERED.lock().unwrap().contains(&pid(hwnd)) && !draws_covered_by_policy(hwnd) && fully_covered(hwnd)
+}
+
+/// True if this browser's WindowOcclusionEnabled policy is off, for the person or the machine
+/// (`deskcrew browsers on`): it then keeps drawing covered windows and takes input there.
+fn draws_covered_by_policy(hwnd: Hwnd) -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE, RRF_RT_REG_DWORD, RegGetValueW};
+    let vendor = match image_name(pid(hwnd)).to_lowercase().as_str() {
+        "msedge" => "Microsoft\\Edge",
+        "chrome" => "Google\\Chrome",
+        "brave" => "BraveSoftware\\Brave",
+        _ => return false,
+    };
+    let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+    let key = wide(&format!("SOFTWARE\\Policies\\{vendor}"));
+    let name = wide("WindowOcclusionEnabled");
+    let read = |root| {
+        let mut value: u32 = 1;
+        let mut size = size_of::<u32>() as u32;
+        let found = unsafe { RegGetValueW(root, key.as_ptr(), name.as_ptr(), RRF_RT_REG_DWORD, null_mut(), (&mut value as *mut u32).cast(), &mut size) } == 0;
+        found.then_some(value)
+    };
+    // A machine policy wins over the person's.
+    read(HKEY_LOCAL_MACHINE).or_else(|| read(HKEY_CURRENT_USER)) == Some(0)
 }
 
 /// How long Chromium takes to draw a covered window again once told to, and to take input there.
