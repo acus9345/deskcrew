@@ -66,7 +66,8 @@ const MAX_TABLE_ROWS: usize = 500;
 const MAX_TABLE_COLUMNS: usize = 20;
 const MAX_CELL_CHARS: usize = 60;
 const STOPPED: &str = "stopped by the person with Ctrl+Alt+Esc: ask them before doing more (deskcrew resume clears it)";
-const COVERED: &str = "refused: this window is minimized, and browser and Electron apps take no clicks or keys until they are shown again. Windows would not let deskcrew show it without it coming forward just now. Ask the person to restore it, or add --real";
+const MINIMIZED_POINT: &str = "refused: this window is minimized, and Windows would not let deskcrew show it off screen without it coming forward just now, so x,y are nowhere on screen. Use a control by name, or ask the person to restore it";
+const COVERED: &str ="refused: this window is minimized, and browser and Electron apps take no clicks or keys until they are shown again. Windows would not let deskcrew show it without it coming forward just now. Ask the person to restore it, or add --real";
 /// Commands that act on a window, as opposed to reading it.
 const ACTIONS: [&str; 18] = ["click", "hover", "set", "type", "key", "check", "uncheck", "toggle", "expand", "collapse", "clear", "select", "scroll", "show", "drag", "draw", "down", "pick-file"];
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
@@ -700,6 +701,9 @@ impl Service {
         if let Some((x, y)) = is_point(word) {
             let frames = self.shot_frames(who, tracked).ok_or("x,y are pixels in a shot: take one first")?;
             let (x, y) = frames.to_screen(x, y);
+            if !win::inside(tracked.hwnd, x, y) {
+                return Err(if win::minimized(tracked.hwnd) { MINIMIZED_POINT.into() } else { format!("refused: {word} is not on this window: x,y are pixels in its last shot") });
+            }
             return Ok(Target::Point(x, y));
         }
         let wanted = word.to_lowercase();
@@ -934,6 +938,9 @@ impl Service {
             [target, text] => (Some(target), text),
             _ => return Err("type [control] \"text\" --paste".into()),
         };
+        if text.is_empty() {
+            return Err("nothing to type: to empty a field, use clear".into());
+        }
         // A classic text box pastes when asked to, with no keyboard and no focus.
         let mut field = None;
         if let Some(word) = target
@@ -1182,6 +1189,9 @@ impl Service {
             [word, text] => (Some(word), text),
             _ => return Err("type [control] \"text\"".into()),
         };
+        if text.is_empty() {
+            return Err("nothing to type: to empty a field, use clear".into());
+        }
         let mut place = None;
         let mut hwnd = None;
         let mut field = None;
@@ -1417,6 +1427,9 @@ impl Service {
             ("pen", done)
         } else {
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::inside(tracked.hwnd, *x, *y)) {
+                if win::minimized(tracked.hwnd) {
+                    return Err(MINIMIZED_POINT.into());
+                }
                 return Err(format!("refused: {x},{y} on screen is not on this window"));
             }
             let send = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, &self.stop, jump)?));

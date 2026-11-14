@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- A click or hover at x,y off the window, or on a minimized window deskcrew could not show, is refused with the reason instead of reported as done. `launch` reports the launched program's window even when another app opens one at the same moment. `type ""` says there is nothing to type.
+
 ## [0.1.21] - 2026-11-14
 
 - More works in minimized windows on Windows. `shot`, `click x,y` and drags work in a minimized window of any app, and keys reach a minimized WPF app: the window is shown far off screen for the moment, under the foreground lock, and minimized again. A browser opened with `deskcrew launch` is shown that way too when minimized; it used to report clicks and keys as done that it had dropped. When Windows refuses the lock, which it does while the person is using another app, the reply says why, `see` says the page was not read, and it no longer suggests `--real`. Agents working in the same minimized window at once share one showing, and agents holding the foreground lock at once share it. `place min`, `place max` and `place restore` no longer bring a window in the back forward: `place max` makes it fill its screen there instead, and `place restore` puts it back. A click on a WPF text box puts its caret there in the background. x,y from a shot still fit after the window moves. When an action changes nothing but the window's title, the reply shows the title.

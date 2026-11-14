@@ -29,6 +29,8 @@ const CF_UNICODETEXT: u32 = 13;
 const MAX_CLIPBOARD_CHARS: usize = 8000;
 const WINDOW_TIMEOUT: Duration = Duration::from_secs(6);
 const LAUNCH_WATCH: Duration = Duration::from_millis(20);
+/// How long a new window of another program waits for one of the launched program's own.
+const OTHER_APP_GRACE: Duration = Duration::from_millis(1200);
 const LAUNCH_SETTLE: Duration = Duration::from_millis(2500);
 
 fn wide(text: &str) -> Vec<u16> {
@@ -134,18 +136,31 @@ pub fn launch(app: &str, args: &str, front: bool) -> Result<Option<Hwnd>, String
     let _lock = (!front).then(win::ForegroundLock::take);
     start(app, args)?;
     let started = Instant::now();
+    // Another app can open a window at the same moment: a new window of the program started is
+    // the one. A program that hands its window to another process, as Store apps do, has none,
+    // so any new window counts once none of its own has shown for a while.
+    let wanted = std::path::Path::new(app).file_stem().map(|stem| stem.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let mut other: Option<(Hwnd, Instant)> = None;
     let mut opened = None;
     while started.elapsed() < WINDOW_TIMEOUT {
         thread::sleep(LAUNCH_WATCH);
         if !front {
             person.hold_against(&before);
         }
-        opened = win::list().into_iter().find(|w| !before.contains(&w.hwnd)).map(|w| w.hwnd);
-        if opened.is_some() {
+        let fresh: Vec<win::Win> = win::list().into_iter().filter(|w| !before.contains(&w.hwnd)).collect();
+        if let Some(own) = fresh.iter().find(|w| w.app.to_lowercase() == wanted) {
+            opened = Some(own.hwnd);
             break;
         }
+        if let Some(first) = fresh.first() {
+            let (hwnd, since) = *other.get_or_insert((first.hwnd, Instant::now()));
+            if since.elapsed() >= OTHER_APP_GRACE {
+                opened = Some(hwnd);
+                break;
+            }
+        }
     }
-    let Some(hwnd) = opened else { return Ok(None) };
+    let Some(hwnd) = opened.or(other.map(|(hwnd, _)| hwnd)) else { return Ok(None) };
     // The new window is the agent's: its taskbar button is not left flashing for the person.
     win::note_worked_in(hwnd);
     // A browser already running opened this window in its old process, which kept its cover check.
