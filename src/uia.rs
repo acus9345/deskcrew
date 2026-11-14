@@ -660,6 +660,10 @@ impl Element {
         unsafe { self.0.GetCurrentPatternAs::<IUIAutomationScrollPattern>(UIA_ScrollPatternId).and_then(|p| if sideways { p.Scroll(amount, ScrollAmount_NoAmount) } else { p.Scroll(ScrollAmount_NoAmount, amount) }).map_err(say) }
     }
 
+    pub fn set_focus(&self) -> Result<(), String> {
+        unsafe { self.0.SetFocus().map_err(say) }
+    }
+
     pub fn bring_into_view(&self) -> Result<(), String> {
         unsafe { self.0.GetCurrentPatternAs::<IUIAutomationScrollItemPattern>(UIA_ScrollItemPatternId).and_then(|p| p.ScrollIntoView()).map_err(say) }
     }

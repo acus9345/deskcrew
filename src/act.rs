@@ -379,7 +379,10 @@ pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: im
 
 /// One key or shortcut as window messages, to the control with focus in the app's window.
 pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String> {
-    // WPF reads keys only while its window has keyboard focus.
+    // WPF reads keys only while its window has keyboard focus, which a minimized one cannot get.
+    if win::is_wpf(root) && win::minimized(root) {
+        return Err("refused: this WPF window is minimized, and it takes no keys until it is shown again. Windows would not let deskcrew show it off screen without it coming forward just now. Ask the person to restore it, or add --real".into());
+    }
     if win::is_wpf(root) {
         return post_chord(root, chord, spec, true);
     }
@@ -580,6 +583,40 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<St
         sent?;
     }
     Ok("message".into())
+}
+
+/// Put the caret in a WPF text box in the back, as a click on it would: the window gets keyboard
+/// focus inside its own app for a moment, with the foreground lock held so it stays behind, and
+/// the box is focused through accessibility then. WPF keeps it as the focused box, so the keys an
+/// agent sends later go to it.
+pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    unsafe {
+        let theirs = GetWindowThreadProcessId(root as HWND, std::ptr::null_mut());
+        if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
+            return Err(NEEDS_REAL.into());
+        }
+        let front = win::foreground();
+        let _lock = win::ForegroundLock::take();
+        let mine = GetCurrentThreadId();
+        if AttachThreadInput(mine, theirs, 1) == 0 {
+            return Err(NEEDS_REAL.into());
+        }
+        SetFocus(root as HWND);
+        let focused = GetFocus() == root as HWND && node.element.set_focus().is_ok();
+        SetFocus(std::ptr::null_mut());
+        AttachThreadInput(mine, theirs, 0);
+        // Should the app have come forward all the same, the person gets their window back.
+        if win::foreground() != front && win::pid(win::foreground()) == win::pid(root) && !win::bring_forward(front) {
+            win::stop_flashing(front);
+        }
+        if !focused {
+            return Err(NEEDS_REAL.into());
+        }
+        Ok("focus".into())
+    }
 }
 
 pub fn close_window(hwnd: Hwnd) -> Result<(), String> {

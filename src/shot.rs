@@ -77,7 +77,7 @@ fn read_bitmap(dc: *mut core::ffi::c_void, bitmap: *mut core::ffi::c_void, w: i3
 #[cfg(windows)]
 pub fn window(hwnd: Hwnd) -> Result<(Frame, f32), String> {
     if win::minimized(hwnd) {
-        return Err("that window is minimized: place restore first".into());
+        return Err("that window is minimized, and Windows would not let deskcrew draw it off screen without it coming forward just now: ask the person to restore it, or use place restore".into());
     }
     let (ox, oy, ow, oh) = win::outer_rect(hwnd);
     let (x, y, w, h) = win::rect(hwnd);

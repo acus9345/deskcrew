@@ -24,7 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWNOACTIVATE};
+use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINNOACTIVE};
 
 /// What a picture of a window the agent has not read yet says: reading is far cheaper.
 const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
@@ -677,6 +677,14 @@ impl Service {
         }
     }
 
+    /// Where the agent's last shot of this window lies on screen now. Shots keep their place in the
+    /// window, so x,y still fit after the window moves, or while a minimized one is shown off screen.
+    fn shot_frames(&self, who: &str, tracked: &Tracked) -> Option<Frames> {
+        let kept = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.hwnd).map(|s| s.frames))?;
+        let (left, top, ..) = win::rect(tracked.hwnd);
+        Some(Frames { x: kept.x + left, y: kept.y + top, ..kept })
+    }
+
     fn resolve(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<Target, String> {
         self.resolve_for(word, who, tracked, view, |_| true)
     }
@@ -690,8 +698,7 @@ impl Service {
             return if view.nodes.contains_key(&id) { Ok(Target::Control(id)) } else { Err(format!("e{id} is gone: see")) };
         }
         if let Some((x, y)) = is_point(word) {
-            let frames = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.hwnd).map(|s| s.frames));
-            let frames = frames.ok_or("x,y are pixels in a shot: take one first")?;
+            let frames = self.shot_frames(who, tracked).ok_or("x,y are pixels in a shot: take one first")?;
             let (x, y) = frames.to_screen(x, y);
             return Ok(Target::Point(x, y));
         }
@@ -880,6 +887,13 @@ impl Service {
                 Some(Err(error)) if error.contains("administrator") => return Err(error),
                 _ => {}
             }
+        }
+        // A click on a WPF text box puts the caret there, for the keys that follow.
+        if let (Some(node), true) = (&node, plain)
+            && win::is_wpf(tracked.hwnd)
+            && matches!(node.parts.role.as_str(), "edit" | "document" | "combobox")
+        {
+            return act::focus_wpf_field(tracked.hwnd, node);
         }
         // A spot in an app that draws itself takes no posted click, but the control drawn there
         // can still be pressed through its own action.
@@ -1081,7 +1095,7 @@ impl Service {
         let [word, state] = words else { return Err("is e3 on|off|open|closed|selected|enabled|disabled".into()) };
         let tracked = self.pick(who, flags.window.as_deref())?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd);
+        let _drawn = win::keep_drawn(tracked.hwnd, false);
         let mut view = tracked.view.lock().unwrap();
         self.first_read(&tracked, &mut view, false)?;
         let Target::Control(id) = self.resolve(word, who, &tracked, &mut view)? else { return Err("is needs a control".into()) };
@@ -1434,8 +1448,8 @@ impl Service {
         }
         let tracked = self.pick(who, flags.window.as_deref())?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd);
-        if win::minimized(tracked.hwnd) && win::holds_input(tracked.hwnd) {
+        let _drawn = win::keep_drawn(tracked.hwnd, true);
+        if win::minimized(tracked.hwnd) && win::is_chromium(tracked.hwnd) {
             return Err(COVERED.into());
         }
         let (strokes, pids) = {
@@ -1506,7 +1520,7 @@ impl Service {
             },
             None => None,
         };
-        let frames = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.hwnd).map(|s| s.frames));
+        let frames = self.shot_frames(who, tracked);
         let mut strokes = Vec::new();
         for stroke in script.split(';').filter(|s| !s.trim().is_empty()) {
             let mut points = Vec::new();
@@ -1579,9 +1593,10 @@ impl Service {
         };
         let verb = words.first().map_or("", String::as_str);
         let rest = words.get(1..).unwrap_or(&[]);
-        // A minimized browser or Electron window drops or holds its input until it is shown again.
-        // A covered one is kept drawn while an agent works in it, so it takes input.
-        if !flags.real && !flags.mouse && ACTIONS.contains(&verb) && win::is_chromium(tracked.hwnd) && win::minimized(tracked.hwnd) && win::holds_input(tracked.hwnd) {
+        // A minimized browser or Electron window drops or holds its input until it is shown again,
+        // even one started to take input while covered. It is shown off screen while an agent works
+        // in it, so this only happens when that could not be done.
+        if !flags.real && !flags.mouse && ACTIONS.contains(&verb) && win::is_chromium(tracked.hwnd) && win::minimized(tracked.hwnd) {
             return Err(COVERED.into());
         }
         match (verb, rest) {
@@ -1620,13 +1635,14 @@ impl Service {
         }
         let tracked = self.pick(who, flags.window.as_deref())?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd);
+        let _drawn = win::keep_drawn(tracked.hwnd, steps.iter().any(|step| step.first().is_some_and(|verb| verb == "draw") || step.iter().skip(1).any(|word| is_point(word).is_some())));
         let mut guard = tracked.view.lock().unwrap();
         let view = &mut *guard;
         if !view.read_once {
             self.first_read(&tracked, view, false)?;
         }
         let before = self.seen(who, tracked.hwnd).unwrap_or_else(|| view.lines.clone());
+        let title_before = win::title(tracked.hwnd);
         let picture_before = shot::window(tracked.hwnd).ok().filter(|(frame, _)| !frame.is_blank());
         self.focus_in(&view.pids);
         let mut routes = Vec::new();
@@ -1655,18 +1671,26 @@ impl Service {
         match settled {
             Ok(notes) => {
                 let (changes, complete) = lines::change_report(&before, &view.lines);
-                let nothing = changes.is_empty() && notes.is_empty();
+                let title = win::title(tracked.hwnd);
+                let retitled = title != title_before && !title.is_empty();
+                let nothing = changes.is_empty() && notes.is_empty() && !retitled;
                 out.extend(notes);
                 out.extend(changes);
+                // Many apps show what an action did in their title: a file name, a saved mark.
+                if retitled {
+                    out.push(format!("~ title \"{}\"", lines::clip(&title, 80)));
+                }
                 if complete {
                     self.remember(who, tracked.hwnd, view.lines.clone());
                 }
                 // The controls tell nothing: the picture still can, without sending one.
-                let picture = if nothing && !waited_only && !routes.iter().any(|r| r.starts_with("dialog")) { picture_before.as_ref().map(|before| self.picture_change(&tracked, before)) } else { None };
+                let picture = if nothing && !waited_only && !routes.iter().any(|r| r.starts_with("dialog") || r == "focus") { picture_before.as_ref().map(|before| self.picture_change(&tracked, before)) } else { None };
                 match picture {
                     Some(Some(note)) => out.push(note),
                     Some(None) if routes.iter().any(|r| r == "message") => out.push("nothing changed, on screen either: try --real if it should have".into()),
                     Some(None) => out.push("nothing changed, on screen either".into()),
+                    // A minimized window has no picture to tell by, and --real would restore it.
+                    None if nothing && win::minimized(tracked.hwnd) => out.push("no control changed; the window is minimized, so its picture could not be checked".into()),
                     None if nothing && routes.iter().any(|r| r == "message") => out.push("nothing changed: try --real if it should have".into()),
                     None if nothing && routes.iter().any(|r| r == "pen" || r == "mouse" || r == "keyboard") => out.push("nothing changed: check with shot".into()),
                     None => {}
@@ -1716,17 +1740,22 @@ impl Service {
         let spec = words.first().map(String::as_str).or(flags.window.as_deref());
         let tracked = self.pick(who, spec)?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd);
+        let _drawn = win::keep_drawn(tracked.hwnd, false);
         let mut guard = tracked.view.lock().unwrap();
         let view = &mut *guard;
         self.first_read(&tracked, view, flags.all)?;
+        // A minimized browser leaves its page out of accessibility until it is shown again.
+        let unread = (win::is_chromium(tracked.hwnd) && win::minimized(tracked.hwnd))
+            .then_some("the page itself is not read while this window is minimized: Windows would not let deskcrew show it off screen without it coming forward just now. Ask the person to restore it");
         let filtered = flags.find.is_some() || flags.from > 0;
         let seen = self.seen(who, tracked.hwnd).filter(|_| !flags.full && !filtered && !flags.all);
         if let Some(seen) = seen {
             let changes = lines::changes(&seen, &view.lines);
             if changes.len() * 2 <= view.lines.len().max(1) {
                 self.remember(who, tracked.hwnd, view.lines.clone());
-                return Ok(if changes.is_empty() { "no change".into() } else { changes.join("\n") });
+                let mut said = if changes.is_empty() { vec!["no change".to_string()] } else { changes };
+                said.extend(unread.map(String::from));
+                return Ok(said.join("\n"));
             }
         }
         if !filtered {
@@ -1739,6 +1768,7 @@ impl Service {
             out.extend(self.rows_off_screen(view));
             out.extend(self.blind_spot(who, &tracked, view));
         }
+        out.extend(unread.map(String::from));
         Ok(out.join("\n"))
     }
 
@@ -1806,7 +1836,7 @@ impl Service {
             // These x,y are window pixels: clicks read them that way until the next shot.
             let mut agents = self.agents.lock().unwrap();
             let state = agents.entry(who.to_string()).or_default();
-            let frames = Frames { x: window.0, y: window.1, scale: 1.0 };
+            let frames = Frames { x: 0, y: 0, scale: 1.0 };
             match state.shots.get_mut(&tracked.hwnd) {
                 Some(last) => {
                     last.frames = frames;
@@ -1828,7 +1858,7 @@ impl Service {
         let word = words.first().ok_or("table needs a control")?;
         let tracked = self.pick(who, flags.window.as_deref())?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd);
+        let _drawn = win::keep_drawn(tracked.hwnd, false);
         let mut view = tracked.view.lock().unwrap();
         if !view.read_once {
             self.first_read(&tracked, &mut view, false)?;
@@ -1895,7 +1925,7 @@ impl Service {
         let word = words.first().ok_or("get needs a control")?;
         let tracked = self.pick(who, flags.window.as_deref())?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd);
+        let _drawn = win::keep_drawn(tracked.hwnd, false);
         let mut view = tracked.view.lock().unwrap();
         if !view.read_once {
             self.first_read(&tracked, &mut view, false)?;
@@ -1947,7 +1977,7 @@ impl Service {
         let control = word.and_then(|w| is_ref(w));
         let tracked = self.pick(who, if control.is_some() { flags.window.as_deref() } else { word.map(String::as_str).or(flags.window.as_deref()) })?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd);
+        let _drawn = win::keep_drawn(tracked.hwnd, true);
         let (left, top, ..) = win::rect(tracked.hwnd);
         let mut note = "";
         let (mut frame, mut units) = shot::window(tracked.hwnd)?;
@@ -2005,7 +2035,7 @@ impl Service {
         }
         let path = shot::path_for(who, tracked.id);
         small.save(&path)?;
-        let frames = Frames { x: origin.0, y: origin.1, scale: scale * units };
+        let frames = Frames { x: origin.0 - left, y: origin.1 - top, scale: scale * units };
         if control.is_none() {
             state.shots.insert(tracked.hwnd, LastShot { hash, frame, frames });
         } else if let Some(last) = state.shots.get_mut(&tracked.hwnd) {
@@ -2035,18 +2065,37 @@ impl Service {
     fn place(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let tracked = self.pick(who, flags.window.as_deref())?;
         let word = words.first().ok_or("place x,y,w,h|min|max|restore")?;
+        // A window in the back stays there: Windows' own minimize, maximize and restore activate
+        // the window, which would take the person's keyboard. Their own window is theirs to change.
+        let front = win::foreground();
+        let theirs = front == tracked.hwnd;
+        let _lock = (!theirs).then(win::ForegroundLock::take);
+        let mut said = "ok";
         match word.as_str() {
-            "min" => win::show(tracked.hwnd, SW_MINIMIZE),
-            "max" => win::show(tracked.hwnd, SW_MAXIMIZE),
-            "restore" => win::show(tracked.hwnd, SW_RESTORE),
-            "show" => win::show(tracked.hwnd, SW_SHOWNOACTIVATE),
+            "min" => win::show(tracked.hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE }),
+            "max" if theirs => win::show(tracked.hwnd, SW_MAXIMIZE),
+            "max" => {
+                if !win::fill_screen_behind(tracked.hwnd) {
+                    said = "ok: it fills the screen in the back; Windows' own maximize would have brought it forward";
+                }
+            }
+            "restore" if theirs => win::show(tracked.hwnd, SW_RESTORE),
+            "restore" | "show" => win::restore_behind(tracked.hwnd),
             box_text => {
                 let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
                 win::place(tracked.hwnd, x, y, w, h);
             }
         }
-        Ok("ok".into())
+        // Should the app have come forward all the same, the person gets their window back.
+        if !theirs && front != 0 && win::foreground() != front && win::pid(win::foreground()) == win::pid(tracked.hwnd) {
+            thread::sleep(Duration::from_millis(30));
+            if !win::bring_forward(front) {
+                win::stop_flashing(front);
+            }
+        }
+        win::stop_flashing(tracked.hwnd);
+        Ok(said.into())
     }
 
     fn status(&self) -> Reply {

@@ -259,6 +259,9 @@ pub fn holds_input(hwnd: Hwnd) -> bool {
 /// How long Chromium takes to draw a covered window again once told to, and to take input there.
 const REDRAW_WAIT: Duration = Duration::from_millis(300);
 
+/// How long any other app takes to lay out and draw a window shown again.
+const SHOWN_WAIT: Duration = Duration::from_millis(150);
+
 /// How many agents are working in covered browser windows right now, and from when Chromium is
 /// drawing them.
 static KEPT_DRAWN: std::sync::Mutex<(usize, Option<Instant>)> = std::sync::Mutex::new((0, None));
@@ -307,9 +310,47 @@ struct OffScreen {
     _lock: ForegroundLock,
 }
 
+/// Minimized windows shown off screen now, and how many agents are working in each. The last one
+/// to finish minimizes it again.
+static OFF_SCREEN: std::sync::Mutex<std::collections::BTreeMap<Hwnd, (usize, OffScreen)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Join the agents working in a window shown off screen, showing it there if it is minimized.
+/// False if it is neither.
+fn share_off_screen(hwnd: Hwnd) -> bool {
+    let mut shown = OFF_SCREEN.lock().unwrap();
+    if let Some((count, _)) = shown.get_mut(&hwnd) {
+        *count += 1;
+        return true;
+    }
+    if !minimized(hwnd) {
+        return false;
+    }
+    match show_off_screen(hwnd) {
+        Some(off) => {
+            shown.insert(hwnd, (1, off));
+            true
+        }
+        None => false,
+    }
+}
+
+fn leave_off_screen(hwnd: Hwnd) {
+    let mut shown = OFF_SCREEN.lock().unwrap();
+    let last = match shown.get_mut(&hwnd) {
+        Some((count, _)) => {
+            *count -= 1;
+            *count == 0
+        }
+        None => false,
+    };
+    if last {
+        shown.remove(&hwnd);
+    }
+}
+
 /// While held, covered browser and Electron windows are drawn and take input. Dropping it lets
 /// Chromium hide them again once no agent is working in one, and minimizes again one that was.
-pub struct KeptDrawn(Option<Hwnd>, Option<OffScreen>);
+pub struct KeptDrawn(Option<Hwnd>, Option<Hwnd>);
 
 /// Turn a window's minimize and restore animations off or back on.
 fn animations(hwnd: Hwnd, on: bool) {
@@ -318,12 +359,72 @@ fn animations(hwnd: Hwnd, on: bool) {
     unsafe { DwmSetWindowAttribute(raw(hwnd), DWMWA_TRANSITIONS_FORCEDISABLED as u32, &off as *const i32 as *const _, size_of::<i32>() as u32) };
 }
 
-/// Show a minimized window, far off every screen and without activating it, while Windows lets no
-/// app take the foreground: Chromium tries to when its window is restored.
+/// Make a window in the back fill its screen, short of the taskbar, without activating it:
+/// Windows' own maximize always activates the window. True if it was already maximized.
+pub fn fill_screen_behind(hwnd: Hwnd) -> bool {
+    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
+    unsafe {
+        if IsZoomed(raw(hwnd)) != 0 {
+            return true;
+        }
+        if IsIconic(raw(hwnd)) != 0 {
+            ShowWindow(raw(hwnd), SW_SHOWNOACTIVATE);
+        }
+        let mut info: MONITORINFO = zeroed();
+        info.cbSize = size_of::<MONITORINFO>() as u32;
+        if GetMonitorInfoW(MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST), &mut info) != 0 {
+            let work = info.rcWork;
+            let mut before: RECT = zeroed();
+            if GetWindowRect(raw(hwnd), &mut before) != 0 {
+                FILLED.lock().unwrap().entry(hwnd).or_insert(before);
+            }
+            place(hwnd, work.left, work.top, work.right - work.left, work.bottom - work.top);
+        }
+        false
+    }
+}
+
+/// Windows made to fill their screen in the back, and where each was before.
+static FILLED: std::sync::Mutex<std::collections::BTreeMap<Hwnd, RECT>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Restore a window in the back without activating it: from minimized, maximized, or filling its
+/// screen, back to where it was.
+pub fn restore_behind(hwnd: Hwnd) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
+    unsafe {
+        if IsIconic(raw(hwnd)) != 0 || IsZoomed(raw(hwnd)) != 0 {
+            ShowWindow(raw(hwnd), SW_SHOWNOACTIVATE);
+        }
+    }
+    let before = FILLED.lock().unwrap().remove(&hwnd);
+    if let Some(before) = before
+        && unsafe { IsIconic(raw(hwnd)) } == 0
+    {
+        place(hwnd, before.left, before.top, before.right - before.left, before.bottom - before.top);
+    }
+}
+
+/// A place for a window off every screen where Windows still counts it as on the screen it was on,
+/// so an app that follows each screen's pixel density does not lay itself out again.
+fn far_from_screens(normal: RECT, width: i32, height: i32) -> RECT {
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromRect};
+    const FAR: i32 = 31_000;
+    let at = |left: i32, top: i32| RECT { left, top, right: left + width, bottom: top + height };
+    let own = unsafe { MonitorFromRect(&normal, MONITOR_DEFAULTTONEAREST) };
+    let tries = [at(-FAR, -FAR), at(normal.left, -FAR), at(-FAR, normal.top), at(normal.left, FAR - height), at(FAR - width, normal.top)];
+    tries.into_iter().find(|rect| unsafe { MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST) } == own).unwrap_or(tries[0])
+}
+
+/// Show a minimized window, far off every screen and without activating it, while no app can take
+/// the foreground. A restored window comes forward on its own when its app still counts it as its
+/// active window, as Chromium does, and Windows lets it whenever deskcrew could not stop it: so
+/// this is only done while Windows gives deskcrew the foreground lock. It does while the agent's
+/// own terminal or app is in front, or the person has left the computer long enough.
 fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, SW_SHOWNOACTIVATE, SetWindowPlacement, WINDOWPLACEMENT};
-    const FAR: i32 = -31_000;
     let lock = ForegroundLock::try_take()?;
+    let front = foreground();
     unsafe {
         let mut placement: WINDOWPLACEMENT = zeroed();
         placement.length = size_of::<WINDOWPLACEMENT>() as u32;
@@ -331,16 +432,27 @@ fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
             return None;
         }
         let normal = placement.rcNormalPosition;
+        let (width, height) = (normal.right - normal.left, normal.bottom - normal.top);
         let mut away = placement;
         away.flags = 0;
         away.showCmd = SW_SHOWNOACTIVATE as u32;
-        away.rcNormalPosition = RECT { left: FAR, top: FAR, right: FAR + (normal.right - normal.left), bottom: FAR + (normal.bottom - normal.top) };
+        away.rcNormalPosition = far_from_screens(normal, width, height);
         animations(hwnd, false);
         if SetWindowPlacement(raw(hwnd), &away) == 0 {
             animations(hwnd, true);
             return None;
         }
-        Some(OffScreen { hwnd, placement, _lock: lock })
+        let shown = OffScreen { hwnd, placement, _lock: lock };
+        // Should it come forward all the same, the person gets their window back at once.
+        let now = foreground();
+        if now != front && (now == hwnd || pid(now) == pid(hwnd)) {
+            drop(shown);
+            if front != 0 && !bring_forward(front) {
+                stop_flashing(front);
+            }
+            return None;
+        }
+        Some(shown)
     }
 }
 
@@ -348,17 +460,20 @@ impl Drop for OffScreen {
     fn drop(&mut self) {
         use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWMINNOACTIVE, SetWindowPlacement, WPF_RESTORETOMAXIMIZED};
         let mut back = self.placement;
-        back.showCmd = SW_SHOWMINNOACTIVE as u32;
         back.flags &= WPF_RESTORETOMAXIMIZED;
+        back.showCmd = SW_SHOWMINNOACTIVE as u32;
         unsafe { SetWindowPlacement(raw(self.hwnd), &back) };
         animations(self.hwnd, true);
+        stop_flashing(self.hwnd);
     }
 }
 
 impl Drop for KeptDrawn {
     fn drop(&mut self) {
         // Minimized again first, while the foreground lock is still held.
-        self.1.take();
+        if let Some(hwnd) = self.1 {
+            leave_off_screen(hwnd);
+        }
         let Some(stand_in) = self.0 else { return };
         let mut working = KEPT_DRAWN.lock().unwrap();
         working.0 -= 1;
@@ -374,20 +489,28 @@ impl Drop for KeptDrawn {
 /// opened for as long as an agent works in a covered window. Nothing shows on screen, nothing
 /// moves, and the person's windows stay in front.
 ///
-/// A minimized one is shown far off screen for that time, without being activated, and minimized
-/// again afterwards. Chromium tries to come forward when restored, so this is done only while
-/// Windows' foreground lock is held; if it cannot be, the window stays minimized and is refused.
-pub fn keep_drawn(hwnd: Hwnd) -> KeptDrawn {
-    if !is_chromium(hwnd) || !holds_input(hwnd) {
-        return KeptDrawn(None, None);
-    }
-    let off_screen = if minimized(hwnd) {
-        match show_off_screen(hwnd) {
-            Some(shown) => Some(shown),
-            None => return KeptDrawn(None, None),
+/// A minimized window is shown far off screen for that time, without being activated, and
+/// minimized again afterwards: a browser, Electron or WPF one always, since they take no input
+/// while minimized, and any other when the agent needs its picture (`pixels`). If Windows would
+/// let it come forward over the person's window just then, it stays minimized.
+pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
+    let chromium = is_chromium(hwnd);
+    let off_screen = if minimized(hwnd) || OFF_SCREEN.lock().unwrap().contains_key(&hwnd) {
+        if !(chromium || is_wpf(hwnd) || pixels) {
+            return KeptDrawn(None, None);
         }
-    } else {
+        if !share_off_screen(hwnd) {
+            return KeptDrawn(None, None);
+        }
+        if !chromium {
+            thread::sleep(SHOWN_WAIT);
+            return KeptDrawn(None, Some(hwnd));
+        }
+        Some(hwnd)
+    } else if chromium && holds_input(hwnd) {
         None
+    } else {
+        return KeptDrawn(None, None);
     };
     let Some(stand_in) = thumbnail_stand_in() else { return KeptDrawn(None, off_screen) };
     let ready = {
@@ -749,19 +872,40 @@ pub struct ForegroundLock;
 
 impl ForegroundLock {
     pub fn take() -> ForegroundLock {
-        unsafe { LockSetForegroundWindow(LSFW_LOCK) };
+        let mut held = LOCKS.lock().unwrap();
+        if !held.1 {
+            held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
+        }
+        held.0 += 1;
         ForegroundLock
     }
 
     /// The lock, if Windows gave it: it only does to a process that could take the foreground.
     pub fn try_take() -> Option<ForegroundLock> {
-        (unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0).then_some(ForegroundLock)
+        let mut held = LOCKS.lock().unwrap();
+        if !held.1 {
+            held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
+        }
+        if !held.1 {
+            return None;
+        }
+        held.0 += 1;
+        Some(ForegroundLock)
     }
 }
 
+/// Windows has one foreground lock, so agents working at once share it: how many hold it, and
+/// whether Windows gave it. The last to let go unlocks it.
+static LOCKS: std::sync::Mutex<(usize, bool)> = std::sync::Mutex::new((0, false));
+
 impl Drop for ForegroundLock {
     fn drop(&mut self) {
-        unsafe { LockSetForegroundWindow(LSFW_UNLOCK) };
+        let mut held = LOCKS.lock().unwrap();
+        held.0 -= 1;
+        if held.0 == 0 && held.1 {
+            unsafe { LockSetForegroundWindow(LSFW_UNLOCK) };
+            held.1 = false;
+        }
     }
 }
 
