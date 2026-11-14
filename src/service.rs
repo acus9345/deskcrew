@@ -723,6 +723,13 @@ impl Service {
             let mut hits = named(true);
             if hits.is_empty() {
                 hits = named(false);
+            } else if !hits.iter().any(|id| fits(&view.nodes[id])) {
+                // A label named exactly so, while a longer name belongs to a control that can take
+                // the action, such as a menu entry "Gemini 4 Hydrogen Extra New": that one is meant.
+                let able: Vec<u32> = named(false).into_iter().filter(|id| fits(&view.nodes[id])).collect();
+                if !able.is_empty() {
+                    hits = able;
+                }
             }
             match hits.as_slice() {
                 [only] => return Ok(Target::Control(*only)),
@@ -926,6 +933,11 @@ impl Service {
         if matches!(wanted, "open" | "closed") {
             let (node, rect) = self.locate(id, tracked, view)?;
             self.cursor_on(who, flags, rect);
+            if wanted == "open"
+                && let Some(opened) = self.open_submenu(tracked, view, id)
+            {
+                return opened;
+            }
             return node.element.open_or_close().map(|_| "expand".to_string());
         }
         self.click(who, flags, tracked, view, &format!("e{id}"))
@@ -1114,10 +1126,62 @@ impl Service {
         Ok(if yes { "yes" } else { "no" }.into())
     }
 
+    /// Open the submenu of an entry in a browser or Electron menu with the menu's own keys: Home,
+    /// Down to the entry, then Right. These menus open a submenu on the real mouse hovering, which a
+    /// posted move cannot hold, and accessibility would bring the window forward. None if this is
+    /// not such an entry.
+    fn open_submenu(&self, tracked: &Tracked, view: &mut View, id: u32) -> Option<Reply> {
+        let node = view.nodes.get(&id)?;
+        if !win::is_chromium(tracked.hwnd) || node.parts.role != "menuitem" || !node.parts.states.contains(&"closed") {
+            return None;
+        }
+        // The entries of the same menu, in order: the ones after the nearest menu before this one.
+        let menu = view.nodes.range(..id).rev().find(|(_, n)| n.parts.role == "menu").map(|(at, _)| *at)?;
+        let entries: Vec<u32> = view
+            .nodes
+            .range(menu + 1..)
+            .take_while(|(_, n)| n.parts.role != "menu")
+            .filter(|(_, n)| n.parts.role == "menuitem" && !n.parts.states.contains(&"disabled"))
+            .map(|(at, _)| *at)
+            .collect();
+        let downs = entries.iter().position(|at| *at == id)?;
+        let press = |spec: &str| real::chord(spec).and_then(|chord| act::post_key(tracked.hwnd, &chord, spec));
+        let pressed = (|| {
+            press("home")?;
+            for _ in 0..downs {
+                press("down")?;
+            }
+            press("right")
+        })();
+        if let Err(error) = pressed {
+            return Some(Err(error));
+        }
+        let until = Instant::now() + Duration::from_millis(1500);
+        loop {
+            thread::sleep(SETTLE_STEP);
+            if self.read(tracked, view, false).is_ok() && view.nodes.get(&id).is_some_and(|n| n.parts.states.contains(&"open")) {
+                return Some(Ok("menu keys".into()));
+            }
+            if Instant::now() >= until {
+                return Some(Err("the submenu did not open with the menu's keys: try click on the entry first, then key right".into()));
+            }
+        }
+    }
+
     fn hover(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
-        let (x, y) = match self.resolve(word, who, tracked, view)? {
+        // A name that fits several things means the menu entry with a submenu, when one is open.
+        let (x, y) = match self.resolve_for(word, who, tracked, view, |n| n.parts.role == "menuitem" && n.parts.states.contains(&"closed"))? {
             Target::Point(x, y) => (x, y),
-            Target::Control(id) => act::centre(self.locate(id, tracked, view)?.1),
+            Target::Control(id) => {
+                let rect = self.locate(id, tracked, view)?.1;
+                if !flags.mouse
+                    && let Some(opened) = self.open_submenu(tracked, view, id)
+                {
+                    self.cursor_on(who, flags, rect);
+                    return opened;
+                }
+                act::centre(rect)
+            }
             Target::Menu(_) => return Err("hover needs a control or x,y".into()),
         };
         self.cursor_on(who, flags, (x, y, 0, 0));

@@ -6,6 +6,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- `hover` or `expand` on a menu entry with a submenu in a browser or Electron app opens the submenu with the menu's own keys, in the back, where a posted hover could not hold it open. A name that fits both a label and a control that can take the action means the control.
+- On Windows, deskcrew's pictures, log, sessions and cursor setting moved to `%USERPROFILE%\.deskcrew`. Windows gives packaged apps such as Claude and every program they start a private copy of AppData, so a picture deskcrew saved there could reach an agent missing or stale, and their log and sessions were hidden from other apps.
+
 - Sessions and traces. `deskcrew session start [name] [--shots]` records an agent's commands into a session, which other agents join with `session join ID`, `--session ID` or `DESKCREW_SESSION`. `deskcrew trace` shows the timeline: when, which agent, the command, how long it took, whether it worked and its reply. With `--shots`, each action keeps a picture of the window before and after. `deskcrew trace export` writes the whole session as one HTML page with the pictures inside. Typed text and values are left out, as in the log. `session end`, `session list` and `session gc` close, list and delete sessions.
 
 ## [0.1.23] - 2026-11-14

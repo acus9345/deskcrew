@@ -115,13 +115,15 @@ fn prompt(text: &str, buttons: &[&str]) -> Option<usize> {
 }
 
 fn settings_file() -> PathBuf {
-    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    root.join("deskcrew").join("cursor.txt")
+    crate::shot::home().join("cursor.txt")
 }
 
-/// Whether agents may ask, and who may always borrow.
+/// Whether agents may ask, and who may always borrow. A setting saved before 0.1.24 is still read
+/// from deskcrew's old folder until it is saved again.
 fn load() -> (bool, Vec<String>) {
-    let text = fs::read_to_string(settings_file()).unwrap_or_default();
+    let text = fs::read_to_string(settings_file())
+        .or_else(|_| crate::shot::old_home().map(|old| fs::read_to_string(old.join("cursor.txt"))).unwrap_or_else(|| Err(std::io::ErrorKind::NotFound.into())))
+        .unwrap_or_default();
     let may_ask = text.lines().any(|line| line.trim() == "ask");
     let always = text.lines().filter_map(|line| line.trim().strip_prefix("always ")).map(str::to_string).collect();
     (may_ask, always)

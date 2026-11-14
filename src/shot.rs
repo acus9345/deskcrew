@@ -299,16 +299,26 @@ pub fn path_for(agent: &str, window: u32) -> PathBuf {
 
 /// deskcrew's own folder for pictures and its log.
 pub fn home() -> PathBuf {
+    // Not in AppData: Windows gives each packaged app, such as Claude or another Store app, and
+    // every program it starts, its own private copy of AppData, so a picture or session saved
+    // there by one would be missing or stale for the others.
     #[cfg(windows)]
-    let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
+    let folder = std::env::var_os("USERPROFILE").map(PathBuf::from).unwrap_or_else(std::env::temp_dir).join(".deskcrew");
     #[cfg(target_os = "macos")]
-    let root = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library").join("Caches")).unwrap_or_else(std::env::temp_dir);
+    let folder = std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library").join("Caches")).unwrap_or_else(std::env::temp_dir).join("deskcrew");
     #[cfg(target_os = "linux")]
-    let root = std::env::var_os("XDG_CACHE_HOME")
+    let folder = std::env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(std::env::temp_dir);
-    root.join("deskcrew")
+        .unwrap_or_else(std::env::temp_dir)
+        .join("deskcrew");
+    folder
+}
+
+/// Where deskcrew kept its folder before 0.1.24 on Windows, for settings saved there.
+#[cfg(windows)]
+pub fn old_home() -> Option<PathBuf> {
+    std::env::var_os("LOCALAPPDATA").map(|root| PathBuf::from(root).join("deskcrew"))
 }
 
 #[cfg(test)]

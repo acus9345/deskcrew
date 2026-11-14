@@ -120,9 +120,9 @@ ok invoke
 
 Run `deskcrew help` for every command. A background service starts itself on first use and exits after 30 idle minutes.
 
-`deskcrew log` shows the last 30 commands agents gave it (`deskcrew log 200` for more): when, which agent, the command, whether it worked and the first line of the reply. Typed text, clipboard text and file contents show only their length, since they may be passwords. The log is `deskcrew/log.txt` in your local app data (`~/Library/Caches` on a Mac, `~/.cache` on Linux) and keeps about the last 2 MB.
+`deskcrew log` shows the last 30 commands agents gave it (`deskcrew log 200` for more): when, which agent, the command, whether it worked and the first line of the reply. Typed text, clipboard text and file contents show only their length, since they may be passwords. The log is `log.txt` in `%USERPROFILE%\.deskcrew` (`~/Library/Caches/deskcrew` on a Mac, `~/.cache/deskcrew` on Linux) and keeps about the last 2 MB.
 
-For one run, a session keeps a fuller record. `deskcrew session start "order test" --shots` starts one for the agent that runs it; from then on its commands go into the session, each with when, which agent, how long it took, whether it worked and its reply, and with `--shots` a picture of the window before and after each action. Other agents join with `deskcrew session join ID`, `--session ID` on a command, or `DESKCREW_SESSION=ID`. `deskcrew trace` shows the timeline, and `deskcrew trace export` writes it as one HTML page with the pictures inside, to read or share. `session end` closes it, `session list` lists them, and `session gc` deletes the ended ones. Traces leave out typed text, values after `=` and the whole reply of `get`, `clip`, `fetch`, `table`, `run` and file reads, as the log does. Control names, window titles and pictures stay in, so keep a trace private. Sessions are kept in `deskcrew/sessions` beside the log; a session records at most 20,000 commands and 1,000 pictures.
+For one run, a session keeps a fuller record. `deskcrew session start "order test" --shots` starts one for the agent that runs it; from then on its commands go into the session, each with when, which agent, how long it took, whether it worked and its reply, and with `--shots` a picture of the window before and after each action. Other agents join with `deskcrew session join ID`, `--session ID` on a command, or `DESKCREW_SESSION=ID`. `deskcrew trace` shows the timeline, and `deskcrew trace export` writes it as one HTML page with the pictures inside, to read or share. `session end` closes it, `session list` lists them, and `session gc` deletes the ended ones. Traces leave out typed text, values after `=` and the whole reply of `get`, `clip`, `fetch`, `table`, `run` and file reads, as the log does. Control names, window titles and pictures stay in, so keep a trace private. Sessions are kept in `sessions` beside the log; a session records at most 20,000 commands and 1,000 pictures.
 
 ## Linux (X11 / Xvfb)
 
@@ -318,7 +318,7 @@ Each reply names the route it took.
 | `session` | every agent may borrow it until deskcrew stops |
 | `always` | every agent may borrow it when needed, until you run `off` |
 
-Anything except `off` opens a prompt you have to accept. This stops an agent from turning it on by accident or by habit, but it is not a security boundary: anything running as you can edit `%LOCALAPPDATA%\deskcrew\cursor.txt` or click the prompt.
+Anything except `off` opens a prompt you have to accept. This stops an agent from turning it on by accident or by habit, but it is not a security boundary: anything running as you can edit `%USERPROFILE%\.deskcrew\cursor.txt` or click the prompt.
 
 Some classic controls answer an accessibility request by quietly clicking with the real mouse, so a shield blocks every synthetic mouse event while those requests run. A control that needs that is refused with a message instead. In tests, Paint drawing and Edge presses caused no synthetic mouse events at all.
 
@@ -384,6 +384,7 @@ desk-pilot always moved your real pointer; deskcrew only does with `--real` or `
 - x,y from a shot keep their place in the window, so they still fit after the window moves. When an action changes no control but the window's title, the reply shows the new title.
 - Pressing a WPF button or setting a WPF text box through accessibility can make the app take the foreground for an instant, about 15 ms; deskcrew gives your window back at once, but a key you press in that instant can land in the app. This also happens with Windows' own UI Automation and no deskcrew. A click on a WPF text box puts its caret there in the background, for the keys that follow.
 - In Edge, once an agent has clicked in the page, keys and shortcuts reach a window in the back: Ctrl+S reached the page and Ctrl+= zoomed the browser. Before that click the page has no focus, and keys go nowhere. Other Chromium browsers and Electron apps were not checked again.
+- A menu entry with a submenu in a browser or Electron app opens it only while the real mouse rests on it, which a posted move cannot hold. `hover` or `expand` on such an entry opens it with the menu's own keys instead (Home, Down to the entry, Right), in the back; when a name fits both a label and such an entry, the entry is meant. Tested in Antigravity's model menu.
 - Windows of the same browser share one process, and activate each other when worked at the same time, which loses input. Parallel agents need separate apps or separate browser profiles.
 - Classic rich text boxes, such as a WinForms RichTextBox or WordPad's, are set by replacing their text as an edit, so the app knows there are changes to save, and typing goes to the end. Notepad's newer text box was not tried.
 - The pen needs the window in front, so a `draw` borrows your focus for as long as it runs.
@@ -397,7 +398,7 @@ desk-pilot always moved your real pointer; deskcrew only does with `--real` or `
 - A launched window opens behind yours, and may show on top for an instant first. `launch --front` leaves it in front. Because it starts behind you, a browser opened this way is covered until you move something.
 - Tested on one monitor at 150% scaling. A second monitor has not been tried; a minimized window shown off screen is placed where Windows still counts it as on its own monitor, so it keeps that monitor's scaling, but that was not tried with two.
 - Apps running as administrator can be read but not driven, unless deskcrew also runs as administrator.
-- Pictures are saved in `%LOCALAPPDATA%\deskcrew\shots` and can show private content.
+- Pictures are saved in `%USERPROFILE%\.deskcrew\shots` and can show private content.
 - Text read off a picture can mistake similar letters, such as `I` and `l`. It reads in the languages set up in Windows.
 - Each action takes a picture of the window before and after, which adds a little time on large windows. A blinking caret is ignored, but other animations show as a change.
 
