@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.22] - 2026-11-14
+
 - A click or hover at x,y off the window, or on a minimized window deskcrew could not show, is refused with the reason instead of reported as done. `launch` reports the launched program's window even when another app opens one at the same moment. `type ""` says there is nothing to type.
 
 ## [0.1.21] - 2026-11-14
