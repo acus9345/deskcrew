@@ -48,6 +48,7 @@ use mac::service;
 mod setup;
 mod shot;
 mod system;
+mod trace;
 #[cfg(windows)]
 mod uia;
 #[cfg(windows)]
@@ -72,16 +73,35 @@ fn main() {
         }
         Some("--version") => println!("deskcrew {}", env!("CARGO_PKG_VERSION")),
         Some("log") => println!("{}", log::show(&args)),
+        Some("session" | "trace") => {
+            let mut rest = args.clone();
+            let who = client::agent(&mut rest);
+            let reply = if rest[0] == "session" { trace::session_command(&who, &rest[1..]) } else { trace::trace_command(&who, &rest[1..]) };
+            match reply {
+                Ok(text) => println!("{text}"),
+                Err(text) => {
+                    println!("{text}");
+                    std::process::exit(1);
+                }
+            }
+        }
         None | Some("help" | "--help" | "-h") => println!("{}
-{}", service::HELP, system::HELP),
+{}
+{}", service::HELP, system::HELP, trace::HELP),
         _ => {
             // Processes, files, the shell and the like need no window, so they skip the service.
-            let words: Vec<String> = args.iter().enumerate().filter(|(at, _)| !(args.get(at.wrapping_sub(1)).is_some_and(|w| w == "--agent") || args[*at] == "--agent")).map(|(_, w)| w.clone()).collect();
+            let mut words: Vec<String> = args.iter().enumerate().filter(|(at, _)| !(args.get(at.wrapping_sub(1)).is_some_and(|w| w == "--agent") || args[*at] == "--agent")).map(|(_, w)| w.clone()).collect();
+            let who = client::agent(&mut args.clone());
+            let session = system::COMMANDS.contains(&words[0].as_str()).then(|| trace::session_of(&who, &mut words)).flatten();
+            let started = std::time::Instant::now();
             if let Some(reply) = system::handle(&words) {
-                let who = client::agent(&mut args.clone());
-                match &reply {
-                    Ok(text) => log::record(&who, &words, true, text),
-                    Err(text) => log::record(&who, &words, false, text),
+                let (ok, text) = match &reply {
+                    Ok(text) => (true, text),
+                    Err(text) => (false, text),
+                };
+                log::record(&who, &words, ok, text);
+                if let Some(session) = &session {
+                    session.record(&who, &words, ok, text, started.elapsed(), None, None);
                 }
                 match reply {
                     Ok(text) => println!("{text}"),

@@ -61,8 +61,8 @@ fn length(text: &str) -> String {
 }
 
 /// The command as it was given, with typed text and file contents swapped for their length.
-fn hidden(words: &[String]) -> String {
-    let flags_with_values = ["-w", "--window", "--agent", "--with", "--hold", "--ms", "--expect", "--risk", "--region", "--edge", "--from", "--find"];
+pub fn hidden(words: &[String]) -> String {
+    let flags_with_values = ["-w", "--window", "--agent", "--session", "--with", "--hold", "--ms", "--expect", "--risk", "--region", "--edge", "--from", "--find"];
     // Positions of the words that are not flags or flag values.
     let mut plain = Vec::new();
     let mut skip = false;
@@ -152,7 +152,7 @@ fn split_quoted(text: &str) -> Vec<String> {
 }
 
 /// The time now in UTC, as 2026-11-13 09:12:05Z.
-fn now() -> String {
+pub fn now() -> String {
     let seconds = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
     let (days, rest) = (seconds / 86_400, seconds % 86_400);
     // Days since 1970 to a calendar date (Howard Hinnant's method).

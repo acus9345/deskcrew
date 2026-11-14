@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Sessions and traces. `deskcrew session start [name] [--shots]` records an agent's commands into a session, which other agents join with `session join ID`, `--session ID` or `DESKCREW_SESSION`. `deskcrew trace` shows the timeline: when, which agent, the command, how long it took, whether it worked and its reply. With `--shots`, each action keeps a picture of the window before and after. `deskcrew trace export` writes the whole session as one HTML page with the pictures inside. Typed text and values are left out, as in the log. `session end`, `session list` and `session gc` close, list and delete sessions.
+
 ## [0.1.23] - 2026-11-14
 
 - `deskcrew browsers on|off|status` turns Edge's, Chrome's and Brave's own window occlusion policy off or back on, so they keep drawing covered windows and take input there, also when they are already running. `on` and `off` need a terminal opened as administrator, since Windows lets only an administrator set browser policies. With the policy off, deskcrew no longer tells those browsers a task switcher view is open.

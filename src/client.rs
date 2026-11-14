@@ -195,8 +195,23 @@ fn connect() -> Result<Pipe, String> {
     }
 }
 
+/// One request to the service as this agent, without logging it: whether it worked, and the reply.
+pub fn ask(who: &str, args: &[String]) -> Result<(bool, String), String> {
+    let mut words = vec![who.to_string()];
+    words.extend(args.iter().cloned());
+    let reply = connect().and_then(|pipe| {
+        pipe.send(words.join("\0").as_bytes()).map_err(|e| e.to_string())?;
+        pipe.receive().map_err(|e| format!("the deskcrew service stopped answering: {e}"))
+    })?;
+    let (code, text) = reply.split_first().ok_or("the deskcrew service sent nothing back")?;
+    Ok((*code == 0, String::from_utf8_lossy(text).into_owned()))
+}
+
 pub fn run(mut args: Vec<String>) -> i32 {
     let who = agent(&mut args);
+    let session = crate::trace::session_of(&who, &mut args);
+    let before = session.as_ref().and_then(|s| s.picture(&who, &args, "before"));
+    let started = Instant::now();
     let mut words = vec![who];
     words.extend(args);
     let message = words.join("\0");
@@ -204,7 +219,13 @@ pub fn run(mut args: Vec<String>) -> i32 {
         pipe.send(message.as_bytes()).map_err(|e| e.to_string())?;
         pipe.receive().map_err(|e| format!("the deskcrew service stopped answering: {e}"))
     });
-    let log_reply = |ok: bool, text: &str| crate::log::record(&words[0], &words[1..], ok, text);
+    let log_reply = |ok: bool, text: &str| {
+        crate::log::record(&words[0], &words[1..], ok, text);
+        if let Some(session) = &session {
+            let after = before.is_some().then(|| session.picture(&words[0], &words[1..], "after")).flatten();
+            session.record(&words[0], &words[1..], ok, text, started.elapsed(), before.as_deref(), after.as_deref());
+        }
+    };
     match answer {
         Ok(reply) if !reply.is_empty() => {
             log_reply(reply[0] == 0, &String::from_utf8_lossy(&reply[1..]));

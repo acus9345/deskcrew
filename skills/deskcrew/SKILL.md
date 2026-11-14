@@ -19,6 +19,7 @@ Use this on your own whenever a task needs the desktop; the person does not need
 - Before a risky `do`, show the plan with `--dry`, and pass `--risk high`: it is refused until the person agrees and you add `--force`.
 - `notifications` opens the panel and takes focus: read it, use its refs, then always run `notifications close`. `down` needs `up` within 30 seconds.
 - Each coding agent is recognised and gets its own name and colour. Copies of one agent working in parallel need separate names for separate cursors: `--agent "Claude 2"` or `DESKCREW_AGENT`.
+- When the person wants a record of a run, or to see what went wrong later, run `deskcrew session start "name" --shots` first, `session end` at the end, and give them the page from `trace export`.
 
 Background first. A failure saying `add --real` means the action needs the window in front: `--real` borrows the person's focus briefly and uses the keyboard or a pen, so their cursor stays put. `drag` and `draw` pick the quietest way themselves. Agents take turns on `--real`, and it is refused if a point is not on the target window.
 
