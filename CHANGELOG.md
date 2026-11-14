@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.23] - 2026-11-14
+
 - `deskcrew browsers on|off|status` turns Edge's, Chrome's and Brave's own window occlusion policy off or back on, so they keep drawing covered windows and take input there, also when they are already running. `on` and `off` need a terminal opened as administrator, since Windows lets only an administrator set browser policies. With the policy off, deskcrew no longer tells those browsers a task switcher view is open.
 
 ## [0.1.22] - 2026-11-14
