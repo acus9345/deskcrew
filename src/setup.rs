@@ -87,6 +87,43 @@ fn app_rules(home: &Path) -> Vec<String> {
     said
 }
 
+/// Agent apps that run the commands their agents type in a sandbox, out of sight of the person's
+/// windows, but start MCP servers themselves: deskcrew goes in as an MCP server there.
+fn app_mcp(home: &Path, program: &Path) -> Vec<String> {
+    let mut said = Vec::new();
+    let antigravity = home.join(".gemini").join("antigravity");
+    if antigravity.is_dir() {
+        said.push(match add_mcp_server(&antigravity.join("mcp_config.json"), program) {
+            Ok(()) => "MCP server: Antigravity (restart it to load)".to_string(),
+            Err(error) => format!("Antigravity MCP server failed: {error}"),
+        });
+    }
+    said
+}
+
+/// Add or update deskcrew in an `mcpServers` config, leaving every other server alone. A file that
+/// is not JSON is left as it is, so nothing the person wrote is lost.
+fn add_mcp_server(file: &Path, program: &Path) -> Result<(), String> {
+    use serde_json::{Map, Value, json};
+    let mut config = match fs::read_to_string(file) {
+        Ok(text) if !text.trim().is_empty() => serde_json::from_str::<Value>(&text).map_err(|e| format!("{} is not valid JSON ({e}), so it was left alone", file.display()))?,
+        _ => Value::Object(Map::new()),
+    };
+    let servers = config
+        .as_object_mut()
+        .ok_or("its config is not a JSON object")?
+        .entry("mcpServers")
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or("its mcpServers is not a JSON object")?;
+    servers.insert("deskcrew".into(), json!({ "command": program.display().to_string(), "args": ["mcp"] }));
+    let text = serde_json::to_string_pretty(&config).map_err(|e| e.to_string())?;
+    if let Some(folder) = file.parent() {
+        fs::create_dir_all(folder).map_err(|e| e.to_string())?;
+    }
+    fs::write(file, text + "\n").map_err(|e| e.to_string())
+}
+
 #[cfg(windows)]
 fn app_data(_home: &Path) -> Option<PathBuf> {
     env::var_os("APPDATA").map(PathBuf::from)
@@ -221,6 +258,9 @@ pub fn run() -> i32 {
     for line in app_rules(&home) {
         println!("{line}");
     }
+    for line in app_mcp(&home, &install_folder(&home).0.join(PROGRAM)) {
+        println!("{line}");
+    }
     println!("{found} agents set up. Any other agent that can run commands works too: add this to its rules:");
     println!("{}", rule_text());
     0
@@ -246,6 +286,27 @@ mod tests {
         fs::write(&file, "Someone's own rules.").unwrap();
         write_rule(&file).unwrap();
         assert!(fs::read_to_string(&file).unwrap().starts_with("Someone's own rules.\n\n<!-- deskcrew: start -->"));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn deskcrew_joins_an_mcp_config_without_touching_the_rest() {
+        let dir = env::temp_dir().join(format!("deskcrew-mcp-{}", std::process::id()));
+        let file = dir.join("mcp_config.json");
+        let _ = fs::remove_dir_all(&dir);
+        let program = Path::new(r"C:\tools\deskcrew.exe");
+        add_mcp_server(&file, program).unwrap();
+        let read = || serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(read()["mcpServers"]["deskcrew"]["args"][0], "mcp");
+        fs::write(&file, r#"{"mcpServers": {"other": {"command": "x"}, "deskcrew": {"command": "old"}}, "keep": 1}"#).unwrap();
+        add_mcp_server(&file, program).unwrap();
+        let config = read();
+        assert_eq!(config["mcpServers"]["other"]["command"], "x");
+        assert_eq!(config["keep"], 1);
+        assert_eq!(config["mcpServers"]["deskcrew"]["command"], r"C:\tools\deskcrew.exe");
+        fs::write(&file, "not json").unwrap();
+        assert!(add_mcp_server(&file, program).is_err());
+        assert_eq!(fs::read_to_string(&file).unwrap(), "not json");
         let _ = fs::remove_dir_all(&dir);
     }
 }

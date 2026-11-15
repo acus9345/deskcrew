@@ -78,6 +78,7 @@ The rule sits between `<!-- deskcrew: start -->` and `<!-- deskcrew: end -->` li
 | Claude Desktop | in `claude_desktop_config.json` (Settings > Developer > Edit Config): `"mcpServers": { "deskcrew": { "command": "deskcrew", "args": ["mcp"] } }` |
 | Cursor | the same `mcpServers` entry in `~/.cursor/mcp.json` |
 | Gemini CLI | the same `mcpServers` entry in `~/.gemini/settings.json` |
+| Antigravity | `setup` adds it to `~/.gemini/antigravity/mcp_config.json`; restart Antigravity to load it |
 | VS Code (Copilot) | in `.vscode/mcp.json` or your user `mcp.json`: `"servers": { "deskcrew": { "type": "stdio", "command": "deskcrew", "args": ["mcp"] } }` |
 
 Codex's own config takes it as:
@@ -87,6 +88,8 @@ Codex's own config takes it as:
 command = "deskcrew"
 args = ["mcp"]
 ```
+
+Antigravity runs the commands its agents type on a separate, sandboxed Windows desktop, where deskcrew cannot see your windows, so there it has to be used as an MCP server. When deskcrew finds itself on such a desktop with nothing to show, its reply says so.
 
 Each client shows up as its own cursor, named from what the client calls itself (Claude, Codex, Cursor...). Set `DESKCREW_AGENT` in the server's environment to choose the name.
 

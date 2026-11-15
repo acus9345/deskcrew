@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- `deskcrew setup` adds deskcrew as an MCP server to Antigravity, which runs the commands its agents type on a sandboxed Windows desktop where no window of yours can be seen. On such a desktop, `windows` and a window that matches nothing now say why and point to the MCP tools, instead of only "no windows".
+
 ## [0.1.24] - 2026-11-15
 
 - `draw` takes shapes: `line`, `rect`, `circle`, `ellipse`, `arc`, `bezier` and `poly`, with `--fill` and `--close`, on Windows, the Mac and Linux. `drag` and `draw` take `--button right|middle` and `--with shift|ctrl|alt`; on Windows these go by window message with the keys set only in the app's own keyboard state. `deskcrew --version` prints the version. A blank picture of a fully covered window is no longer replaced by a copy of the screen, which showed the window on top. Ideas from a review of the Hydrogen team's branch.

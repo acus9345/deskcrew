@@ -30,7 +30,14 @@ fn name() -> Vec<u16> {
     format!(r"\\.\pipe\deskcrew-{}-{session}{desktop}", env!("CARGO_PKG_VERSION")).encode_utf16().chain(Some(0)).collect()
 }
 
-fn desktop() -> String {
+/// The name of the Windows desktop this process runs on: "Default" for the one on screen. Read
+/// once, from the first thread to ask: a thread that has made no window calls has no desktop yet.
+pub fn desktop() -> String {
+    static NAME: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    NAME.get_or_init(read_desktop).clone()
+}
+
+fn read_desktop() -> String {
     use windows_sys::Win32::System::{
         StationsAndDesktops::{GetThreadDesktop, GetUserObjectInformationW, UOI_NAME},
         Threading::GetCurrentThreadId,

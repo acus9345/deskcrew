@@ -73,6 +73,16 @@ const ACTIONS: [&str; 18] = ["click", "hover", "set", "type", "key", "check", "u
 /// What the pen route cannot do without touching the person's keyboard or mouse.
 const PEN_LIMITS: &str = "refused: this app takes drawing from deskcrew's pen, which has no middle button and cannot hold Shift, Ctrl or Alt without pressing your real keys. Drop --with or --button middle, or use --mouse";
 const DRAW_USAGE: &str = "draw [control] \"x,y x,y; rect x,y w,h; circle x,y r\"";
+/// Said when nothing is found and deskcrew runs on another desktop than the one on screen.
+fn out_of_sight() -> String {
+    match crate::pipe::desktop() {
+        name if name.is_empty() || name.eq_ignore_ascii_case("Default") => String::new(),
+        name => format!(
+            "\ndeskcrew runs on the Windows desktop '{name}', not the one on screen, so it cannot see the windows there. Agent apps such as Antigravity run commands in a sandbox desktop like this: use deskcrew through the app's MCP tools instead. deskcrew setup adds them to Antigravity; restart it after."
+        ),
+    }
+}
+
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
 
 pub const HELP: &str = r#"deskcrew drives Windows apps in the background. Fastest: see a window once, then do every step in one call.
@@ -510,7 +520,7 @@ impl Service {
             }
         }
         match matches.as_slice() {
-            [] => Err(format!("no window matches '{spec}'")),
+            [] => Err(format!("no window matches '{spec}'{}", out_of_sight())),
             [only] => {
                 // A dialog already read as part of its window is worked from that window, so its
                 // refs hold and the reply shows what the dialog changed there.
@@ -1869,7 +1879,7 @@ impl Service {
                 format!("w{}{mark} \"{}\" {}", self.track(w.hwnd).id, lines::clip(&w.title, 50), w.app)
             })
             .collect();
-        Ok(if shown.is_empty() { "no windows".into() } else { shown.join("\n") })
+        Ok(if shown.is_empty() { format!("no windows{}", out_of_sight()) } else { shown.join("\n") })
     }
 
     fn see(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
