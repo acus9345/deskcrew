@@ -167,6 +167,24 @@ pub fn inside(hwnd: Hwnd, x: i32, y: i32) -> bool {
     x >= left && y >= top && x < left + w && y < top + h
 }
 
+/// The app's own top-level window at this point, the highest first: a dialog or menu it opened
+/// over `root` is where a real click there would land.
+pub fn own_window_at(root: Hwnd, x: i32, y: i32) -> Hwnd {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetTopWindow};
+    let owner = pid(root);
+    unsafe {
+        let mut at = GetTopWindow(null_mut());
+        while !at.is_null() {
+            let hwnd = at as Hwnd;
+            if IsWindowVisible(at) != 0 && pid(hwnd) == owner && class(hwnd) != "SysShadow" && inside(hwnd, x, y) {
+                return hwnd;
+            }
+            at = GetWindow(at, GW_HWNDNEXT);
+        }
+    }
+    root
+}
+
 /// One entry of a classic menu bar, which can be run without ever opening the menu.
 pub struct MenuEntry {
     pub label: String,
@@ -855,8 +873,21 @@ pub fn is_chromium(hwnd: Hwnd) -> bool {
 /// them, in the back) and Firefox (a page canvas gets whole strokes). Holding the button in their
 /// key state as well makes them miss the release.
 pub fn reads_posted_mouse(hwnd: Hwnd) -> bool {
-    let name = class(hwnd);
-    name.starts_with("Qt") || name.starts_with("MozillaWindowClass")
+    is_qt(hwnd) || is_firefox(hwnd)
+}
+
+pub fn is_firefox(hwnd: Hwnd) -> bool {
+    class(hwnd).starts_with("MozillaWindowClass")
+}
+
+pub fn is_qt(hwnd: Hwnd) -> bool {
+    class(hwnd).starts_with("Qt")
+}
+
+/// Windows that read keys only while they hold keyboard focus in their own app: WPF, and Qt, which
+/// takes a shortcut only in the window it thinks is active.
+pub fn keys_need_focus(hwnd: Hwnd) -> bool {
+    is_wpf(hwnd) || is_qt(hwnd) || is_firefox(hwnd)
 }
 
 /// Windows whose pointer input only comes from a real mouse, pen or touch: posted mouse messages

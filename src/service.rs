@@ -931,6 +931,16 @@ impl Service {
         }
         // Accessibility makes a browser, and any app seen to do the same, pull its window over the
         // person's. A window message never does, covered or not.
+        // Qt runs a dialog that a button or menu entry opens inside the accessibility call, and
+        // answers no one until it is closed; a posted click returns at once. It goes to whichever
+        // of the app's windows is on top there, such as a dialog or a menu over this one.
+        let qt = win::is_qt(tracked.hwnd).then(|| win::own_window_at(tracked.hwnd, x, y));
+        if let (Some(window), Some(node), true) = (qt, &node, plain)
+            && matches!(node.parts.role.as_str(), "button" | "menuitem")
+            && win::inside(window, x, y)
+        {
+            return act::post_click(window, x, y, flags.right, flags.double);
+        }
         let by_message = win::is_chromium(tracked.hwnd)
             || (win::pulls_forward(&view.pids) && !win::draws_itself(tracked.hwnd) && view.surfaces.is_empty() && node.as_ref().is_some_and(|node| node.parts.role != "menuitem"));
         let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !by_message);
@@ -963,7 +973,7 @@ impl Service {
                 return pressed.map(|route| format!("{route} on '{}' under {word}", found.parts.name));
             }
         }
-        act::post_click(tracked.hwnd, x, y, flags.right, flags.double)
+        act::post_click(qt.unwrap_or(tracked.hwnd), x, y, flags.right, flags.double)
     }
 
     /// Check, uncheck, expand or collapse, leaving a control that is already that way alone.
@@ -1392,6 +1402,7 @@ impl Service {
                     act::post_text_watched(hwnd, text, &self.stop, follow)
                 }
                 (None, _) if win::is_chromium(tracked.hwnd) => act::post_text(tracked.hwnd, text, &self.stop),
+                (None, _) if win::keys_need_focus(tracked.hwnd) => act::post_text_focused(tracked.hwnd, text, &self.stop),
                 (None, _) => act::post_text_watched(win::keyboard_target(tracked.hwnd), text, &self.stop, follow),
             }
     

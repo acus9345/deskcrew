@@ -6,6 +6,9 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Keys, shortcuts and typing reach Qt apps such as Krita, and Firefox, in the back, the way keys reach WPF apps: the window gets keyboard focus inside its own app for a moment, with the foreground lock held so it stays behind. Krita's tool shortcuts, Ctrl+N, Ctrl+Z and Escape used to need --real, which brought Krita forward. Typing with no control named now works in WPF too.
+- Buttons and menu entries in Qt apps are pressed by a posted click rather than accessibility, which Qt answers only once a dialog the button opened is closed: Krita's dialogs no longer time out, and its menus open in the back. The click goes to the app's own window on top at that spot, so a dialog's or open menu's controls take it from the main window too.
+
 ## [0.1.25] - 2026-11-15
 
 - Qt apps such as Krita, and Firefox, are drawn in and clicked by window message, in the back: no focus change and no movement of your pointer. They used to get the pen, which brought them forward for every stroke.
