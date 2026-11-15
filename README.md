@@ -78,7 +78,7 @@ The rule sits between `<!-- deskcrew: start -->` and `<!-- deskcrew: end -->` li
 | Claude Desktop | in `claude_desktop_config.json` (Settings > Developer > Edit Config): `"mcpServers": { "deskcrew": { "command": "deskcrew", "args": ["mcp"] } }` |
 | Cursor | the same `mcpServers` entry in `~/.cursor/mcp.json` |
 | Gemini CLI | the same `mcpServers` entry in `~/.gemini/settings.json` |
-| Antigravity | `setup` adds it to `~/.gemini/antigravity/mcp_config.json`; restart Antigravity to load it |
+| Antigravity | `setup` adds it to `~/.gemini/config/mcp_config.json`; restart Antigravity to load it |
 | VS Code (Copilot) | in `.vscode/mcp.json` or your user `mcp.json`: `"servers": { "deskcrew": { "type": "stdio", "command": "deskcrew", "args": ["mcp"] } }` |
 
 Codex's own config takes it as:

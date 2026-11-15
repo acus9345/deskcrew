@@ -91,9 +91,10 @@ fn app_rules(home: &Path) -> Vec<String> {
 /// windows, but start MCP servers themselves: deskcrew goes in as an MCP server there.
 fn app_mcp(home: &Path, program: &Path) -> Vec<String> {
     let mut said = Vec::new();
-    let antigravity = home.join(".gemini").join("antigravity");
-    if antigravity.is_dir() {
-        said.push(match add_mcp_server(&antigravity.join("mcp_config.json"), program) {
+    // Antigravity reads its global MCP servers from ~/.gemini/config, its own docs say.
+    let gemini = home.join(".gemini");
+    if gemini.join("antigravity").is_dir() {
+        said.push(match add_mcp_server(&gemini.join("config").join("mcp_config.json"), program) {
             Ok(()) => "MCP server: Antigravity (restart it to load)".to_string(),
             Err(error) => format!("Antigravity MCP server failed: {error}"),
         });
@@ -297,6 +298,10 @@ mod tests {
         let program = Path::new(r"C:\tools\deskcrew.exe");
         add_mcp_server(&file, program).unwrap();
         let read = || serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&file).unwrap()).unwrap();
+        assert_eq!(read()["mcpServers"]["deskcrew"]["args"][0], "mcp");
+        // Antigravity ships the file empty.
+        fs::write(&file, "").unwrap();
+        add_mcp_server(&file, program).unwrap();
         assert_eq!(read()["mcpServers"]["deskcrew"]["args"][0], "mcp");
         fs::write(&file, r#"{"mcpServers": {"other": {"command": "x"}, "deskcrew": {"command": "old"}}, "keep": 1}"#).unwrap();
         add_mcp_server(&file, program).unwrap();
