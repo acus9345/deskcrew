@@ -159,26 +159,26 @@ Each X display gets its own background service, so agents on `:99` and `:0` neve
 - When an action changes no control, its reply says whether the window's picture changed and where, so the agent doesn't need a picture to check.
 - `draw` takes shapes by name, so an agent does not work out every point: `line a b`, `rect x,y w,h`, `circle x,y r`, `ellipse x,y rx,ry`, `arc x,y r from to` (degrees), `bezier a b c d` and `poly a b c [--close]`, with `--fill` for a rect or circle, mixed with plain strokes after `;`.
 
-Measured on 2026-11-01 against agent-desktop 1.0.2, in characters an agent has to read, on throwaway windows at 150% scaling. Its figures use `snapshot -i --compact`. These are characters, not tokens, and agent-desktop's `--skeleton` mode reads less by leaving detail out.
+Measured on 2026-11-15 against agent-desktop 1.3.1, in characters an agent has to read, median of three reads, on a throwaway test form, Character Map, Calculator and a File Explorer window on `C:\Windows`. Its figures use `snapshot -i --compact`. These are characters, not tokens, and agent-desktop's `--skeleton` mode reads less by leaving detail out.
 
 | Reading a window | Controls | agent-desktop | deskcrew | Time, agent-desktop | Time, deskcrew |
 | --- | --- | --- | --- | --- | --- |
-| Test form | 42 | 10,138 | 1,047 | 191 ms | 74 ms |
-| Character Map | 11 | 3,603 | 260 | 177 ms | 24 ms |
-| Calculator | 37 | 9,350 | 689 | 175 ms | 25 ms |
-| File Explorer | 121 | 39,595 | 3,375 | 296 ms | 62 ms |
+| Test form | 43 | 9,929 | 476 | 249 ms | 62 ms |
+| Character Map | 8 | 3,757 | 525 | 254 ms | 45 ms |
+| Calculator | 38 | 9,899 | 923 | 236 ms | 25 ms |
+| File Explorer | 192 | 52,089 | 3,763 | 356 ms | 103 ms |
 
-For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 characters with agent-desktop, reading after each press, and 811 with deskcrew. The tool's help is 1,903 characters.
+For `1 + 2 =` on Calculator, knowing the result of every press took 51,210 characters with agent-desktop, reading after each press, and 1,078 with deskcrew. The tool's help is 3,764 characters. [`bench/reading.py`](bench/reading.py) and [`bench/calc_presses.py`](bench/calc_presses.py) rerun these.
 
 ## Compared with agent-desktop
 
-[agent-desktop](https://github.com/vercel-labs/agent-desktop) inspired this project and reaches further. The reading figures above were measured; the rest of its column comes from the agent-desktop 1.0.2 documentation.
+[agent-desktop](https://github.com/vercel-labs/agent-desktop) inspired this project and reaches further. The reading figures above were measured; the rest of its column comes from the agent-desktop 1.3.1 documentation.
 
 | | agent-desktop | deskcrew |
 | --- | --- | --- |
-| Platforms | macOS, Windows, Linux | Windows; macOS and Linux (X11) newer, tested in CI |
-| Used from | command line, or a library called in process | command line, an agent skill, or an MCP server |
-| Reading a window | 3,603 to 39,595 characters in the tests above | 260 to 3,375 characters, about 10 times less |
+| Platforms | macOS, Windows, Linux (X11 or Wayland) | Windows; macOS and Linux (X11) newer, tested in CI |
+| Used from | command line, a C library called in process, or an MCP server | command line, an agent skill, or an MCP server |
+| Reading a window | 3,757 to 52,089 characters in the tests above | 476 to 3,763 characters, 7 to 21 times less |
 | Drawn cursors | `cursor-overlay`, with `--multi-agent` for one per agent; always on top of other windows | always on, one per agent with no setup, and covered by whatever covers their window |
 | Clicks, typing, toggles, menus, scrolling, drag | yes | yes |
 | Holding a key | listed, but refuses to run for now | `down` and `up`, released by itself after 30 s |
@@ -187,64 +187,68 @@ For `1 + 2 =` on Calculator, knowing the result of every press took 48,570 chara
 | Clipboard, windows, launching apps | yes | yes |
 | Notifications | yes | `notifications`, which opens the panel and takes focus until `notifications close` |
 | System surfaces | `open-system-surface` | `launch` with a Windows link such as `ms-settings:` |
+| Sessions and traces | `session` and `trace` | `session` and `trace`, and `trace export` as one HTML page with pictures before and after each action |
+| Sandboxes | `sandbox` creates and runs local sandboxes | — |
 
 Pick agent-desktop if you want it as a library, or need macOS or Linux support that has been used more widely. Pick deskcrew if you want several agents on screen for fewer tokens, especially on Windows.
 
 ## Compared with other Windows tools
 
-Measured on 2026-11-04 on the same machine, reading the same four throwaway windows three times with each tool, all in one run. These are characters an agent has to read, not tokens, and only reading was measured, not acting.
+Measured on 2026-11-15 on the same machine, reading the same four windows three times with each tool, all in one run: a throwaway test form, Character Map, Calculator and a File Explorer window on `C:\Windows`. These are characters an agent has to read, not tokens, and only reading was measured, not acting.
 
-| Reading a window | deskcrew 0.1.9 | [agent-desktop](https://github.com/vercel-labs/agent-desktop) 1.1.0 | [agent-cu](https://github.com/kortix-ai/agent-computer-use) 0.1.1 | [mcp-windows](https://github.com/sbroenne/mcp-windows) 1.3.28 | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) 0.8.8 |
+| Reading a window | deskcrew 0.1.24 | [agent-desktop](https://github.com/vercel-labs/agent-desktop) 1.3.1 | [agent-cu](https://github.com/kortix-ai/agent-computer-use) 0.1.1 | [mcp-windows](https://github.com/sbroenne/mcp-windows) 1.3.28 | [Windows-MCP](https://github.com/CursorTouch/Windows-MCP) 0.8.9 |
 | --- | --- | --- | --- | --- | --- |
-| Test form | 488 | 9,641 | 1,776 | 7,089 | 4,216 |
-| Character Map | 485 | 3,664 | 823 | 3,760 | 3,007 |
-| Calculator | 689 | 9,394 | 2,199 | 8,212 | 4,680 |
-| File Explorer | 3,381 | 39,798 | 8,938 | 26,635 | 10,897 |
-| Time per read after the first | 22 to 101 ms | 192 to 308 ms | 0.13 to 4.4 s | 30 to 210 ms | about 14.5 s |
-| What an agent loads to learn the tool | 2,469 characters of help | 8,934 characters of help | a skill | 58,165 characters of tool schemas | 25,054 characters of tool schemas |
+| Test form | 476 | 9,929 | 1,845 | 6,977 | 18,334 |
+| Character Map | 525 | 3,757 | 931 | 3,509 | 18,335 |
+| Calculator | 923 | 9,899 | 2,548 | 7,692 | 18,335 |
+| File Explorer | 3,763 | 52,089 | 14,257 | 34,885 | 18,334 |
+| Time per read after the first | 23 to 103 ms | 234 to 361 ms | 61 to 244 ms | 38 to 276 ms | 357 to 397 ms |
+| What an agent loads to learn the tool | 3,764 characters of help | 9,245 characters of help | its skill, 23,813 characters | 58,165 characters of tool schemas | 28,974 characters of tool schemas |
+
+[`bench/reading.py`](bench/reading.py) reruns this.
 
 How each tool was called:
 
 - deskcrew: `see -f`.
 - agent-desktop: `snapshot --window-id w-<handle> -i --compact`, its interactive, compact mode. Its `--skeleton` mode reads less by leaving detail out, and was not measured.
-- agent-cu: `snapshot -i -c`, its recommended compact mode. Its npm package has no Windows program, so it was built from the GitHub source. Its read time swung between about 0.1 s and 4 s from window to window.
+- agent-cu: `snapshot --app "<window title>" -i -c`, its recommended compact mode. Its npm package has no Windows program, so it was built from the GitHub source. Its project now says it is no longer maintained.
 - mcp-windows: `ui_snapshot` in full mode. Its incremental mode makes repeated reads cheaper and was not measured.
-- Windows-MCP: `Snapshot` without a picture. It always reads the whole desktop, other windows and taskbar included, so its figures change with what else is open and are not for one window alone. It waits while the person is using the computer, and refuses to run while a screensaver is on.
+- Windows-MCP: `Snapshot` without a picture. It always reads the whole desktop, other windows and taskbar included, so its figures change with what else is open and are not for one window alone.
 
 ## Agents doing whole tasks
 
-Reading a window is only part of the cost. This measures what an agent spends to finish a task, in the tokens the API reports. Measured on 2026-11-08 with Claude Code 2.1.318 running Sonnet 5.5 headless at its default effort, three runs per tool, on the same machine, on throwaway windows. Each figure is the median of the three. "Right" is checked from the app's own log, not from what the agent said.
+Reading a window is only part of the cost. This measures what an agent spends to finish a task, in the tokens the API reports. Measured on 2026-11-15 with Claude Code 2.1.318 running Sonnet 5.5 headless at its default effort, three runs per tool, on the same machine, on throwaway windows. Each figure is the median of the three. "Right" is checked from the app's own log, not from what the agent said.
 
 - **Order form:** fill in name, email, quantity, country, shipping and gift wrap, submit, confirm the dialog, and report the order number.
 - **Stock grid:** find the item with the lowest stock in an 80-row grid, type its name into a box, press Check, and report the result.
 
 | Order form | Right | Time | Model calls | Tokens read | Tokens written | Cost |
 | --- | --- | --- | --- | --- | --- | --- |
-| deskcrew (this version) | 3 of 3 | 17 s | 5 | 50,187 | 420 | $0.039 |
-| agent-desktop 1.1.0 | 0 of 3 | 55 s | 11 | 209,974 | 1,419 | $0.119 |
-| agent-cu | 3 of 3 | 348 s | 15 | 305,637 | 2,013 | $0.138 |
-| mcp-windows 1.3.28 | 3 of 3 | 73 s | 20 | 760,113 | 3,154 | $0.205 |
-| Windows-MCP 0.8.8 | 3 of 3 | 98 s | 10 | 372,519 | 1,394 | $0.210 |
+| deskcrew 0.1.24 | 3 of 3 | 12 s | 5 | 50,155 | 400 | $0.040 |
+| agent-desktop 1.3.1 | 0 of 3 | 65 s | 13 | 261,099 | 1,814 | $0.133 |
+| agent-cu 0.1.1 | 3 of 3 | 355 s | 16 | 329,400 | 2,086 | $0.139 |
+| mcp-windows 1.3.28 | 3 of 3 | 74 s | 25 | 1,003,453 | 4,344 | $0.269 |
+| Windows-MCP 0.8.9 | 3 of 3 | 37 s | 8 | 176,123 | 1,117 | $0.096 |
 
 | Stock grid | Right | Time | Model calls | Tokens read | Tokens written | Cost |
 | --- | --- | --- | --- | --- | --- | --- |
-| deskcrew (this version) | 3 of 3 | 11 s | 4 | 41,373 | 293 | $0.041 |
-| agent-desktop 1.1.0 | 3 of 3 | 26 s | 8 | 142,283 | 1,338 | $0.107 |
-| agent-cu | 3 of 3 | 26 s | 6 | 129,703 | 676 | $0.111 |
-| mcp-windows 1.3.28 | 3 of 3 | 57 s | 19 | 1,035,417 | 4,486 | $0.311 |
-| Windows-MCP 0.8.8 | 3 of 3 | 127 s | 15 | 413,186 | 2,490 | $0.165 |
+| deskcrew 0.1.24 | 3 of 3 | 10 s | 4 | 39,262 | 317 | $0.036 |
+| agent-desktop 1.3.1 | 3 of 3 | 30 s | 13 | 255,474 | 1,424 | $0.124 |
+| agent-cu 0.1.1 | 3 of 3 | 14 s | 4 | 77,389 | 429 | $0.101 |
+| mcp-windows 1.3.28 | 3 of 3 | 21 s | 10 | 496,677 | 1,812 | $0.202 |
+| Windows-MCP 0.8.9 | 3 of 3 | 52 s | 13 | 333,375 | 2,047 | $0.150 |
 
 Tokens read count everything sent to the model on every call, most of it from the prompt cache, which is billed at a tenth of the price; cost is what the API charged. Sonnet hardly thought on these tasks with any tool, so the time is mostly calls to the model and the tool's own work.
 
-How each tool was set up: every agent had only Bash and the Skill tool built in, none of your own settings, and the tool the way its README says to install it. deskcrew got what `setup` writes; agent-desktop its bundled skill and the lines its README gives for an agent's instructions; agent-cu its skill from skills.sh, built from source as above; mcp-windows and Windows-MCP as MCP servers.
+How each tool was set up: every agent had only Bash and the Skill tool built in, none of your own settings, and the tool the way its README says to install it. deskcrew got what `setup` writes; agent-desktop its bundled skill and the lines its README gives for an agent's instructions; agent-cu its skill from skills.sh, built from source as above; mcp-windows and Windows-MCP as MCP servers. deskcrew and agent-desktop ran on a hidden desktop, where nothing can reach the person's screen; agent-cu, mcp-windows and Windows-MCP send real input, so they ran on the visible desktop with nobody at the computer.
 
 What happened with the others:
 
-- agent-desktop could not pick the form's WinForms radio button in its background mode: every click or select on it timed out. Each run stopped there and asked to use the real mouse, so no order was placed.
-- agent-cu got every order right, but its click on Submit waited about two minutes while the confirm dialog was open, and other reads waited 30 to 60 seconds.
+- agent-desktop could not pick the form's WinForms radio button in its background mode: every click, check or select on it timed out on its visibility check. Each run stopped there and asked to use the real mouse, so no order was placed. Three more runs on the visible desktop stopped the same way.
+- agent-cu got every order right, but its click on Submit waited two minutes while the confirm dialog was open, and other reads and clicks waited 30 to 60 seconds.
 - mcp-windows and Windows-MCP finished every task, using the real mouse and keyboard, with their tool schemas sent on every call.
 
-Compared with deskcrew 0.1.11 under the same agent, this version took the order form from 29 s and 6 model calls to 17 s and 5, and the stock grid from 19 s and 7 calls to 14 s and 4, with 47% fewer tokens read. Those before-and-after runs were on a hidden desktop, where nothing can reach the person's screen. [`bench/`](bench/README.md) has the tasks and the runner.
+Against the runs of 2026-11-08 with an older deskcrew, the order form went from 17 s to 12 s and the stock grid from 11 s to 10 s, with about the same tokens. [`bench/`](bench/README.md) has the tasks and the runner.
 
 ## Features compared
 

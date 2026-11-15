@@ -4,3 +4,5 @@ results*.jsonl
 *.log
 smoke.jsonl
 __pycache__/
+reading.json
+calc_presses.json

@@ -14,6 +14,8 @@ SKILL_URLS = {
 }
 # Real input (SendInput: the mouse, typed keys) reaches only the desktop the person is using, so
 # these tools cannot run on the hidden one, and must not run while the person is at the computer.
+# The Windows-MCP release the comparison uses, run with uvx.
+WINDOWS_MCP = 'windows-mcp==0.8.9'
 NEEDS_REAL_DESKTOP = {'windows-mcp', 'mcp-windows', 'agent-cu'}
 
 
@@ -81,7 +83,7 @@ def prepare(tool, work, deskcrew_exe):
         add_skill(work, 'agent-computer-use', skill_text('agent-cu'))
         return {'flags': flags, 'path': bin_dir}
     servers = {
-        'windows-mcp': {'command': 'uvx', 'args': ['--python', '3.14', 'windows-mcp==0.8.8', 'serve']},
+        'windows-mcp': {'command': 'uvx', 'args': ['--python', '3.14', WINDOWS_MCP, 'serve']},
         'mcp-windows': {'command': p.get('mcp-windows', ''), 'args': []},
     }
     if tool in servers:

@@ -41,4 +41,8 @@ python bench/compare.py --visible
 
 mcp-windows sends real input, so this runs on your own desktop: start it only when you will be away for about ten minutes. `--report <label>` prints the table for runs already made, and `--save` writes it to `published/`, with each run's commands but not the tools' replies, which can hold your own window titles.
 
-`published/clean-order.md` and `published/clean-stock.md` are the runs behind the README's tables, made on 2026-11-08.
+`published/v0124-order.md` and `published/v0124-stock.md` are the runs behind the README's tables, made on 2026-11-15 with deskcrew 0.1.24; `clean-order.md` and `clean-stock.md` are the earlier ones, from 2026-11-08.
+
+## Reading a window
+
+`reading.py` reads a throwaway test form, Character Map, Calculator and a File Explorer window on `C:\Windows` three times with each tool, and `calc_presses.py` counts what `1 + 2 =` on Calculator takes to follow. Both write their raw output next to them, kept out of git: Windows-MCP reads the whole desktop, so its replies hold the titles of your other windows. Run them while you are away, since Windows-MCP and the opened windows use the desktop you see.
