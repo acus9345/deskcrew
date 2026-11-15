@@ -850,17 +850,20 @@ pub fn is_chromium(hwnd: Hwnd) -> bool {
     class(hwnd).starts_with("Chrome_")
 }
 
-/// Qt draws its own controls but reads posted mouse messages like a classic window: Krita's
-/// canvas draws and its buttons press from them, in the back.
-pub fn is_qt(hwnd: Hwnd) -> bool {
-    class(hwnd).starts_with("Qt")
+/// Apps that draw their own controls but read posted mouse messages like a classic window, with
+/// the button taken from the message itself: Qt (Krita's canvas draws and its buttons press from
+/// them, in the back) and Firefox (a page canvas gets whole strokes). Holding the button in their
+/// key state as well makes them miss the release.
+pub fn reads_posted_mouse(hwnd: Hwnd) -> bool {
+    let name = class(hwnd);
+    name.starts_with("Qt") || name.starts_with("MozillaWindowClass")
 }
 
 /// Windows whose pointer input only comes from a real mouse, pen or touch: posted mouse messages
-/// do nothing there (WPF, WinUI, Store apps, Firefox), so they need the pen or `--real`. WPF does
-/// take them while it holds the mouse capture, but its ink canvas then takes focus on the press.
+/// do nothing there (WPF, WinUI and Store apps), so they need the pen or `--real`. WPF does take
+/// them while it holds the mouse capture, but only once its window is active.
 pub fn ignores_posted_mouse(hwnd: Hwnd) -> bool {
-    draws_itself(hwnd) && !is_qt(hwnd)
+    draws_itself(hwnd) && !reads_posted_mouse(hwnd)
 }
 
 /// True if this point is on some monitor.

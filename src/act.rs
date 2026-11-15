@@ -176,9 +176,9 @@ pub fn post_stroke(
         Button::Middle => VK_MBUTTON,
         _ => VK_LBUTTON,
     };
-    // Qt reads the button from the message, and would read a held state as the button still down
-    // when it gets the release, joining one stroke to the next. WinForms needs the state.
-    let mut held = if win::is_qt(hwnd) || win::is_qt(root) { Vec::new() } else { vec![button_vk] };
+    // Qt and Firefox read the button from the message, and would read a held state as the button
+    // still down when they get the release, joining one stroke to the next. WinForms needs it.
+    let mut held = if win::reads_posted_mouse(hwnd) || win::reads_posted_mouse(root) { Vec::new() } else { vec![button_vk] };
     held.extend(modifiers.virtual_keys());
     with_state_held(hwnd, &held, || post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved))
 }
