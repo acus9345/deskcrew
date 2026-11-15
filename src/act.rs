@@ -106,9 +106,9 @@ pub fn is_classic_row(node: &Node, root: Hwnd) -> bool {
     node.parts.role == "item" && ["LISTBOX", "SYSLISTVIEW32", "SYSTREEVIEW32"].iter().any(|name| class.contains(name))
 }
 
-/// True for a point drawn by an engine of the app's own, where only pen input can reach.
-pub fn draws_at(root: Hwnd, x: i32, y: i32) -> bool {
-    win::draws_itself(win::child_at(root, x, y).0) || win::draws_itself(root)
+/// True for a point where posted mouse messages do nothing, so only pen input can reach it.
+pub fn needs_pen_at(root: Hwnd, x: i32, y: i32) -> bool {
+    win::ignores_posted_mouse(win::child_at(root, x, y).0) || win::ignores_posted_mouse(root)
 }
 
 pub fn post_command(root: Hwnd, id: usize) -> Result<String, String> {
@@ -176,7 +176,9 @@ pub fn post_stroke(
         Button::Middle => VK_MBUTTON,
         _ => VK_LBUTTON,
     };
-    let mut held = vec![button_vk];
+    // Qt reads the button from the message, and would read a held state as the button still down
+    // when it gets the release, joining one stroke to the next. WinForms needs the state.
+    let mut held = if win::is_qt(hwnd) || win::is_qt(root) { Vec::new() } else { vec![button_vk] };
     held.extend(modifiers.virtual_keys());
     with_state_held(hwnd, &held, || post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved))
 }
@@ -213,7 +215,7 @@ fn post_stroke_now(
 /// A click as window messages, into the innermost window under the point.
 pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Result<String, String> {
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::draws_itself(hwnd) || win::draws_itself(root) {
+    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);
@@ -240,7 +242,7 @@ pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: 
     const MK_XBUTTON1: usize = 0x20;
     const MK_XBUTTON2: usize = 0x40;
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::draws_itself(hwnd) || win::draws_itself(root) {
+    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);
@@ -264,7 +266,7 @@ pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: 
 /// The pointer resting on a spot, without pressing.
 pub fn post_hover(root: Hwnd, x: i32, y: i32) -> Result<String, String> {
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::draws_itself(hwnd) || win::draws_itself(root) {
+    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
         return Err(NEEDS_REAL.into());
     }
     post(hwnd, WM_MOUSEMOVE, 0, win::lparam(cx, cy))?;
@@ -282,7 +284,7 @@ pub fn post_paste(hwnd: Hwnd) -> Result<String, String> {
 pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32, sideways: bool) -> Result<String, String> {
     const WM_MOUSEHWHEEL: u32 = 0x020E;
     let (hwnd, _, _) = win::child_at(root, x, y);
-    if win::draws_itself(hwnd) || win::draws_itself(root) {
+    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
         return Err(NEEDS_REAL.into());
     }
     let wheel = ((notches * WHEEL_DELTA) as u32 & 0xFFFF) << 16;
@@ -293,7 +295,7 @@ pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32, sideways: bool) -> R
 /// A long press: the button stays down for `hold` before it lets go.
 pub fn post_long_press(root: Hwnd, x: i32, y: i32, right: bool, hold: std::time::Duration) -> Result<String, String> {
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::draws_itself(hwnd) || win::draws_itself(root) {
+    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);

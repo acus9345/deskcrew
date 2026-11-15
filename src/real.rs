@@ -33,6 +33,10 @@ const PRESS: Duration = Duration::from_millis(40);
 const HOLD_LIMIT: Duration = Duration::from_secs(30);
 /// A window just brought forward drops the first press if it comes too soon.
 const FOCUS_SETTLE: Duration = Duration::from_millis(350);
+/// The pen needs far less: a pen press reaches a window as soon as it is on top, and strokes
+/// arrived whole with no wait at all in WPF; these leave a margin.
+const PEN_SETTLE: Duration = Duration::from_millis(50);
+const PEN_DRAIN: Duration = Duration::from_millis(30);
 /// Input already sent still has to reach the app before focus can move away from it.
 const DRAIN: Duration = Duration::from_millis(120);
 const FOCUS_MOVED: &str = "stopped: focus moved away from that window, so nothing more was typed";
@@ -421,11 +425,21 @@ pub fn wait_for_quiet() {
 /// borrowed for --mouse.
 pub struct Borrowed {
     pointer: Option<POINT>,
+    drain: Duration,
     guard: win::FocusGuard,
     root_pids: Vec<u32>,
 }
 
-pub fn borrow(root: Hwnd, pids: &[u32], mouse: bool) -> Result<Borrowed, String> {
+/// What focus is borrowed for: the keyboard, the person's own mouse, or deskcrew's pen.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Loan {
+    Keys,
+    Mouse,
+    Pen,
+}
+
+pub fn borrow(root: Hwnd, pids: &[u32], loan: Loan) -> Result<Borrowed, String> {
+    let mouse = loan == Loan::Mouse;
     wait_for_quiet();
     let mut pointer = POINT { x: 0, y: 0 };
     unsafe { GetCursorPos(&mut pointer) };
@@ -436,14 +450,15 @@ pub fn borrow(root: Hwnd, pids: &[u32], mouse: bool) -> Result<Borrowed, String>
         return Err("Windows would not bring that window forward".into());
     }
     if !already_front {
-        thread::sleep(FOCUS_SETTLE);
+        thread::sleep(if loan == Loan::Pen { PEN_SETTLE } else { FOCUS_SETTLE });
     }
-    Ok(Borrowed { pointer, guard, root_pids: pids.to_vec() })
+    let drain = if loan == Loan::Pen { PEN_DRAIN } else { DRAIN };
+    Ok(Borrowed { pointer, drain, guard, root_pids: pids.to_vec() })
 }
 
 impl Drop for Borrowed {
     fn drop(&mut self) {
-        thread::sleep(DRAIN);
+        thread::sleep(self.drain);
         if let Some(pointer) = self.pointer {
             move_to(pointer.x, pointer.y);
         }

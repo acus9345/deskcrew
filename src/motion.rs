@@ -239,13 +239,18 @@ pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
 
 /// Visit each point of a stroke on schedule, at a steady speed. False if stopped on the way.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, mut visit: impl FnMut(usize, i32, i32)) -> bool {
+pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, visit: impl FnMut(usize, i32, i32)) -> bool {
+    pace_at(path, PIXELS_PER_SECOND, stop, visit)
+}
+
+/// `pace` at another speed, in pixels a second.
+pub fn pace_at(path: &[(f32, f32)], speed: f32, stop: &AtomicBool, mut visit: impl FnMut(usize, i32, i32)) -> bool {
     let started = Instant::now();
     for (at, point) in path.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return false;
         }
-        let due = Duration::from_secs_f32(at as f32 * STEP_PIXELS / PIXELS_PER_SECOND);
+        let due = Duration::from_secs_f32(at as f32 * STEP_PIXELS / speed);
         while let Some(left) = due.checked_sub(started.elapsed()) {
             if left > Duration::from_millis(2) {
                 thread::sleep(left - Duration::from_millis(2));

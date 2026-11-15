@@ -1,7 +1,7 @@
 // The background service. It keeps the cursors on screen between commands, remembers each
 // window's refs, and runs agents side by side: one queue per window, one for the real mouse.
 use crate::borrow::Permission;
-use crate::real::{Button, Modifiers, MouseButton};
+use crate::real::{Button, Loan, Modifiers, MouseButton};
 use crate::{
     act::{self, NEEDS_REAL},
     apps,
@@ -162,7 +162,7 @@ fn press_at(root: Hwnd, x: i32, y: i32, flags: &Flags) -> Reply {
         real::click(x, y, flags.right, flags.double);
         return Ok("mouse".into());
     }
-    if !act::draws_at(root, x, y) {
+    if !act::needs_pen_at(root, x, y) {
         return act::post_click(root, x, y, flags.right, flags.double);
     }
     let pen = Pen::new().ok_or(act::NO_PEN)?;
@@ -821,19 +821,23 @@ impl Service {
     /// Bring the window forward for work that needs it, and give focus back after. Every point has
     /// to land on this window: a press anywhere else would hit whatever the person has open there.
     fn with_front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], work: impl FnOnce() -> T) -> Result<T, String> {
-        self.front(tracked, view, points, false, work)
+        self.front(tracked, view, points, Loan::Keys, work)
     }
 
     /// Bring the window forward for this work. The cursor is only borrowed with `mouse`, which the
     /// person has to have allowed.
-    fn front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], mouse: bool, work: impl FnOnce() -> T) -> Result<T, String> {
+    fn front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], loan: Loan, work: impl FnOnce() -> T) -> Result<T, String> {
+        // A point off the window, or off every screen, is refused before focus moves at all.
+        let mut family = view.surfaces.clone();
+        family.push(tracked.hwnd);
+        if let Some((x, y)) = points.iter().find(|(x, y)| !win::on_screen(*x, *y) || !family.iter().any(|w| win::inside(*w, *x, *y))) {
+            return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
+        }
         let _turn = self.real_input.lock().unwrap();
         // The focus keeper stands aside while focus is on loan, or it would take it straight back.
         self.home.lock().unwrap().on_loan = true;
         let result = (|| {
-            let _borrowed = real::borrow(tracked.hwnd, &view.pids, mouse)?;
-            let mut family = view.surfaces.clone();
-            family.push(tracked.hwnd);
+            let _borrowed = real::borrow(tracked.hwnd, &view.pids, loan)?;
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::owns_point(&family, *x, *y)) {
                 return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
             }
@@ -869,7 +873,7 @@ impl Service {
         if flags.mouse {
             let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
             let held = flags.with.as_deref().map(real::chord).transpose()?;
-            return self.front(tracked, view, &[(x, y)], true, || {
+            return self.front(tracked, view, &[(x, y)], Loan::Mouse, || {
                 if let Some(chord) = &held {
                     real::set_keys(chord, true);
                 }
@@ -931,7 +935,7 @@ impl Service {
             || (win::pulls_forward(&view.pids) && !win::draws_itself(tracked.hwnd) && view.surfaces.is_empty() && node.as_ref().is_some_and(|node| node.parts.role != "menuitem"));
         let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !by_message);
         if let (Some(node), true) = (&node, plain) {
-            let classic = !act::draws_at(tracked.hwnd, x, y);
+            let classic = !act::needs_pen_at(tracked.hwnd, x, y);
             let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press(node), false) };
             if tried_mouse {
                 return Err(act::NEEDS_MOUSE.into());
@@ -951,7 +955,7 @@ impl Service {
         }
         // A spot in an app that draws itself takes no posted click, but the control drawn there
         // can still be pressed through its own action.
-        if node.is_none() && plain && act::draws_at(tracked.hwnd, x, y) {
+        if node.is_none() && plain && act::needs_pen_at(tracked.hwnd, x, y) {
             self.read(tracked, view, false)?;
             if let Some(found) = control_at(view, x, y)
                 && let Some(pressed) = act::press(found)
@@ -1229,7 +1233,7 @@ impl Service {
         };
         self.cursor_on(who, flags, (x, y, 0, 0));
         if flags.mouse {
-            self.front(tracked, view, &[(x, y)], true, || real::move_to(x, y))?;
+            self.front(tracked, view, &[(x, y)], Loan::Mouse, || real::move_to(x, y))?;
             return Ok("mouse".into());
         }
         act::post_hover(tracked.hwnd, x, y)
@@ -1483,7 +1487,7 @@ impl Service {
         // A wheel turned down scrolls down, but a sideways one turned positive scrolls right.
         let notches = if down != sideways { -times } else { times };
         if flags.mouse {
-            self.front(tracked, view, &[(x, y)], true, || real::wheel(x, y, notches, sideways))?;
+            self.front(tracked, view, &[(x, y)], Loan::Mouse, || real::wheel(x, y, notches, sideways))?;
             return Ok("mouse".into());
         }
         if flags.real {
@@ -1525,18 +1529,17 @@ impl Service {
         let (x, y) = *points.first().ok_or("nothing to draw")?;
         let jump = |x: i32, y: i32| self.overlay.jump(who, x, y);
         let (route, finished) = if flags.mouse {
-            let done = self.front(tracked, view, &points, true, || strokes.iter().all(|path| real::stroke(path, button, modifiers, &self.stop, jump)))?;
+            let done = self.front(tracked, view, &points, Loan::Mouse, || strokes.iter().all(|path| real::stroke(path, button, modifiers, &self.stop, jump)))?;
             ("mouse", done)
-        } else if act::draws_at(tracked.hwnd, x, y) {
+        } else if act::needs_pen_at(tracked.hwnd, x, y) {
             // The pen has a tip and a barrel button, and holding Shift for it would mean pressing
             // the person's own keyboard.
             if !modifiers.is_empty() || button == MouseButton::Middle {
                 return Err(PEN_LIMITS.into());
             }
             let pen = Pen::new().ok_or(act::NO_PEN)?;
-            let done = self.with_front(tracked, view, &points, || {
-                strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && pen.stroke(path, button, &self.stop, jump)?))
-            })??;
+            let draw = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && pen.stroke(path, button, &self.stop, jump)?));
+            let done = self.front(tracked, view, &points, Loan::Pen, draw)??;
             ("pen", done)
         } else {
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::inside(tracked.hwnd, *x, *y)) {

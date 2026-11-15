@@ -79,10 +79,16 @@ struct Form {
 
 impl Form {
     fn open(work: &Path, title: &str, x: i32, y: i32) -> Form {
+        Form::open_script(work, "form.ps1", title, x, y)
+    }
+
+    fn open_script(work: &Path, name: &str, title: &str, x: i32, y: i32) -> Form {
         let log = work.join(format!("{title}.log"));
-        let script = concat!(env!("CARGO_MANIFEST_DIR"), r"\tests\form.ps1");
+        let script = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests").join(name);
         let child = Command::new("powershell.exe")
-            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File", script, "-Title", title])
+            .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-STA", "-File"])
+            .arg(&script)
+            .args(["-Title", title])
             .arg("-Log")
             .arg(&log)
             .args(["-X", &x.to_string(), "-Y", &y.to_string()])
@@ -351,7 +357,7 @@ fn everything_on_a_real_desktop() {
         let (x, y) = l.split(' ').nth(2)?.split_once(',')?;
         Some((x.parse().ok()?, y.parse().ok()?))
     }).collect();
-    let apart = match points[..] { [rect, circle] => Some((circle.0 - rect.0, circle.1 - rect.1)), _ => None };
+    let apart = match points[..] { [rect, circle, ..] => Some((circle.0 - rect.0, circle.1 - rect.1)), _ => None };
     r.check("draw takes shapes by name", same && apart == Some((110, 30)), format!("{apart:?} {reply}"));
     let (ok, reply) = dc(a, &["drag", "60,250", "300,330", "--button", "side"]);
     r.check("an unknown --button is refused", !ok && reply.contains("--button takes"), &reply);
@@ -453,6 +459,23 @@ fn everything_on_a_real_desktop() {
     let (ok, reply) = dc("Cursor", &["click", "Popped"]);
     r.check("an open popup's entry runs, with the app in the back", ok && reply.contains("menu command") && form_b.wait_for("popped"), &reply);
     r.check("and the cursor was not touched", SYNTHETIC.load(Ordering::SeqCst) == synthetic, format!("{}", SYNTHETIC.load(Ordering::SeqCst) - synthetic));
+
+    // An app that takes no posted mouse input gets the pen, which needs the window in front for
+    // the stroke, then gives the front and the pointer back.
+    let ink_title = format!("deskcrew-ink-{stamp}");
+    let ink = Form::open_script(&work, "wpf.ps1", &ink_title, 300, 300);
+    let _ = dc(a, &["see", "-w", &ink_title]);
+    let _ = dc(a, &["shot", "-f"]);
+    let before = pointer_and_focus();
+    let (ok, reply) = dc(a, &["draw", "60,150 300,180"]);
+    thread::sleep(Duration::from_millis(200));
+    let after = pointer_and_focus();
+    r.check("the pen draws where posted messages do nothing", ok && reply.starts_with("ok pen") && ink.wait_for("stroke"), &reply);
+    r.check("and gives the front and the pointer back", after == before, format!("{before:?} became {after:?}"));
+    let before = pointer_and_focus();
+    let (ok, reply) = dc(a, &["draw", "60,150 4000,180"]);
+    r.check("a pen stroke off the window is refused without taking focus", !ok && reply.contains("refused") && pointer_and_focus() == before, &reply);
+    ink.close();
 
     // Windows closing, and the service.
     form_c.close();

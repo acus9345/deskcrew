@@ -850,7 +850,26 @@ pub fn is_chromium(hwnd: Hwnd) -> bool {
     class(hwnd).starts_with("Chrome_")
 }
 
-/// Windows drawn by their own engine: posted messages never reach their controls.
+/// Qt draws its own controls but reads posted mouse messages like a classic window: Krita's
+/// canvas draws and its buttons press from them, in the back.
+pub fn is_qt(hwnd: Hwnd) -> bool {
+    class(hwnd).starts_with("Qt")
+}
+
+/// Windows whose pointer input only comes from a real mouse, pen or touch: posted mouse messages
+/// do nothing there (WPF, WinUI, Store apps, Firefox), so they need the pen or `--real`. WPF does
+/// take them while it holds the mouse capture, but its ink canvas then takes focus on the press.
+pub fn ignores_posted_mouse(hwnd: Hwnd) -> bool {
+    draws_itself(hwnd) && !is_qt(hwnd)
+}
+
+/// True if this point is on some monitor.
+pub fn on_screen(x: i32, y: i32) -> bool {
+    screens().iter().any(|&(left, top, w, h, _)| x >= left && y >= top && x < left + w && y < top + h)
+}
+
+/// Windows drawn by their own engine: their controls are not separate windows, and posted
+/// messages do not reach them, Qt's pointer input aside.
 pub fn draws_itself(hwnd: Hwnd) -> bool {
     let name = class(hwnd);
     ["Xaml", "CoreWindow", "DesktopChildSiteBridge", "InputSite", "ApplicationFrame", "Mozilla", "HwndWrapper", "Qt"]
