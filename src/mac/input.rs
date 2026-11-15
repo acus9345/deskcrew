@@ -19,6 +19,19 @@ pub enum Button {
     Forward,
 }
 
+impl Button {
+    pub fn named(word: &str) -> Option<Button> {
+        match word.to_lowercase().as_str() {
+            "left" => Some(Button::Left),
+            "right" => Some(Button::Right),
+            "middle" => Some(Button::Middle),
+            "back" => Some(Button::Back),
+            "forward" => Some(Button::Forward),
+            _ => None,
+        }
+    }
+}
+
 /// Where an event goes: one app in the background, or the system, to whatever is in front.
 #[derive(Clone, Copy)]
 pub enum To {
@@ -87,14 +100,37 @@ pub fn hover(pid: i32, window: u32, x: f64, y: f64) -> Result<(), String> {
 }
 
 /// A press, a path of drags and a release, for drawing and dragging. `moved` hears each point.
-pub fn stroke(pid: i32, window: u32, points: &[(f64, f64)], stop: &dyn Fn() -> bool, moved: &mut dyn FnMut(usize, f64, f64)) -> Result<bool, String> {
+pub fn stroke(
+    pid: i32,
+    window: u32,
+    points: &[(f64, f64)],
+    button: Button,
+    flags: u64,
+    stop: &dyn Fn() -> bool,
+    moved: &mut dyn FnMut(usize, f64, f64),
+) -> Result<bool, String> {
     let Some(&first) = points.first() else { return Ok(true) };
+    let (down, up, drag, code, number) = match button {
+        Button::Left => (kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGEventLeftMouseDragged, kCGMouseButtonLeft, 0),
+        Button::Right => (kCGEventRightMouseDown, kCGEventRightMouseUp, kCGEventRightMouseDragged, kCGMouseButtonRight, 1),
+        Button::Middle => (kCGEventOtherMouseDown, kCGEventOtherMouseUp, kCGEventOtherMouseDragged, kCGMouseButtonCenter, 2),
+        Button::Back => (kCGEventOtherMouseDown, kCGEventOtherMouseUp, kCGEventOtherMouseDragged, 3, 3),
+        Button::Forward => (kCGEventOtherMouseDown, kCGEventOtherMouseUp, kCGEventOtherMouseDragged, 4, 4),
+    };
     let make = |kind: u32, (x, y): (f64, f64)| {
-        let event = unsafe { CGEventCreateMouseEvent(null(), kind, CGPoint { x, y }, kCGMouseButtonLeft) };
+        let event = unsafe { CGEventCreateMouseEvent(null(), kind, CGPoint { x, y }, code) };
+        if !event.is_null() {
+            unsafe {
+                CGEventSetIntegerValueField(event, kCGMouseEventButtonNumber, number);
+                if flags != 0 {
+                    CGEventSetFlags(event, flags);
+                }
+            }
+        }
         aim(event, window);
         event
     };
-    post(To::App(pid), make(kCGEventLeftMouseDown, first))?;
+    post(To::App(pid), make(down, first))?;
     let mut last = first;
     let mut finished = true;
     for (at, point) in points.iter().enumerate().skip(1) {
@@ -103,11 +139,11 @@ pub fn stroke(pid: i32, window: u32, points: &[(f64, f64)], stop: &dyn Fn() -> b
             break;
         }
         thread::sleep(STROKE_GAP);
-        post(To::App(pid), make(kCGEventLeftMouseDragged, *point))?;
+        post(To::App(pid), make(drag, *point))?;
         moved(at, point.0, point.1);
         last = *point;
     }
-    post(To::App(pid), make(kCGEventLeftMouseUp, last))?;
+    post(To::App(pid), make(up, last))?;
     Ok(finished)
 }
 

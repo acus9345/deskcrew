@@ -106,9 +106,55 @@ pub enum Button {
     Forward,
 }
 
+pub type MouseButton = Button;
+
+/// Shift, Ctrl and Alt held through a drag or a stroke.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Modifiers(u8);
+
+impl Modifiers {
+    pub const NONE: Modifiers = Modifiers(0);
+    const SHIFT: u8 = 1;
+    const CONTROL: u8 = 2;
+    const ALT: u8 = 4;
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn has(self, bit: u8) -> bool {
+        self.0 & bit != 0
+    }
+
+    pub fn virtual_keys(self) -> Vec<VIRTUAL_KEY> {
+        [(Self::SHIFT, VK_SHIFT), (Self::CONTROL, VK_CONTROL), (Self::ALT, VK_MENU)].into_iter().filter(|(bit, _)| self.has(*bit)).map(|(_, vk)| vk).collect()
+    }
+
+    /// The MK_ bits a mouse message carries. Alt has none: it shows only in the keyboard state.
+    pub fn mouse_keys(self) -> usize {
+        const MK_SHIFT: usize = 0x4;
+        const MK_CONTROL: usize = 0x8;
+        (if self.has(Self::SHIFT) { MK_SHIFT } else { 0 }) | (if self.has(Self::CONTROL) { MK_CONTROL } else { 0 })
+    }
+
+    /// "shift", "ctrl+alt" and so on.
+    pub fn parse(spec: &str) -> Result<Modifiers, String> {
+        let mut bits = 0;
+        for part in spec.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+            bits |= match part.to_lowercase().as_str() {
+                "shift" => Self::SHIFT,
+                "ctrl" | "control" => Self::CONTROL,
+                "alt" => Self::ALT,
+                other => return Err(format!("unknown key '{other}' in --with: use shift, ctrl or alt, joined with +")),
+            };
+        }
+        Ok(Modifiers(bits))
+    }
+}
+
 impl Button {
     pub fn named(word: &str) -> Option<Button> {
-        match word {
+        match word.to_lowercase().as_str() {
             "left" => Some(Button::Left),
             "right" => Some(Button::Right),
             "middle" => Some(Button::Middle),
@@ -193,12 +239,16 @@ pub fn wheel(x: i32, y: i32, notches: i32, sideways: bool) {
     send(&[mouse(if sideways { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL }, 0, 0, (notches * 120) as u32)]);
 }
 
-/// Press, follow the path, and always let go.
-pub fn stroke(path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> bool {
+/// Press, follow the path, and always let go of the button and any keys held for it.
+pub fn stroke(path: &[(f32, f32)], button: Button, modifiers: Modifiers, stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> bool {
     let Some(first) = path.first() else { return true };
+    let keys = modifiers.virtual_keys();
     move_to(first.0 as i32, first.1 as i32);
     thread::sleep(ARRIVE);
-    press(false, true);
+    for vk in &keys {
+        send(&[key(*vk, 0, 0)]);
+    }
+    press_button(button, true);
     thread::sleep(PRESS);
     let finished = pace(path, stop, |at, x, y| {
         move_to(x, y);
@@ -207,7 +257,10 @@ pub fn stroke(path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32,
         }
     });
     thread::sleep(PRESS);
-    press(false, false);
+    press_button(button, false);
+    for vk in keys.iter().rev() {
+        send(&[key(*vk, 0, KEYEVENTF_KEYUP)]);
+    }
     finished
 }
 

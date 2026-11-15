@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- `draw` takes shapes: `line`, `rect`, `circle`, `ellipse`, `arc`, `bezier` and `poly`, with `--fill` and `--close`, on Windows, the Mac and Linux. `drag` and `draw` take `--button right|middle` and `--with shift|ctrl|alt`; on Windows these go by window message with the keys set only in the app's own keyboard state. `deskcrew --version` prints the version. A blank picture of a fully covered window is no longer replaced by a copy of the screen, which showed the window on top. Ideas from a review of the Hydrogen team's branch.
+- Fixed: picking an entry of an open classic right-click menu closed the menu without running the entry when the app was in the back. The menu is now closed and the entry's command sent to its owner, as a real pick does.
 - `hover` or `expand` on a menu entry with a submenu in a browser or Electron app opens the submenu with the menu's own keys, in the back, where a posted hover could not hold it open. A name that fits both a label and a control that can take the action means the control.
 - On Windows, deskcrew's pictures, log, sessions and cursor setting moved to `%USERPROFILE%\.deskcrew`. Windows gives packaged apps such as Claude and every program they start a private copy of AppData, so a picture deskcrew saved there could reach an agent missing or stale, and their log and sessions were hidden from other apps.
 

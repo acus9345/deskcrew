@@ -135,7 +135,7 @@ pub fn screen(x: i32, y: i32, w: i32, h: i32) -> Result<Frame, String> {
 impl Frame {
     /// One colour edge to edge: the app paints itself some way a window copy cannot see.
     pub fn is_blank(&self) -> bool {
-        let first = &self.pixels[..3];
+        let Some(first) = self.pixels.get(..3) else { return true };
         self.pixels.as_chunks::<4>().0.iter().all(|p| &p[..3] == first)
     }
 

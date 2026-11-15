@@ -261,7 +261,7 @@ fn everything_on_a_real_desktop() {
     let (ok, reply) = dc(a, &["click", "File", "Save"]);
     r.check("a menu opens and its item works", ok && form.wait_for("menu Save"), &reply);
     let (ok, reply) = dc(a, &["key", "ctrl+s"]);
-    r.check("a shortcut without --real says how to do it", !ok && reply.contains("--real"), &reply);
+    r.check("a shortcut is posted in the back, and says --real is there if it did nothing", ok && reply.contains("--real"), &reply);
     let (ok, reply) = dc(a, &["key", "alt+f4", "--real"]);
     r.check("a risky shortcut is refused", !ok && reply.contains("refused"), &reply);
     let (same, reply) = unmoved(&["click", "Alpha"]);
@@ -330,15 +330,48 @@ fn everything_on_a_real_desktop() {
     r.check("drag needs no mouse in a classic window", same && reply.starts_with("ok message") && form.text().matches("up Left").count() > lifted, &reply);
     let (ok, reply) = dc(a, &["draw", "60,250 200,300 300,250; 60,330 300,330", "--smooth"]);
     r.check("draw does several strokes", ok && form.text().matches("up Left").count() >= 4, &reply);
+    // Other buttons and held keys, still by window message: the keys are only in the app's own
+    // keyboard state, never pressed for real.
+    let (same, reply) = unmoved(&["drag", "60,250", "300,330", "--button", "middle", "--with", "shift"]);
+    let pressed = |button: &str, keys: &[&str]| form.text().lines().any(|l| l.starts_with(&format!("down {button}")) && keys.iter().all(|k| l.contains(k)));
+    r.check("drag can use the middle button with Shift held", same && form.wait_for("up Middle") && pressed("Middle", &["mods=Shift"]), &reply);
+    let (same, reply) = unmoved(&["draw", "60,250 300,250", "--with", "ctrl+alt"]);
+    r.check("draw can hold Ctrl and Alt", same && pressed("Left", &["Control", "Alt"]), &reply);
+    // The right button let go on the canvas opens its popup; WinForms reports the release only
+    // once that popup closes, so the popup is the proof it arrived.
+    let (ok, reply) = dc(a, &["drag", "60,250", "300,330", "--button", "right"]);
+    r.check("drag can use the right button", ok && form.wait_for("down Right") && reply.contains("Popped"), &reply);
+    let _ = dc(a, &["click", "Popped"]);
+    // Shot pixels here are window pixels (scale 1), so the circle starts 90 + 20 right of the
+    // rect and 30 lower: its first point is at angle 0.
+    let downs = || form.text().lines().filter(|l| l.starts_with("down Left")).count();
+    let before = downs();
+    let (same, reply) = unmoved(&["draw", "rect 60,250 40,30; circle 150,280 20"]);
+    let points: Vec<(i32, i32)> = form.text().lines().filter(|l| l.starts_with("down Left")).skip(before).filter_map(|l| {
+        let (x, y) = l.split(' ').nth(2)?.split_once(',')?;
+        Some((x.parse().ok()?, y.parse().ok()?))
+    }).collect();
+    let apart = match points[..] { [rect, circle] => Some((circle.0 - rect.0, circle.1 - rect.1)), _ => None };
+    r.check("draw takes shapes by name", same && apart == Some((110, 30)), format!("{apart:?} {reply}"));
+    let (ok, reply) = dc(a, &["drag", "60,250", "300,330", "--button", "side"]);
+    r.check("an unknown --button is refused", !ok && reply.contains("--button takes"), &reply);
+    let (ok, reply) = dc(a, &["draw", "60,250 300,250", "--with", "super"]);
+    r.check("an unknown --with key is refused", !ok && reply.contains("unknown key"), &reply);
+    let (ok, reply) = dc(a, &["draw", "circle 100,100 0"]);
+    r.check("a shape that cannot be drawn says why", !ok && reply.contains("radius"), &reply);
     let (ok, reply) = dc(a, &["type", "#Field", "typed", "--real"]);
     r.check("--real types with the real keyboard", ok && form.wait_for("typed"), &reply);
     let (ok, reply) = dc(a, &["key", "ctrl+a", "--real"]);
     r.check("--real can press a shortcut", ok, &reply);
+    // The person's own setting may let this agent borrow the cursor, so it is turned off here and
+    // put back after the next check.
+    let settings = std::path::Path::new(&std::env::var("USERPROFILE").unwrap()).join(".deskcrew").join("cursor.txt");
+    let saved = std::fs::read_to_string(&settings).ok();
+    std::fs::create_dir_all(settings.parent().unwrap()).unwrap();
+    std::fs::write(&settings, "").unwrap();
     let before = pointer_and_focus();
     let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
     r.check("the cursor cannot be borrowed until the person allows it", !ok && reply.contains("borrow") && pointer_and_focus() == before, &reply);
-    let settings = std::path::Path::new(&std::env::var("LOCALAPPDATA").unwrap()).join("deskcrew").join("cursor.txt");
-    let saved = std::fs::read_to_string(&settings).ok();
     std::fs::write(&settings, format!("always {a}")).unwrap();
     let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
     thread::sleep(Duration::from_millis(100));
@@ -411,15 +444,14 @@ fn everything_on_a_real_desktop() {
     let (ok, reply) = dc(a, &["click", "Alpha"]);
     r.check("resume lets work go on", ok, &reply);
 
-    // A control that can only be clicked by the real mouse is refused, not clicked with it.
+    // An entry of a classic popup runs with the app in the back, and without the mouse.
     let _ = dc("Cursor", &["see", "-w", &second]);
     let _ = dc("Cursor", &["shot", "-f"]);
     let (ok, reply) = dc("Cursor", &["click", "100,300", "--right"]);
     r.check("a right click opens a classic popup", ok && reply.contains("Popped"), &reply);
     let synthetic = SYNTHETIC.load(Ordering::SeqCst);
     let (ok, reply) = dc("Cursor", &["click", "Popped"]);
-    thread::sleep(Duration::from_millis(100));
-    r.check("the shield refuses a control that would take the mouse", !ok && reply.contains("real mouse"), &reply);
+    r.check("an open popup's entry runs, with the app in the back", ok && reply.contains("menu command") && form_b.wait_for("popped"), &reply);
     r.check("and the cursor was not touched", SYNTHETIC.load(Ordering::SeqCst) == synthetic, format!("{}", SYNTHETIC.load(Ordering::SeqCst) - synthetic));
 
     // Windows closing, and the service.

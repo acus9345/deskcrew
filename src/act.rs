@@ -1,6 +1,6 @@
 // Acting on a control without touching the real mouse or keyboard: the app's own accessibility
 // actions first, then Windows messages for classic controls. Each result names the route taken.
-use crate::real::{self, Button, Chord};
+use crate::real::{self, Button, Chord, Modifiers};
 use crate::uia::{Done, Element, Node, Uia};
 use crate::win::{self, Hwnd};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -10,8 +10,8 @@ use windows_sys::Win32::{
         Input::KeyboardAndMouse::{MAPVK_VK_TO_VSC, MapVirtualKeyW},
         WindowsAndMessaging::{
             PostMessageW, SMTO_ABORTIFHUNG, SendMessageTimeoutW, WM_CHAR, WM_CLOSE, WM_COMMAND, WM_KEYDOWN, WM_KEYUP,
-            WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MOUSEMOVE, WM_MOUSEWHEEL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP,
-            WM_SETTEXT,
+            WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_MOUSEMOVE,
+            WM_MOUSEWHEEL, WM_RBUTTONDBLCLK, WM_RBUTTONDOWN, WM_RBUTTONUP, WM_SETTEXT,
         },
     },
 };
@@ -25,6 +25,7 @@ const WHEEL_DELTA: i32 = 120;
 const ACCESS_DENIED: u32 = 5;
 const MK_LBUTTON: usize = 1;
 const MK_RBUTTON: usize = 2;
+const MK_MBUTTON: usize = 0x10;
 const BN_CLICKED: usize = 0;
 const CB_FINDSTRINGEXACT: u32 = 0x0158;
 const CB_SETCURSEL: u32 = 0x014E;
@@ -158,28 +159,54 @@ fn with_state_held<T>(hwnd: Hwnd, keys: &[u16], work: impl FnOnce() -> T) -> T {
 }
 
 /// A whole press, drag and release as window messages, into the window under the first point,
-/// with the left button down in the app's keyboard state while it lasts.
-pub fn post_stroke(root: Hwnd, path: &[(f32, f32)], stop: &AtomicBool, moved: impl FnMut(i32, i32)) -> Result<bool, String> {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LBUTTON;
+/// with the chosen button and modifiers down in the app's keyboard state while it lasts.
+pub fn post_stroke(
+    root: Hwnd,
+    path: &[(f32, f32)],
+    button: Button,
+    modifiers: Modifiers,
+    stop: &AtomicBool,
+    moved: impl FnMut(i32, i32),
+) -> Result<bool, String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
     let Some(first) = path.first() else { return Ok(true) };
     let hwnd = win::child_at(root, first.0 as i32, first.1 as i32).0;
-    with_state_held(hwnd, &[VK_LBUTTON], || post_stroke_now(root, path, stop, moved))
+    let button_vk = match button {
+        Button::Right => VK_RBUTTON,
+        Button::Middle => VK_MBUTTON,
+        _ => VK_LBUTTON,
+    };
+    let mut held = vec![button_vk];
+    held.extend(modifiers.virtual_keys());
+    with_state_held(hwnd, &held, || post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved))
 }
 
-fn post_stroke_now(root: Hwnd, path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> Result<bool, String> {
+fn post_stroke_now(
+    root: Hwnd,
+    path: &[(f32, f32)],
+    button: Button,
+    keys: usize,
+    stop: &AtomicBool,
+    mut moved: impl FnMut(i32, i32),
+) -> Result<bool, String> {
     let Some(first) = path.first() else { return Ok(true) };
     let (hwnd, x, y) = win::child_at(root, first.0 as i32, first.1 as i32);
-    post(hwnd, WM_MOUSEMOVE, 0, win::lparam(x, y))?;
-    post(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, win::lparam(x, y))?;
+    let (down, up, button_bit) = match button {
+        Button::Right => (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON),
+        Button::Middle => (WM_MBUTTONDOWN, WM_MBUTTONUP, MK_MBUTTON),
+        _ => (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON),
+    };
+    post(hwnd, WM_MOUSEMOVE, keys, win::lparam(x, y))?;
+    post(hwnd, down, button_bit | keys, win::lparam(x, y))?;
     let mut last = (x, y);
     let finished = real::pace(path, stop, |at, x, y| {
         last = win::to_client(hwnd, x, y);
-        let _ = post(hwnd, WM_MOUSEMOVE, MK_LBUTTON, win::lparam(last.0, last.1));
+        let _ = post(hwnd, WM_MOUSEMOVE, button_bit | keys, win::lparam(last.0, last.1));
         if at % 3 == 0 {
             moved(x, y);
         }
     });
-    post(hwnd, WM_LBUTTONUP, 0, win::lparam(last.0, last.1))?;
+    post(hwnd, up, keys, win::lparam(last.0, last.1))?;
     Ok(finished)
 }
 
@@ -210,7 +237,6 @@ pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Resu
 /// Ctrl or Alt held: those are set down in the app's keyboard state too, for apps that ask it.
 pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: usize, modifiers: &[u16]) -> Result<String, String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP};
-    const MK_MBUTTON: usize = 0x10;
     const MK_XBUTTON1: usize = 0x20;
     const MK_XBUTTON2: usize = 0x40;
     let (hwnd, cx, cy) = win::child_at(root, x, y);
@@ -404,16 +430,34 @@ pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
     Ok("message".into())
 }
 
-/// Pick an entry of an open classic popup menu by its keyboard: the arrow keys down to it, then
-/// Enter, as window messages. The menu reads its keys from its own thread's queue, so this works
-/// with the app in the back, where a click on the menu needs the real mouse. None if the menu has
-/// no entry by that name.
+/// Pick an entry of an open classic popup menu, with the app in the back, where a click on the
+/// menu needs the real mouse. The menu is closed and its owner gets the entry's command, as it
+/// would from a real pick: a menu opened while its app is in the back does not take posted keys.
+/// The arrow keys and Enter are left for an entry with no command of its own. None if the menu
+/// has no entry by that name.
 pub fn choose_in_popup(popup: Hwnd, label: &str) -> Option<Result<String, String>> {
     let entries = win::menu_entries(win::menu_of_popup(popup));
     let wanted = label.to_lowercase();
     let at = entries.iter().position(|entry| entry.label.to_lowercase() == wanted)?;
     if entries[at].greyed {
         return Some(Err(format!("'{}' is disabled", entries[at].label)));
+    }
+    let entry = &entries[at];
+    if entry.submenu == 0
+        && let Some(owner) = win::menu_owner(popup)
+    {
+        const WM_CANCELMODE: u32 = 0x001F;
+        let mut ignored = 0;
+        unsafe { SendMessageTimeoutW(owner as _, WM_CANCELMODE, 0, 0, SMTO_ABORTIFHUNG, 500, &mut ignored) };
+        // A command that arrives while the app is still in its menu is swallowed by it.
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(1000);
+        while win::in_menu(owner) && std::time::Instant::now() < until {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        if win::in_menu(owner) {
+            return Some(Err("the menu would not close: try key escape, then another way".into()));
+        }
+        return Some(post(owner, WM_COMMAND, entry.command & 0xFFFF, 0).map(|_| "menu command".to_string()));
     }
     const VK_DOWN: usize = 0x28;
     const VK_RETURN: usize = 0x0D;

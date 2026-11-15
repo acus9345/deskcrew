@@ -232,6 +232,27 @@ pub fn menu_of_popup(popup: Hwnd) -> isize {
     menu as isize
 }
 
+fn menu_state(hwnd: Hwnd) -> Option<GUITHREADINFO> {
+    unsafe {
+        let thread = GetWindowThreadProcessId(raw(hwnd), null_mut());
+        let mut info: GUITHREADINFO = zeroed();
+        info.cbSize = size_of::<GUITHREADINFO>() as u32;
+        (thread != 0 && GetGUIThreadInfo(thread, &mut info) != 0).then_some(info)
+    }
+}
+
+/// The window an open popup menu reports its choice to, from its thread's menu state.
+pub fn menu_owner(popup: Hwnd) -> Option<Hwnd> {
+    menu_state(popup).filter(|info| !info.hwndMenuOwner.is_null()).map(|info| info.hwndMenuOwner as Hwnd)
+}
+
+/// True while this window's thread is still in a menu, which can outlast the menu showing.
+pub fn in_menu(hwnd: Hwnd) -> bool {
+    const GUI_INMENUMODE: u32 = 0x4;
+    const GUI_POPUPMENUMODE: u32 = 0x10;
+    menu_state(hwnd).is_some_and(|info| info.flags & (GUI_INMENUMODE | GUI_POPUPMENUMODE) != 0)
+}
+
 /// The entry with this label anywhere in a menu.
 pub fn find_menu(menu: isize, wanted: &str) -> Option<MenuEntry> {
     if menu == 0 {

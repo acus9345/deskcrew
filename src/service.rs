@@ -1,12 +1,12 @@
 // The background service. It keeps the cursors on screen between commands, remembers each
 // window's refs, and runs agents side by side: one queue per window, one for the real mouse.
 use crate::borrow::Permission;
-use crate::real::Button;
+use crate::real::{Button, Modifiers, MouseButton};
 use crate::{
     act::{self, NEEDS_REAL},
     apps,
     lines::{self, Seen},
-    look,
+    look, motion,
     overlay::{Overlay, Rect},
     pen::Pen,
     pipe::Pipe,
@@ -70,6 +70,9 @@ const MINIMIZED_POINT: &str = "refused: this window is minimized, and Windows wo
 const COVERED: &str ="refused: this window is minimized, and browser and Electron apps take no clicks or keys until they are shown again. Windows would not let deskcrew show it without it coming forward just now. Ask the person to restore it, or add --real";
 /// Commands that act on a window, as opposed to reading it.
 const ACTIONS: [&str; 18] = ["click", "hover", "set", "type", "key", "check", "uncheck", "toggle", "expand", "collapse", "clear", "select", "scroll", "show", "drag", "draw", "down", "pick-file"];
+/// What the pen route cannot do without touching the person's keyboard or mouse.
+const PEN_LIMITS: &str = "refused: this app takes drawing from deskcrew's pen, which has no middle button and cannot hold Shift, Ctrl or Alt without pressing your real keys. Drop --with or --button middle, or use --mouse";
+const DRAW_USAGE: &str = "draw [control] \"x,y x,y; rect x,y w,h; circle x,y r\"";
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
 
 pub const HELP: &str = r#"deskcrew drives Windows apps in the background. Fastest: see a window once, then do every step in one call.
@@ -86,7 +89,8 @@ down shift --real | down left x,y --mouse     up (lets go; 30 s limit)
 set e3 "value"     type [e3] "text" [--paste]     key enter [--hold ms --real]     select e3 "Item"
 scroll [e3] up|down|left|right [n]     show e3     wait "text" [--gone] [--ms N]
 table e5 [--from N]                   a table or grid, as many rows as fit     pick-file "path"   fill an Open or Save dialog
-drag a b     draw e3 "x,y x,y; x,y x,y" [--smooth]
+drag a b     draw [e3] "x,y x,y; x,y x,y" [--smooth]     both take [--button right|middle] [--with shift|ctrl|alt]
+  shapes in draw: line a b | rect x,y w,h | circle x,y r | ellipse x,y rx,ry | arc x,y r from to | bezier a b c d | poly a b c [--close]; --fill fills rect and circle
 do "set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Yes" [--dry] [--risk low|medium|high]
                                       many steps, one reply; names work as refs, and it goes on into dialogs it opens
 Any action: --expect "text" fails unless the text shows afterwards.
@@ -263,6 +267,8 @@ struct Flags {
     screen: bool,
     front: bool,
     smooth: bool,
+    fill: bool,
+    close: bool,
     window: Option<String>,
     find: Option<String>,
     from: usize,
@@ -271,6 +277,8 @@ struct Flags {
     hold: Option<u64>,
     region: Option<String>,
     with: Option<String>,
+    button: Option<MouseButton>,
+    button_error: Option<String>,
     expect: Option<String>,
     risk: Option<String>,
 }
@@ -284,6 +292,22 @@ impl Flags {
             (.., true) => Button::Right,
             _ => Button::Left,
         }
+    }
+
+    fn mouse_button(&self) -> MouseButton {
+        if let Some(button) = self.button {
+            button
+        } else if self.middle {
+            MouseButton::Middle
+        } else if self.right {
+            MouseButton::Right
+        } else {
+            MouseButton::Left
+        }
+    }
+
+    fn modifiers(&self) -> Result<Modifiers, String> {
+        self.with.as_deref().map(Modifiers::parse).unwrap_or(Ok(Modifiers::NONE))
     }
 }
 
@@ -321,6 +345,13 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                     flags.with = next;
                     took_next = true;
                 }
+                "--button" => {
+                    match next.as_deref().and_then(MouseButton::named) {
+                        Some(button @ (MouseButton::Left | MouseButton::Right | MouseButton::Middle)) => flags.button = Some(button),
+                        _ => flags.button_error = Some("--button takes left, right or middle".into()),
+                    }
+                    took_next = true;
+                }
                 "--expect" => {
                     flags.expect = next;
                     took_next = true;
@@ -334,6 +365,8 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                 "--screen" => flags.screen = true,
                 "--front" => flags.front = true,
                 "--smooth" => flags.smooth = true,
+                "--fill" => flags.fill = true,
+                "--close" => flags.close = true,
                 "-w" | "--window" => {
                     flags.window = next;
                     took_next = true;
@@ -875,7 +908,7 @@ impl Service {
                 return run_menu_entry(tracked.hwnd, &entry);
             }
             // An entry of an open classic popup menu, such as a right-click menu, is picked with
-            // the menu's own keys: a click on it would need the real mouse.
+            // its command, sent to the menu's owner: a click on it would need the real mouse.
             if plain && node.parts.role == "menuitem"
                 && let Some(result) = win::popup_menus(&view.pids).into_iter().find_map(|popup| act::choose_in_popup(popup, &node.parts.name))
             {
@@ -1477,16 +1510,22 @@ impl Service {
     /// Strokes by the quietest way the app accepts: messages to a classic window, the pen for one
     /// that draws itself, and the real mouse only for an agent allowed to borrow it.
     fn walk(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &View, strokes: Vec<Vec<(f32, f32)>>) -> Reply {
+        let (button, modifiers) = (flags.mouse_button(), flags.modifiers()?);
         let points: Vec<(i32, i32)> = strokes.iter().flatten().map(|p| (p.0.round() as i32, p.1.round() as i32)).collect();
         let (x, y) = *points.first().ok_or("nothing to draw")?;
         let jump = |x: i32, y: i32| self.overlay.jump(who, x, y);
         let (route, finished) = if flags.mouse {
-            let done = self.front(tracked, view, &points, true, || strokes.iter().all(|path| real::stroke(path, &self.stop, jump)))?;
+            let done = self.front(tracked, view, &points, true, || strokes.iter().all(|path| real::stroke(path, button, modifiers, &self.stop, jump)))?;
             ("mouse", done)
         } else if act::draws_at(tracked.hwnd, x, y) {
+            // The pen has a tip and a barrel button, and holding Shift for it would mean pressing
+            // the person's own keyboard.
+            if !modifiers.is_empty() || button == MouseButton::Middle {
+                return Err(PEN_LIMITS.into());
+            }
             let pen = Pen::new().ok_or(act::NO_PEN)?;
             let done = self.with_front(tracked, view, &points, || {
-                strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && pen.stroke(path, &self.stop, jump)?))
+                strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && pen.stroke(path, button, &self.stop, jump)?))
             })??;
             ("pen", done)
         } else {
@@ -1496,7 +1535,7 @@ impl Service {
                 }
                 return Err(format!("refused: {x},{y} on screen is not on this window"));
             }
-            let send = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, &self.stop, jump)?));
+            let send = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, button, modifiers, &self.stop, jump)?));
             let done = if flags.real { self.with_front(tracked, view, &points, send)?? } else { send()? };
             ("message", done)
         };
@@ -1547,6 +1586,8 @@ impl Service {
         self.focus_in(&pids);
         tracked.drawers.fetch_add(1, Ordering::Relaxed);
         let mut result = Ok(true);
+        let button = flags.mouse_button();
+        let modifiers = flags.modifiers()?;
         'strokes: for stroke in &strokes {
             let mut start = 0;
             while start + 1 < stroke.len() {
@@ -1556,7 +1597,7 @@ impl Service {
                 let end = (start + piece).min(stroke.len() - 1);
                 let done = {
                     let _turn = tracked.pointer.lock().unwrap();
-                    act::post_stroke(tracked.hwnd, &stroke[start..=end], &self.stop, |x, y| self.overlay.jump(who, x, y))
+                    act::post_stroke(tracked.hwnd, &stroke[start..=end], button, modifiers, &self.stop, |x, y| self.overlay.jump(who, x, y))
                 };
                 win::stop_flashing(tracked.hwnd);
                 match done {
@@ -1586,33 +1627,45 @@ impl Service {
 
     fn plan_draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Result<Vec<Vec<(f32, f32)>>, String> {
         let (word, script) = match words {
-            [script] => (None, script),
-            [word, script] => (Some(word), script),
-            _ => return Err("draw [control] \"x,y x,y; x,y x,y\"".into()),
+            [] => return Err(DRAW_USAGE.into()),
+            // A first word that is neither a point nor a shape names the control to draw on.
+            [first, rest @ ..] if !rest.is_empty() && is_point(first).is_none() && !motion::is_shape(first) => (Some(first.clone()), rest.join(" ")),
+            _ => (None, words.join(" ")),
         };
         let origin = match word {
-            Some(word) => match self.resolve(word, who, tracked, view)? {
+            Some(ref word) => match self.resolve(word, who, tracked, view)? {
                 Target::Control(id) => Some(self.locate(id, tracked, view)?.1),
                 _ => return Err("draw needs a control".into()),
             },
             None => None,
         };
         let frames = self.shot_frames(who, tracked);
+        let (offset, scale) = match (origin, frames) {
+            (Some(rect), _) => ((rect.0 as f32, rect.1 as f32), 1.0_f32),
+            (None, Some(frames)) => ((frames.x as f32, frames.y as f32), frames.scale),
+            (None, None) => return Err("draw on a control, or take a shot first".into()),
+        };
+
         let mut strokes = Vec::new();
         for stroke in script.split(';').filter(|s| !s.trim().is_empty()) {
-            let mut points = Vec::new();
-            for word in stroke.split_whitespace() {
-                let (x, y) = is_point(word).ok_or(format!("'{word}' is not x,y"))?;
-                points.push(match (origin, frames) {
-                    (Some(rect), _) => (rect.0 + x, rect.1 + y),
-                    (None, Some(frames)) => frames.to_screen(x, y),
-                    (None, None) => return Err("draw on a control, or take a shot first".into()),
-                });
+            let stroke = stroke.trim();
+            if let Some(shape) = motion::parse_shape(stroke)? {
+                let transformed = shape.with_flags(flags.fill, flags.close).transform(offset, scale);
+                strokes.extend(motion::generate_shape(&transformed));
+            } else {
+                let mut points = Vec::new();
+                for word in stroke.split_whitespace() {
+                    let (x, y) = is_point(word).ok_or(format!("'{word}' is not x,y"))?;
+                    points.push(match (origin, frames) {
+                        (Some(rect), _) => (rect.0 + x, rect.1 + y),
+                        (None, Some(frames)) => frames.to_screen(x, y),
+                        (None, None) => return Err("draw on a control, or take a shot first".into()),
+                    });
+                }
+                if !points.is_empty() {
+                    strokes.push(real::trace(&points, flags.smooth));
+                }
             }
-            if points.is_empty() {
-                continue;
-            }
-            strokes.push(real::trace(&points, flags.smooth));
         }
         if strokes.iter().map(Vec::len).sum::<usize>() == 0 {
             return Err("nothing to draw".into());
@@ -1646,6 +1699,9 @@ impl Service {
     fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         self.overlay.over(who, tracked.hwnd);
         let (own, words) = parse(words);
+        if let Some(error) = own.button_error {
+            return Err(error);
+        }
         if own.mouse && !flags.mouse {
             self.borrow.allow(who)?;
         }
@@ -1662,9 +1718,12 @@ impl Service {
             forward: flags.forward || own.forward,
             paste: flags.paste || own.paste,
             with: own.with.or(flags.with.clone()),
+            button: own.button.or(flags.button),
             hold: own.hold.or(flags.hold),
             gone: flags.gone || own.gone,
             smooth: flags.smooth || own.smooth,
+            fill: flags.fill || own.fill,
+            close: flags.close || own.close,
             ms: own.ms.or(flags.ms),
             ..Flags::default()
         };
@@ -2059,12 +2118,18 @@ impl Service {
         let mut note = "";
         let (mut frame, mut units) = shot::window(tracked.hwnd)?;
         if frame.is_blank() {
-            let (x, y, w, h) = win::rect(tracked.hwnd);
-            let copy = self.capture_screen(x, y, w, h)?;
-            if !copy.is_blank() {
-                frame = copy;
-                units = 1.0;
-                note = " (copied from the screen: anything covering the window shows)";
+            // A copy of the screen shows whatever is on top, so it is only worth taking when some
+            // of the window is in view.
+            if win::fully_covered(tracked.hwnd) {
+                note = " (blank: this app draws itself some way a window copy cannot see, and the window is covered, so the screen cannot show it either)";
+            } else {
+                let (x, y, w, h) = win::rect(tracked.hwnd);
+                let copy = self.capture_screen(x, y, w, h)?;
+                if !copy.is_blank() {
+                    frame = copy;
+                    units = 1.0;
+                    note = " (copied from the screen: anything covering the window shows)";
+                }
             }
         }
         let mut origin = (left, top);
@@ -2186,6 +2251,10 @@ impl Service {
 
     fn handle(&self, who: &str, words: &[String]) -> Reply {
         let (flags, rest) = parse(words);
+        if let Some(err) = &flags.button_error {
+            return Err(err.clone());
+        }
+        flags.modifiers()?;
         if flags.mouse {
             self.borrow.allow(who)?;
         }
@@ -2337,5 +2406,19 @@ pub fn run() {
         let current = std::mem::replace(&mut listening, next);
         let worker = service.clone();
         thread::spawn(move || worker.serve(current));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flags_parsing_fill_and_close() {
+        let words = vec!["rect".to_string(), "10,10".to_string(), "50,50".to_string(), "--fill".to_string(), "--close".to_string()];
+        let (flags, rest) = parse(&words);
+        assert!(flags.fill);
+        assert!(flags.close);
+        assert_eq!(rest, vec!["rect", "10,10", "50,50"]);
     }
 }

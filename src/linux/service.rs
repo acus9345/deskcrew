@@ -151,6 +151,10 @@ struct Flags {
     middle: bool,
     back: bool,
     forward: bool,
+    /// From --button; an error when the word was not left, right or middle.
+    button: Option<Result<x::Button, ()>>,
+    fill: bool,
+    close: bool,
     with: Option<String>,
     force: bool,
     paste: bool,
@@ -178,6 +182,9 @@ impl Flags {
         self.middle |= outer.middle;
         self.back |= outer.back;
         self.forward |= outer.forward;
+        self.button = self.button.or(outer.button);
+        self.fill |= outer.fill;
+        self.close |= outer.close;
         self.force |= outer.force;
         self.paste |= outer.paste;
         self.smooth |= outer.smooth;
@@ -186,6 +193,32 @@ impl Flags {
         self.ms = self.ms.or(outer.ms);
         self.hold = self.hold.or(outer.hold);
         self
+    }
+
+    fn mouse_button(&self) -> Result<x::Button, String> {
+        Ok(if let Some(button) = self.button {
+            button.map_err(|_| "--button takes left, right or middle".to_string())?
+        } else if self.middle {
+            x::Button::Middle
+        } else if self.right {
+            x::Button::Right
+        } else if self.back {
+            x::Button::Back
+        } else if self.forward {
+            x::Button::Forward
+        } else {
+            x::Button::Left
+        })
+    }
+
+    fn modifiers(&self) -> Result<Vec<u32>, String> {
+        match &self.with {
+            Some(spec) => match x::chord(spec)? {
+                x::Chord { modifiers, key: None } => Ok(modifiers),
+                _ => Err("--with takes shift, ctrl or alt, joined with +".into()),
+            },
+            None => Ok(Vec::new()),
+        }
     }
 }
 
@@ -204,6 +237,7 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
             "--region" => flags.region = next.clone(),
             "--expect" => flags.expect = next.clone(),
             "--with" => flags.with = next.clone(),
+            "--button" => flags.button = Some(next.as_deref().and_then(x::Button::named).filter(|b| matches!(b, x::Button::Left | x::Button::Right | x::Button::Middle)).ok_or(()) ),
             "--risk" => flags.risk = next.clone(),
             "--from" => flags.from = number(&next).unwrap_or(0) as usize,
             "--edge" => flags.edge = number(&next).map(|n| n as u32),
@@ -224,6 +258,8 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
             "--middle" => flags.middle = true,
             "--back" => flags.back = true,
             "--forward" => flags.forward = true,
+            "--fill" => flags.fill = true,
+            "--close" => flags.close = true,
             "--force" => flags.force = true,
             "--paste" => flags.paste = true,
             "--smooth" => flags.smooth = true,
@@ -522,13 +558,7 @@ impl Service {
     }
 
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
-        let button = match () {
-            _ if flags.right => Button::Right,
-            _ if flags.middle => Button::Middle,
-            _ if flags.back => Button::Back,
-            _ if flags.forward => Button::Forward,
-            _ => Button::Left,
-        };
+        let button = flags.mouse_button()?;
         let count = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
         let mut with = match &flags.with {
             Some(spec) => x::chord(spec)?.modifiers,
@@ -798,7 +828,7 @@ impl Service {
         Ok("pointer".into())
     }
 
-    fn strokes(&self, who: &str, tracked: &Tracked, strokes: &[Vec<(f32, f32)>]) -> Reply {
+    fn strokes(&self, who: &str, tracked: &Tracked, strokes: &[Vec<(f32, f32)>], button: Button, modifiers: &[u32]) -> Reply {
         let window = self.window_of(tracked)?.rect;
         let inside = |p: &(f32, f32)| {
             let (px, py) = (p.0 as i32, p.1 as i32);
@@ -813,53 +843,84 @@ impl Service {
         }
         // The drawn cursor rides along with the pen.
         let finished = self.front(tracked, || {
-            for stroke in strokes {
-                if !x::stroke(stroke, &stop, &mut |_, px, py| self.overlay.jump(who, px, py))? {
-                    return Ok(false);
+            x::modifiers(modifiers, true)?;
+            let res = (|| {
+                for stroke in strokes {
+                    if !x::stroke(stroke, button, &stop, &mut |_, px, py| self.overlay.jump(who, px, py))? {
+                        return Ok(false);
+                    }
                 }
-            }
-            Ok(true)
+                Ok(true)
+            })();
+            let _ = x::modifiers(modifiers, false);
+            res
         })?;
         if finished { Ok("pointer".into()) } else { Err(STOPPED.into()) }
     }
 
-    fn drag(&self, who: &str, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
+    fn drag(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
         let a = self.point_of(from, who, tracked, view)?;
         let b = self.point_of(to, who, tracked, view)?;
-        self.strokes(who, tracked, &[motion::trace(&[a, b], false)])
+        let button = flags.mouse_button()?;
+        let mut modifiers = flags.modifiers()?;
+        // Keys this agent already holds stay down after the stroke.
+        modifiers.retain(|m| !self.held_keys(who).contains(m));
+        self.strokes(who, tracked, &[motion::trace(&[a, b], flags.smooth)], button, &modifiers)
+    }
+
+    fn plan_draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Result<Vec<Vec<(f32, f32)>>, String> {
+        let (word, script) = match words {
+            [] => return Err("draw [control] \"x,y x,y; rect x,y w,h; circle x,y r\"".into()),
+            // A first word that is neither a point nor a shape names the control to draw on.
+            [first, rest @ ..] if !rest.is_empty() && is_point(first).is_none() && !motion::is_shape(first) => (Some(first.clone()), rest.join(" ")),
+            _ => (None, words.join(" ")),
+        };
+        let origin = match word {
+            Some(ref word) => Some(self.control(word, who, tracked, view)?.1),
+            None => None,
+        };
+        let frames = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.window).map(|s| s.frames));
+        let (offset, scale) = match (origin, frames) {
+            (Some(rect), _) => ((rect.0 as f32, rect.1 as f32), 1.0_f32),
+            (None, Some(frames)) => ((frames.x as f32, frames.y as f32), frames.scale),
+            (None, None) => return Err("draw on a control, or take a shot first".into()),
+        };
+
+        let mut strokes = Vec::new();
+        for stroke in script.split(';').filter(|s| !s.trim().is_empty()) {
+            let stroke = stroke.trim();
+            if let Some(shape) = motion::parse_shape(stroke)? {
+                let transformed = shape.with_flags(flags.fill, flags.close).transform(offset, scale);
+                strokes.extend(motion::generate_shape(&transformed));
+            } else {
+                let mut points = Vec::new();
+                for word in stroke.split_whitespace() {
+                    let (px, py) = is_point(word).ok_or(format!("'{word}' is not x,y"))?;
+                    points.push(match (origin, frames) {
+                        (Some(rect), _) => (rect.0 + px, rect.1 + py),
+                        (None, Some(frames)) => frames.to_screen(px, py),
+                        (None, None) => return Err("draw on a control, or take a shot first".into()),
+                    });
+                }
+                if !points.is_empty() {
+                    strokes.push(motion::trace(&points, flags.smooth));
+                }
+            }
+        }
+        if strokes.is_empty() || strokes.iter().map(Vec::len).sum::<usize>() == 0 {
+            return Err("nothing to draw".into());
+        }
+        Ok(strokes)
     }
 
     /// Strokes of x,y points in the last shot, or from a control's top left.
     fn draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        let (word, script) = match words {
-            [script] => (None, script),
-            [word, script] => (Some(word), script),
-            _ => return Err("draw [control] \"x,y x,y; x,y x,y\"".into()),
-        };
-        let origin = match word {
-            Some(word) => Some(self.control(word, who, tracked, view)?.1),
-            None => None,
-        };
-        let frames = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.window).map(|s| s.frames));
-        let mut strokes = Vec::new();
-        for stroke in script.split(';').filter(|s| !s.trim().is_empty()) {
-            let mut points = Vec::new();
-            for word in stroke.split_whitespace() {
-                let (px, py) = is_point(word).ok_or(format!("'{word}' is not x,y"))?;
-                points.push(match (origin, frames) {
-                    (Some(rect), _) => (rect.0 + px, rect.1 + py),
-                    (None, Some(frames)) => frames.to_screen(px, py),
-                    (None, None) => return Err("draw on a control, or take a shot first".into()),
-                });
-            }
-            if !points.is_empty() {
-                strokes.push(motion::trace(&points, flags.smooth));
-            }
-        }
-        if strokes.is_empty() {
-            return Err("nothing to draw".into());
-        }
-        self.strokes(who, tracked, &strokes)
+        let strokes = self.plan_draw(who, flags, tracked, view, words)?;
+        let button = flags.mouse_button()?;
+        let mut modifiers = flags.modifiers()?;
+        // Keys this agent already holds stay down after the stroke.
+        modifiers.retain(|m| !self.held_keys(who).contains(m));
+        self.strokes(who, tracked, &strokes, button, &modifiers)
     }
 
     fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
@@ -902,7 +963,7 @@ impl Service {
             ("key", [spec]) => self.key(who, &flags, tracked, spec),
             ("down", rest) => self.down(who, rest),
             ("scroll", rest) => self.scroll(who, tracked, view, rest),
-            ("drag", [from, to]) => self.drag(who, tracked, view, from, to),
+            ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
             ("draw", rest) => self.draw(who, &flags, tracked, view, rest),
             ("wait", [text]) => self.wait(&flags, tracked, view, text),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),

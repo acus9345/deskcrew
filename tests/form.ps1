@@ -78,7 +78,7 @@ $pad = New-Object System.Windows.Forms.Panel
 $pad.Name = 'Pad'; $pad.BackColor = [System.Drawing.Color]::FromArgb(250, 240, 0)
 $pad.Location = New-Object System.Drawing.Point(10, 180); $pad.Size = New-Object System.Drawing.Size(420, 220)
 $script:moves = 0
-$pad.Add_MouseDown({ $script:moves = 0; Note "down $($_.Button) $($_.X),$($_.Y)" })
+$pad.Add_MouseDown({ $script:moves = 0; Note "down $($_.Button) $($_.X),$($_.Y) mods=$([System.Windows.Forms.Control]::ModifierKeys)" })
 $pad.Add_MouseMove({ if ($_.Button -ne 'None') { $script:moves++ } })
 $pad.Add_MouseUp({ Note "up $($_.Button) $($_.X),$($_.Y) moves=$($script:moves)" })
 $pad.Add_MouseDoubleClick({ Note "double $($_.X),$($_.Y)" })

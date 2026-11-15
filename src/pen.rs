@@ -1,7 +1,7 @@
 // A second pointer of our own. Windows treats a synthetic pen as separate hardware, so modern apps
 // can be pressed and drawn on while the person keeps their mouse. Classic apps get the pen turned
 // into mouse events, which would move the pointer, so they get window messages instead.
-use crate::real;
+use crate::real::{self, Button};
 use std::{mem::zeroed, sync::atomic::AtomicBool, thread, time::Duration};
 use windows_sys::Win32::{
     Foundation::POINT,
@@ -58,8 +58,8 @@ impl Pen {
         self.send(x, y, POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | button | POINTER_FLAG_DOWN, PRESSURE)
     }
 
-    fn slide(&self, x: i32, y: i32) -> bool {
-        self.send(x, y, POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | POINTER_FLAG_FIRSTBUTTON | POINTER_FLAG_UPDATE, PRESSURE)
+    fn slide(&self, x: i32, y: i32, button: POINTER_FLAGS) -> bool {
+        self.send(x, y, POINTER_FLAG_INRANGE | POINTER_FLAG_INCONTACT | button | POINTER_FLAG_UPDATE, PRESSURE)
     }
 
     fn lift(&self, x: i32, y: i32) -> bool {
@@ -86,19 +86,21 @@ impl Pen {
     }
 
     /// Press, follow the path at a steady speed, and always lift. False if stopped on the way.
-    pub fn stroke(&self, path: &[(f32, f32)], stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> Result<bool, String> {
+    pub fn stroke(&self, path: &[(f32, f32)], button: Button, stop: &AtomicBool, mut moved: impl FnMut(i32, i32)) -> Result<bool, String> {
         let Some(first) = path.first() else { return Ok(true) };
         let (x, y) = (first.0.round() as i32, first.1.round() as i32);
         if !self.hover(x, y) {
             return Err("Windows would not take pen input".into());
         }
         thread::sleep(SETTLE);
-        self.press(x, y, POINTER_FLAG_FIRSTBUTTON);
+        // The barrel button is the pen's right click.
+        let pointer_btn = if button == Button::Right { POINTER_FLAG_SECONDBUTTON } else { POINTER_FLAG_FIRSTBUTTON };
+        self.press(x, y, pointer_btn);
         thread::sleep(PRESS);
         let mut last = (x, y);
         let finished = real::pace(path, stop, |at, x, y| {
             last = (x, y);
-            self.slide(x, y);
+            self.slide(x, y, pointer_btn);
             if at % 3 == 0 {
                 moved(x, y);
             }

@@ -13,14 +13,14 @@ mod client;
 mod demo;
 mod lines;
 mod log;
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
 mod look;
 mod mcp;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
 mod mac;
-#[cfg_attr(target_os = "linux", allow(dead_code))]
+#[cfg_attr(any(target_os = "linux", target_os = "macos"), allow(dead_code))]
 mod motion;
 #[cfg(windows)]
 mod overlay;
@@ -56,6 +56,12 @@ mod win;
 
 fn main() {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
+    // `--agent name` may come first, as it does for every other command.
+    let first = if args.first().is_some_and(|a| a == "--agent") { args.get(2) } else { args.first() };
+    if matches!(first.map(String::as_str), Some("--version" | "-V")) {
+        println!("deskcrew {}", env!("CARGO_PKG_VERSION"));
+        return;
+    }
     match args.first().map(String::as_str) {
         Some("service") => service::run(),
         Some("mcp") => mcp::serve(),

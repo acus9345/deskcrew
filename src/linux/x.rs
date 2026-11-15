@@ -343,6 +343,17 @@ pub enum Button {
 }
 
 impl Button {
+    pub fn named(word: &str) -> Option<Button> {
+        match word.to_lowercase().as_str() {
+            "left" => Some(Button::Left),
+            "right" => Some(Button::Right),
+            "middle" => Some(Button::Middle),
+            "back" => Some(Button::Back),
+            "forward" => Some(Button::Forward),
+            _ => None,
+        }
+    }
+
     fn number(self) -> u8 {
         match self {
             Button::Left => 1,
@@ -408,11 +419,11 @@ pub fn wheel(px: i32, py: i32, notches: i32, sideways: bool) -> Result<(), Strin
     x.conn.flush().map_err(|e| e.to_string())
 }
 
-pub fn stroke(path: &[(f32, f32)], stop: &dyn Fn() -> bool, moved: &mut dyn FnMut(usize, i32, i32)) -> Result<bool, String> {
+pub fn stroke(path: &[(f32, f32)], button: Button, stop: &dyn Fn() -> bool, moved: &mut dyn FnMut(usize, i32, i32)) -> Result<bool, String> {
     let Some(first) = path.first() else { return Ok(true) };
     move_to(first.0 as i32, first.1 as i32)?;
     thread::sleep(MOVE_SETTLE);
-    button(Button::Left, true)?;
+    self::button(button, true)?;
     let mut finished = true;
     for (at, point) in path.iter().enumerate().skip(1) {
         if stop() {
@@ -423,7 +434,7 @@ pub fn stroke(path: &[(f32, f32)], stop: &dyn Fn() -> bool, moved: &mut dyn FnMu
         moved(at, point.0 as i32, point.1 as i32);
         thread::sleep(Duration::from_millis(4));
     }
-    button(Button::Left, false)?;
+    self::button(button, false)?;
     Ok(finished)
 }
 
