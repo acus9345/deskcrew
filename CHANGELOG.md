@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.25] - 2026-11-15
+
 - Qt apps such as Krita, and Firefox, are drawn in and clicked by window message, in the back: no focus change and no movement of your pointer. They used to get the pen, which brought them forward for every stroke.
 - The pen, still used for WPF, WinUI and Store apps, puts your pointer back where it was afterwards, unless you moved it meanwhile, and holds focus for less than half as long: it moves at 4000 pixels a second instead of 1000, and waits 50 ms instead of 350 ms after bringing the window forward. A pen or `--real` action with a point off the window or off every screen is refused before focus moves, instead of after half a second in front.
 - `deskcrew setup` adds deskcrew as an MCP server to Antigravity, which runs the commands its agents type on a sandboxed Windows desktop where no window of yours can be seen. On such a desktop, `windows` and a window that matches nothing now say why and point to the MCP tools, instead of only "no windows".
