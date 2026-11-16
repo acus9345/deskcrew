@@ -1037,9 +1037,12 @@ impl Service {
         let element = field(view)?;
         Some((|| {
             atspi::set_text(&element, path)?;
-            // The field's own activate action accepts the dialog, as Enter in it would, and needs
-            // no keyboard focus, which a dialog that is not the active window does not show.
-            if atspi::perform(&element, &["activate"]).is_err() {
+            // The dialog's default button, Open or Save in any language, accepts it as Enter would,
+            // and needs no keyboard focus, which a dialog that is not the active window lacks.
+            thread::sleep(MENU_OPEN);
+            self.read(tracked, view, false)?;
+            let default = view.nodes.values().find(|n| n.parts.role == "button" && !n.parts.states.contains(&"disabled") && atspi::is_default(&n.element));
+            if default.is_none_or(|button| atspi::press(&button.element).is_err()) {
                 if !atspi::focused(&element) {
                     let _ = atspi::focus(&element);
                 }

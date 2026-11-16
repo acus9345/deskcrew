@@ -28,6 +28,7 @@ const INDETERMINATE: u32 = 32;
 const HORIZONTAL: u32 = 14;
 const VERTICAL: u32 = 29;
 const CHECKABLE: u32 = 41;
+const IS_DEFAULT: u32 = 39;
 
 /// One object on the accessibility bus.
 #[derive(Clone, Debug, PartialEq)]
@@ -658,4 +659,9 @@ pub fn caret(obj: &Obj) -> Option<(i32, i32, i32)> {
     // An empty field: the start of its box, a little in.
     let (x, y, _, h) = rect(obj)?;
     (h > 4).then_some((x + 3, y + 3, h - 6))
+}
+
+/// Whether this is the button a dialog presses when its Enter is pressed, as Open or Save is.
+pub fn is_default(obj: &Obj) -> bool {
+    has(states(obj), IS_DEFAULT)
 }
