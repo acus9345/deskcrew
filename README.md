@@ -140,7 +140,7 @@ The Linux version is the newest and least tried. CI runs it on Ubuntu under Xvfb
 - The window list comes from the window manager, or straight from the X server on a bare Xvfb with none.
 - The accessibility bus is the one `AT_SPI_BUS_ADDRESS` or the display names, or else the one at-spi2-core starts. Without at-spi2-core's registry, deskcrew finds the apps on the bus itself.
 - Each agent has its drawn cursor, as on Windows and the Mac. Its edges are smooth with a compositor, and cut to its outline on a bare Xvfb. The name is drawn in Liberation Sans Bold, or DejaVu Sans Bold, whichever is installed. deskcrew's own shots leave the cursors out.
-- There are no `table`, `pick-file` or `notifications` on Linux yet, and no typing caret: the name tag pulses instead. The clipboard needs `xclip` or `xsel`.
+- `table` reads a GTK or Qt table through AT-SPI's Table interface, and a list as one column. `pick-file` fills a GTK or Qt file dialog, this window or one its app opened, and presses its default button (Open or Save, in any language); in GTK's it opens the location field with Ctrl+L first. `notifications` lists the notifications apps sent since deskcrew's service started, newest first: Linux has no common way to ask what a notification server is showing, so deskcrew watches the session bus for them; there is nothing to click or close. While typing into a named field, the agent's cursor becomes a caret where the text goes in, as on Windows. The clipboard needs `xclip` or `xsel`.
 
 To try it on a virtual display:
 
