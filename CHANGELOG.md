@@ -6,6 +6,21 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Fixed: after keys or typing reached Krita or Firefox in the back, your own keys did nothing in that app once you brought it forward, until you clicked inside it. deskcrew left the app active with nothing focused, and Windows does not focus a window it sees as active already. The window keeps its focus now.
+- Keys, typing and held keys for a WPF, Qt or Firefox window you have in front go through the keyboard, as `--real` would, instead of asking for `--real`: the window is in front already, so nothing moves. `--real` keys for a window with a dialog open go to the dialog, which used to lose them to its disabled owner.
+- Enter, Escape, Backspace and Delete reach a Store app in the back through its own buttons where it has them, as Calculator does (Equals, Clear, Backspace, Clear entry). Store apps read those keys only from the real keyboard.
+- Calculator, and other Store apps, came forward over your window whenever one of their buttons was pressed through accessibility. Windows' foreground lock is now held through that moment, so they stay behind.
+- Drawing and dragging in a WPF app in the back goes by window message, with the mouse capture and the button given to the app for the moment and a move one pixel off first, instead of the pen, so it no longer takes focus. WPF looks for what is under its first message on the real screen, where another window covers it, and dropped the press without that move.
+- A click at x,y on a WinForms control another window covers raises its Click in the back: the window moves off every screen for about a tenth of a second, where nothing covers it, and comes back. It used to need `--real`.
+- Keys and typing reach a Chromium page in the back (Edge, Chrome, Electron apps) without a click in it first: the window is told it is active, which gives the page Chromium's own focus and does not bring it forward. Before, keys went nowhere until an agent had clicked in the page.
+- Key chords with two ordinary keys, such as `a+b` or `shift+a+b`, go in the back, with the first ones held down in the app's keyboard state. Only the Windows key still needs the real keyboard.
+
+- Keys and typing for a Qt, WPF or Firefox window go to a dialog it opened over itself, which holds all its input until it closes: Escape or typing sent to Krita's main window reaches its New document or Recover Files dialog in the back. A dialog just opened gets a moment to pick its focused control first, since Qt dropped the first key before. A key whose press closed its window is no longer reported as failed.
+- `key --hold` reaches Qt, WPF and Firefox in the back, with focus in the app's own window for the whole hold. It used to need --real there.
+- A click in a Qt app goes to a dialog, menu or popup of the tracked window at that spot, but no longer to another main window of the same app that covers it.
+
+- `deskcrew setup` no longer fails with "being used by another process" when an agent's MCP server, such as Antigravity's, is running the installed program. On Windows the running copy is moved aside as `deskcrew-old-N.exe`, and a later setup removes it once nothing runs it; on Linux and the Mac the new build is renamed over it.
+
 ## [0.1.26] - 2026-11-15
 
 - Keys, shortcuts and typing reach Qt apps such as Krita, and Firefox, in the back, the way keys reach WPF apps: the window gets keyboard focus inside its own app for a moment, with the foreground lock held so it stays behind. Krita's tool shortcuts, Ctrl+N, Ctrl+Z and Escape used to need --real, which brought Krita forward. Typing with no control named now works in WPF too.

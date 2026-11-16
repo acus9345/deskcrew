@@ -196,6 +196,41 @@ fn add_to_user_path(folder: &Path) -> Result<(), String> {
     if done.success() { Ok(()) } else { Err("could not add it to your PATH".into()) }
 }
 
+/// Copies the program next to `target` and renames it into place, so a copy that an
+/// agent's MCP server or another program is still running does not stop the install.
+/// Linux and the Mac let a running program be replaced by rename. Windows does not, but
+/// lets it be renamed: it is moved aside as `deskcrew-old-N.exe`, and those left over
+/// from earlier installs are removed once nothing runs them.
+fn replace_program(current: &Path, target: &Path) -> std::io::Result<()> {
+    let folder = target.parent().unwrap_or(Path::new("."));
+    remove_old_copies(folder);
+    let fresh = folder.join(format!("{PROGRAM}.new"));
+    fs::copy(current, &fresh)?;
+    let Err(error) = fs::rename(&fresh, target) else { return Ok(()) };
+    if cfg!(windows) && target.exists() {
+        let aside = (1..1000).map(|n| folder.join(format!("deskcrew-old-{n}.exe"))).find(|p| !p.exists());
+        if let Some(aside) = aside
+            && fs::rename(target, &aside).is_ok()
+        {
+            return fs::rename(&fresh, target).inspect_err(|_| {
+                let _ = fs::rename(&aside, target);
+            });
+        }
+    }
+    let _ = fs::remove_file(&fresh);
+    Err(error)
+}
+
+fn remove_old_copies(folder: &Path) {
+    let Ok(entries) = fs::read_dir(folder) else { return };
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().into_owned();
+        if name.starts_with("deskcrew-old-") && name.ends_with(".exe") {
+            let _ = fs::remove_file(entry.path());
+        }
+    }
+}
+
 fn install_program(home: &Path) -> Result<String, String> {
     let (folder, on_path) = install_folder(home);
     let target = folder.join(PROGRAM);
@@ -210,7 +245,7 @@ fn install_program(home: &Path) -> Result<String, String> {
     }
     std::thread::sleep(std::time::Duration::from_millis(300));
     fs::create_dir_all(&folder).map_err(|e| e.to_string())?;
-    fs::copy(&current, &target).map_err(|e| format!("could not copy to {}: {e}", target.display()))?;
+    replace_program(&current, &target).map_err(|e| format!("could not copy to {}: {e}", target.display()))?;
     if on_path {
         return Ok(format!("program: {}", target.display()));
     }
@@ -312,6 +347,44 @@ mod tests {
         fs::write(&file, "not json").unwrap();
         assert!(add_mcp_server(&file, program).is_err());
         assert_eq!(fs::read_to_string(&file).unwrap(), "not json");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_running_copy_is_replaced() {
+        let dir = env::temp_dir().join(format!("deskcrew-replace-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let target = dir.join(PROGRAM);
+        #[cfg(windows)]
+        let (waiter, args): (&str, &[&str]) = (r"C:\Windows\System32\PING.EXE", &["-n", "30", "127.0.0.1"]);
+        #[cfg(not(windows))]
+        let (waiter, args): (&str, &[&str]) = (if Path::new("/bin/sleep").exists() { "/bin/sleep" } else { "/usr/bin/sleep" }, &["30"]);
+        fs::copy(waiter, &target).unwrap();
+        let mut running = std::process::Command::new(&target).args(args).stdout(std::process::Stdio::null()).spawn().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(300));
+        let source = dir.join("new-build");
+        fs::write(&source, "the new build").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        replace_program(&source, &target).unwrap();
+        assert_eq!(fs::read_to_string(&target).unwrap(), "the new build");
+        assert!(!dir.join(format!("{PROGRAM}.new")).exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(fs::metadata(&target).unwrap().permissions().mode() & 0o111, 0o111, "the new build can still be run");
+        }
+        let aside = dir.join("deskcrew-old-1.exe");
+        assert_eq!(aside.exists(), cfg!(windows), "only Windows moves the running copy aside");
+        let _ = running.kill();
+        let _ = running.wait();
+        // The next install clears the copy moved aside, now that nothing runs it.
+        replace_program(&source, &target).unwrap();
+        assert!(!aside.exists());
         let _ = fs::remove_dir_all(&dir);
     }
 }

@@ -17,6 +17,8 @@ use windows_sys::Win32::{
 };
 
 pub const NEEDS_REAL: &str = "no background way to do this here: add --real";
+/// Part of the reply for keys that would go to the app the person has in front.
+pub const IN_FRONT: &str = "goes to the window in front";
 pub const NEEDS_MOUSE: &str = "this control only answers the real mouse: try click x,y on it, or --mouse to ask the person to borrow their cursor";
 /// Closing one of these takes the person's desktop with it.
 const SHELL_WINDOWS: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
@@ -74,6 +76,37 @@ pub fn press(node: &Node) -> Option<Result<String, String>> {
     None
 }
 
+/// Give a Chromium page in the back the keyboard, as a click in it would. Chromium routes keys by its
+/// own focus, not Windows', and gives it to the page when its window is told it is active: that
+/// message changes nothing on the screen but the title bar, and does not bring the window forward.
+/// Telling it after that it is inactive again takes the page's focus away, so it is left active.
+pub fn wake_page(root: Hwnd) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WA_ACTIVE, WM_ACTIVATE};
+    if win::is_chromium(root) && !win::front_thread(root) {
+        let mut ignored = 0;
+        unsafe { SendMessageTimeoutW(root as HWND, WM_ACTIVATE, WA_ACTIVE as usize, 0, SMTO_ABORTIFHUNG, 500, &mut ignored) };
+    }
+}
+
+/// How long a Store app takes to bring its window forward after one of its buttons is pressed
+/// through accessibility, which it does every time.
+const STORE_ACTIVATION: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// Press a control of `root`, keeping its app behind. A Store app such as Calculator comes forward
+/// a moment after accessibility presses one of its buttons, and WPF can for an instant: Windows'
+/// foreground lock, held through that moment, stops both.
+pub fn press_behind(node: &Node, root: Hwnd) -> Option<Result<String, String>> {
+    if !win::draws_itself(root) {
+        return press(node);
+    }
+    let lock = win::ForegroundLock::try_take();
+    let pressed = press(node);
+    if lock.is_some() && win::class(root) == "ApplicationFrameWindow" {
+        std::thread::sleep(STORE_ACTIVATION);
+    }
+    pressed
+}
+
 /// A check box or radio button WinForms draws itself: its own default action flips it in place.
 /// Accessibility's toggle needs the window active, and WinForms drops a posted click on a spot
 /// another window covers.
@@ -125,7 +158,6 @@ const HELD_SETTLE: std::time::Duration = std::time::Duration::from_millis(60);
 /// window is in front shares its state with the person, so it is left alone.
 fn with_state_held<T>(hwnd: Hwnd, keys: &[u16], work: impl FnOnce() -> T) -> T {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT};
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     if keys.is_empty() {
         return work();
@@ -136,26 +168,71 @@ fn with_state_held<T>(hwnd: Hwnd, keys: &[u16], work: impl FnOnce() -> T) -> T {
         if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) || AttachThreadInput(mine, theirs, 1) == 0 {
             return work();
         }
-        let mut saved = [0u8; 256];
-        GetKeyboardState(saved.as_mut_ptr());
-        let mut state = saved;
-        for vk in keys {
-            state[*vk as usize] |= 0x80;
-            let side = match *vk {
-                VK_CONTROL => VK_LCONTROL,
-                VK_SHIFT => VK_LSHIFT,
-                VK_MENU => VK_LMENU,
-                other => other,
-            };
-            state[side as usize] |= 0x80;
-        }
-        SetKeyboardState(state.as_ptr());
-        let result = work();
-        std::thread::sleep(HELD_SETTLE);
-        SetKeyboardState(saved.as_ptr());
+        let result = held_down(keys, work);
         AttachThreadInput(mine, theirs, 0);
         result
     }
+}
+
+/// Run `work` with these keys down in the keyboard state of the thread this one is joined to,
+/// and put that state back after.
+fn held_down<T>(keys: &[u16], work: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT};
+    let mut saved = [0u8; 256];
+    unsafe { GetKeyboardState(saved.as_mut_ptr()) };
+    let mut state = saved;
+    for vk in keys {
+        state[*vk as usize] |= 0x80;
+        let side = match *vk {
+            VK_CONTROL => VK_LCONTROL,
+            VK_SHIFT => VK_LSHIFT,
+            VK_MENU => VK_LMENU,
+            other => other,
+        };
+        state[side as usize] |= 0x80;
+    }
+    unsafe { SetKeyboardState(state.as_ptr()) };
+    let result = work();
+    std::thread::sleep(HELD_SETTLE);
+    unsafe { SetKeyboardState(saved.as_ptr()) };
+    result
+}
+
+/// WPF reads posted mouse messages only while its window holds the mouse capture, and asks its
+/// keyboard state whether the button is down. Both are given to it while `work` posts them, from
+/// this thread joined to the app's, with the foreground lock held so the window stays behind. None
+/// when the app is the one in front: its input is the person's.
+fn with_capture<T>(hwnd: Hwnd, buttons: &[u16], work: impl FnOnce() -> T) -> Option<T> {
+    use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture};
+    use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowThreadProcessId;
+    unsafe {
+        let theirs = GetWindowThreadProcessId(hwnd as HWND, std::ptr::null_mut());
+        let mine = GetCurrentThreadId();
+        if theirs == 0 || win::front_thread(hwnd) {
+            return None;
+        }
+        let _lock = win::ForegroundLock::take();
+        if AttachThreadInput(mine, theirs, 1) == 0 {
+            return None;
+        }
+        let result = held_down(buttons, || {
+            SetCapture(hwnd as HWND);
+            let result = work();
+            // The messages are taken in turn: the capture has to last until the last one is read.
+            std::thread::sleep(HELD_SETTLE);
+            ReleaseCapture();
+            result
+        });
+        AttachThreadInput(mine, theirs, 0);
+        Some(result)
+    }
+}
+
+/// WPF in the back takes a posted press or drag while it holds the mouse capture. In front its
+/// input is the person's, and the pen is used instead.
+pub fn posts_with_capture(root: Hwnd) -> bool {
+    win::is_wpf(root) && !win::minimized(root) && !win::front_thread(root)
 }
 
 /// A whole press, drag and release as window messages, into the window under the first point,
@@ -180,6 +257,17 @@ pub fn post_stroke(
     // still down when they get the release, joining one stroke to the next. WinForms needs it.
     let mut held = if win::reads_posted_mouse(hwnd) || win::reads_posted_mouse(root) { Vec::new() } else { vec![button_vk] };
     held.extend(modifiers.virtual_keys());
+    if win::is_wpf(root) {
+        // WPF wakes its mouse on the first message and looks for what is under it on the real
+        // screen, where another window covers it: a press then has nothing to go to. A move first,
+        // one pixel off, takes that, and the stroke's own first move finds the canvas by itself.
+        let (_, cx, cy) = win::child_at(root, first.0 as i32, first.1 as i32);
+        let stroke = || {
+            post(hwnd, WM_MOUSEMOVE, modifiers.mouse_keys(), win::lparam(cx + 1, cy))?;
+            post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved)
+        };
+        return with_capture(hwnd, &held, stroke).unwrap_or_else(|| Err(NEEDS_REAL.into()));
+    }
     with_state_held(hwnd, &held, || post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved))
 }
 
@@ -224,16 +312,33 @@ pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Resu
     } else {
         (WM_LBUTTONDOWN, WM_LBUTTONUP, WM_LBUTTONDBLCLK, MK_LBUTTON)
     };
-    post(hwnd, WM_MOUSEMOVE, 0, at)?;
-    post(hwnd, down, held, at)?;
-    post(hwnd, up, 0, at)?;
-    win::remember_field(hwnd);
-    if double {
-        post(hwnd, again, held, at)?;
+    let click = || {
+        post(hwnd, WM_MOUSEMOVE, 0, at)?;
+        post(hwnd, down, held, at)?;
         post(hwnd, up, 0, at)?;
+        if double {
+            post(hwnd, again, held, at)?;
+            post(hwnd, up, 0, at)?;
+        }
+        Ok::<(), String>(())
+    };
+    // WinForms raises Click only where its window really shows, so a covered one is moved off
+    // every screen, where nothing covers it, until it has read the click.
+    if win::is_winforms(hwnd) && !win::minimized(root) && !win::owns_point(&[root], x, y) {
+        win::uncovered(root, || {
+            let sent = click();
+            std::thread::sleep(UNCOVERED_READ);
+            sent
+        })?;
+    } else {
+        click()?;
     }
+    win::remember_field(hwnd);
     Ok("message".into())
 }
+
+/// How long a window moved off screen for a click stays there for its app to read the click.
+const UNCOVERED_READ: std::time::Duration = std::time::Duration::from_millis(120);
 
 /// A middle click or a triple click, which have no accessibility equivalent, or a click with Shift,
 /// Ctrl or Alt held: those are set down in the app's keyboard state too, for apps that ask it.
@@ -337,6 +442,12 @@ pub fn is_rich_text(hwnd: Hwnd) -> bool {
     hwnd != 0 && win::class(hwnd).to_uppercase().contains("RICHEDIT")
 }
 
+/// A key's release, which has nowhere to go once its press closed the window, as Escape closes a
+/// dialog, and needs nowhere then.
+fn release(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> Result<(), String> {
+    post(hwnd, message, wparam, lparam).or_else(|e| if win::exists(hwnd) { Err(e) } else { Ok(()) })
+}
+
 fn send(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> Result<isize, String> {
     let mut result = 0;
     let sent = unsafe { SendMessageTimeoutW(hwnd as HWND, message, wparam, lparam, SMTO_ABORTIFHUNG, 1000, &mut result) };
@@ -388,11 +499,15 @@ pub fn post_text(hwnd: Hwnd, text: &str, stop: &AtomicBool) -> Result<String, St
 }
 
 /// Type as window messages, telling `next` before each key which window takes it and what it is.
-pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: impl FnMut(Hwnd, u16)) -> Result<String, String> {
+pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, next: impl FnMut(Hwnd, u16)) -> Result<String, String> {
     if !win::takes_posted_keys(hwnd) {
         return Err(NEEDS_REAL.into());
     }
     win::remember_field(hwnd);
+    post_chars(hwnd, text, stop, next)
+}
+
+fn post_chars(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: impl FnMut(Hwnd, u16)) -> Result<String, String> {
     for unit in text.encode_utf16() {
         if stop.load(Ordering::Relaxed) {
             return Err("stopped by the person with Ctrl+Alt+Esc".into());
@@ -412,7 +527,7 @@ pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
         return Err("refused: this WPF window is minimized, and it takes no keys until it is shown again. Windows would not let deskcrew show it off screen without it coming forward just now. Ask the person to restore it, or add --real".into());
     }
     if win::keys_need_focus(root) {
-        return post_chord(root, chord, spec, true);
+        return post_chord(win::key_window(root), chord, spec, true);
     }
     let target = win::keyboard_target(root);
     if !win::takes_posted_keys(target) {
@@ -428,7 +543,7 @@ pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
     if matches!(vk, 0x08 | 0x09 | 0x0D | 0x1B | 0x20) && !win::key_site(target) {
         post(target, WM_CHAR, vk as usize, 1 | (scan << 16))?;
     }
-    post(target, WM_KEYUP, vk as usize, 1 | (scan << 16) | (1 << 30) | (1 << 31))?;
+    release(target, WM_KEYUP, vk as usize, 1 | (scan << 16) | (1 << 30) | (1 << 31))?;
     Ok("message".into())
 }
 
@@ -487,10 +602,20 @@ const REPEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(33);
 /// A key held down for a while as window messages: down, repeats as a keyboard sends them, then up,
 /// with it set down in the app's keyboard state the whole time for apps that ask that state.
 pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
+    let all: Vec<u16> = chord.keys.iter().map(|(vk, _)| *vk).collect();
+    // WPF, Qt and Firefox take keys only with focus inside their own app, held for the whole time.
+    if win::keys_need_focus(root) {
+        let window = win::key_window(root);
+        return attached(window, "a held key", true, || held_down(&all, || hold_keys(window, chord, hold, stop)));
+    }
     let target = win::keyboard_target(root);
-    if !win::takes_posted_keys(target) || win::is_wpf(root) {
+    if !win::takes_posted_keys(target) {
         return Err(NEEDS_REAL.into());
     }
+    with_state_held(target, &all, || hold_keys(target, chord, hold, stop))
+}
+
+fn hold_keys(target: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
     let Some(((key, extended), modifiers)) = chord.keys.split_last() else { return Err("no key given".into()) };
     let bits = |vk: u16, extended: bool, again: bool, release: bool| {
         let scan = unsafe { MapVirtualKeyW(vk as u32, MAPVK_VK_TO_VSC) } as isize;
@@ -506,30 +631,27 @@ pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &At
         }
         lparam
     };
-    let all: Vec<u16> = chord.keys.iter().map(|(vk, _)| *vk).collect();
-    with_state_held(target, &all, || {
-        for (vk, e) in modifiers {
-            post(target, WM_KEYDOWN, *vk as usize, bits(*vk, *e, false, false))?;
+    for (vk, e) in modifiers {
+        post(target, WM_KEYDOWN, *vk as usize, bits(*vk, *e, false, false))?;
+    }
+    post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, false, false))?;
+    let started = std::time::Instant::now();
+    let mut next = REPEAT_DELAY;
+    while started.elapsed() < hold {
+        if stop.load(Ordering::Relaxed) {
+            break;
         }
-        post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, false, false))?;
-        let started = std::time::Instant::now();
-        let mut next = REPEAT_DELAY;
-        while started.elapsed() < hold {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            if started.elapsed() >= next {
-                post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, true, false))?;
-                next += REPEAT_EVERY;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(5));
+        if started.elapsed() >= next {
+            post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, true, false))?;
+            next += REPEAT_EVERY;
         }
-        post(target, WM_KEYUP, *key as usize, bits(*key, *extended, false, true))?;
-        for (vk, e) in modifiers.iter().rev() {
-            post(target, WM_KEYUP, *vk as usize, bits(*vk, *e, false, true))?;
-        }
-        Ok("message".to_string())
-    })
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+    release(target, WM_KEYUP, *key as usize, bits(*key, *extended, false, true))?;
+    for (vk, e) in modifiers.iter().rev() {
+        release(target, WM_KEYUP, *vk as usize, bits(*vk, *e, false, true))?;
+    }
+    Ok("message".to_string())
 }
 
 /// How long an app gets to take each half of a posted shortcut while its Ctrl, Shift or Alt is
@@ -554,8 +676,11 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<St
         VK_MENU => Some(VK_LMENU),
         _ => None,
     };
-    // The Windows key belongs to the shell, and a second ordinary key cannot be held this way.
-    if held.iter().any(|(vk, _)| left(*vk).is_none()) {
+    // The Windows key belongs to the shell. Any other key held with the last one, such as A in
+    // a+b, goes down in the app's keyboard state and as a message, as Ctrl does.
+    const VK_LWIN: u16 = 0x5B;
+    const VK_RWIN: u16 = 0x5C;
+    if held.iter().any(|(vk, _)| matches!(*vk, VK_LWIN | VK_RWIN)) {
         return Err(format!("{spec} needs the real keyboard: add --real"));
     }
     let alt = held.iter().any(|(vk, _)| *vk == VK_MENU);
@@ -593,9 +718,9 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<St
             }
             post(target, down, *key as usize, bits(*key, *extended, false))?;
             std::thread::sleep(CHORD_SETTLE);
-            post(target, up, *key as usize, bits(*key, *extended, true))?;
+            release(target, up, *key as usize, bits(*key, *extended, true))?;
             for (vk, e) in held.iter().rev() {
-                post(target, up, *vk as usize, bits(*vk, *e, true))?;
+                release(target, up, *vk as usize, bits(*vk, *e, true))?;
             }
             std::thread::sleep(CHORD_SETTLE);
             Ok::<(), String>(())
@@ -606,9 +731,16 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<St
     Ok("message".into())
 }
 
+/// The windows `attached` has given focus to, and how long one given focus for the first time gets.
+static FOCUSED: std::sync::Mutex<std::collections::BTreeSet<Hwnd>> = std::sync::Mutex::new(std::collections::BTreeSet::new());
+const FIRST_FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(100);
+
 /// Run `work` with this thread's input joined to the app's, so it shares the app's keyboard state.
 /// With `focus`, the window also gets keyboard focus inside its own app for that moment, with the
-/// foreground lock held so it stays behind, and the app keeps no focused window after, as before.
+/// foreground lock held so it stays behind. It keeps that focus after, unless another of the app's
+/// windows had it: Windows cannot make the app inactive again, and a window left active with nothing
+/// focused takes none of the person's keys when they bring it forward, since Windows sees it already
+/// active and does not focus it again.
 fn attached<T>(target: Hwnd, spec: &str, focus: bool, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
@@ -617,42 +749,43 @@ fn attached<T>(target: Hwnd, spec: &str, focus: bool, work: impl FnOnce() -> Res
         let theirs = GetWindowThreadProcessId(target as HWND, std::ptr::null_mut());
         // An app the person is using shares its keyboard state with them: leave that one alone.
         if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
-            return Err(format!("{spec} goes to the window in front: add --real"));
+            return Err(format!("{spec} {IN_FRONT}: add --real"));
         }
         let _lock = focus.then(win::ForegroundLock::take);
         let mine = GetCurrentThreadId();
         if AttachThreadInput(mine, theirs, 1) == 0 {
             return Err(NEEDS_REAL.into());
         }
+        let before = GetFocus();
         if focus {
             SetFocus(target as HWND);
             if GetFocus() != target as HWND {
                 AttachThreadInput(mine, theirs, 0);
                 return Err(NEEDS_REAL.into());
             }
+            // A window focused for the first time, such as a dialog just opened in the back, picks
+            // the control that takes its keys a moment later. Qt drops a key that comes before.
+            if FOCUSED.lock().unwrap().insert(target) {
+                std::thread::sleep(FIRST_FOCUS_SETTLE);
+            }
         }
         let done = work();
-        if focus {
-            SetFocus(std::ptr::null_mut());
+        // WPF keeps no focused window after, as it always has, and takes the person's keys anyway
+        // once they bring it forward.
+        if focus && (!before.is_null() || win::is_wpf(target)) {
+            SetFocus(before);
         }
         AttachThreadInput(mine, theirs, 0);
         done
     }
 }
 
-/// Characters for an app that reads keys only while it has focus inside itself (WPF and Qt), sent
-/// while it has that focus for the moment. They go to whatever the app last had focused.
+/// Characters for an app that reads keys only while it has focus inside itself (WPF, Qt and
+/// Firefox), sent while it has that focus for the moment. They go to whatever the app last had
+/// focused, in a dialog it opened if there is one.
 pub fn post_text_focused(root: Hwnd, text: &str, stop: &AtomicBool) -> Result<String, String> {
-    attached(root, "typing", true, || {
-        for unit in text.encode_utf16() {
-            if stop.load(Ordering::Relaxed) {
-                return Err("stopped by the person with Ctrl+Alt+Esc".into());
-            }
-            post(root, WM_CHAR, if unit == 10 { 13 } else { unit as usize }, 1)?;
-            std::thread::sleep(crate::motion::KEY_EVERY);
-        }
-        Ok("message".into())
-    })
+    let window = win::key_window(root);
+    attached(window, "typing", true, || post_chars(window, text, stop, |_, _| {}))
 }
 
 /// Put the caret in a WPF text box in the back, as a click on it would: the window gets keyboard

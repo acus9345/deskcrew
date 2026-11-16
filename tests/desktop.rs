@@ -460,8 +460,8 @@ fn everything_on_a_real_desktop() {
     r.check("an open popup's entry runs, with the app in the back", ok && reply.contains("menu command") && form_b.wait_for("popped"), &reply);
     r.check("and the cursor was not touched", SYNTHETIC.load(Ordering::SeqCst) == synthetic, format!("{}", SYNTHETIC.load(Ordering::SeqCst) - synthetic));
 
-    // An app that takes no posted mouse input gets the pen, which needs the window in front for
-    // the stroke, then gives the front and the pointer back.
+    // WPF takes posted strokes in the back while it is lent the mouse capture, so drawing there
+    // touches neither the front nor the pointer.
     let ink_title = format!("deskcrew-ink-{stamp}");
     let ink = Form::open_script(&work, "wpf.ps1", &ink_title, 300, 300);
     let _ = dc(a, &["see", "-w", &ink_title]);
@@ -470,7 +470,15 @@ fn everything_on_a_real_desktop() {
     let (ok, reply) = dc(a, &["draw", "60,150 300,180"]);
     thread::sleep(Duration::from_millis(200));
     let after = pointer_and_focus();
-    r.check("the pen draws where posted messages do nothing", ok && reply.starts_with("ok pen") && ink.wait_for("stroke"), &reply);
+    r.check("a WPF app in the back is drawn in by message", ok && reply.starts_with("ok message") && ink.wait_for("stroke"), &reply);
+    r.check("and the front and the pointer stay as they were", after == before, format!("{before:?} became {after:?}"));
+    // With --real the pen draws, which needs the window in front for the stroke, then gives the
+    // front and the pointer back.
+    let before = pointer_and_focus();
+    let (ok, reply) = dc(a, &["draw", "60,220 300,250", "--real"]);
+    thread::sleep(Duration::from_millis(200));
+    let after = pointer_and_focus();
+    r.check("the pen draws with --real", ok && reply.starts_with("ok pen"), &reply);
     r.check("and gives the front and the pointer back", after == before, format!("{before:?} became {after:?}"));
     let before = pointer_and_focus();
     let (ok, reply) = dc(a, &["draw", "60,150 4000,180"]);

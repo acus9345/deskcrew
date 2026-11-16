@@ -445,8 +445,11 @@ pub fn borrow(root: Hwnd, pids: &[u32], loan: Loan) -> Result<Borrowed, String> 
     unsafe { GetCursorPos(&mut pointer) };
     let pointer = mouse.then_some(pointer);
     let guard = win::FocusGuard::take();
-    let already_front = win::foreground() == root;
-    if !win::bring_forward(root) {
+    // A dialog the window opened over itself takes its input, and is what comes forward: the
+    // window itself is disabled until it closes, and keys would go nowhere if it came forward.
+    let front = win::key_window(root);
+    let already_front = win::foreground() == front;
+    if !already_front && !win::bring_forward(front) {
         return Err("Windows would not bring that window forward".into());
     }
     if !already_front {

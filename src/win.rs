@@ -167,22 +167,37 @@ pub fn inside(hwnd: Hwnd, x: i32, y: i32) -> bool {
     x >= left && y >= top && x < left + w && y < top + h
 }
 
-/// The app's own top-level window at this point, the highest first: a dialog or menu it opened
-/// over `root` is where a real click there would land.
-pub fn own_window_at(root: Hwnd, x: i32, y: i32) -> Hwnd {
+fn enabled(hwnd: Hwnd) -> bool {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::IsWindowEnabled;
+    unsafe { IsWindowEnabled(raw(hwnd)) != 0 }
+}
+
+/// `root` and the dialogs, menus and popups it opened, the highest first. Another main window of
+/// the same app is not among them, unless `root` is disabled: then the app shows a dialog that
+/// takes all its input, and one shown at startup has no owner.
+fn own_windows(root: Hwnd) -> impl Iterator<Item = Hwnd> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetTopWindow};
     let owner = pid(root);
-    unsafe {
-        let mut at = GetTopWindow(null_mut());
-        while !at.is_null() {
-            let hwnd = at as Hwnd;
-            if IsWindowVisible(at) != 0 && pid(hwnd) == owner && class(hwnd) != "SysShadow" && inside(hwnd, x, y) {
-                return hwnd;
-            }
-            at = GetWindow(at, GW_HWNDNEXT);
-        }
+    let blocked = !enabled(root);
+    let top = unsafe { GetTopWindow(null_mut()) } as Hwnd;
+    std::iter::successors((top != 0).then_some(top), |&at| Some(unsafe { GetWindow(raw(at), GW_HWNDNEXT) } as Hwnd).filter(|&next| next != 0))
+        .filter(move |&hwnd| unsafe { IsWindowVisible(raw(hwnd)) } != 0 && pid(hwnd) == owner && class(hwnd) != "SysShadow")
+        .filter(move |&hwnd| hwnd == root || blocked || belongs(hwnd, &[root]))
+}
+
+/// The app's own window at this point: a dialog or menu `root` opened over itself is where a real
+/// click there would land.
+pub fn own_window_at(root: Hwnd, x: i32, y: i32) -> Hwnd {
+    own_windows(root).find(|&hwnd| inside(hwnd, x, y)).unwrap_or(root)
+}
+
+/// The window that takes `root`'s keys: `root`, or the dialog it opened over itself, which keeps
+/// `root` from taking any input until it closes.
+pub fn key_window(root: Hwnd) -> Hwnd {
+    if enabled(root) {
+        return root;
     }
-    root
+    own_windows(root).find(|&hwnd| hwnd != root && enabled(hwnd)).unwrap_or(root)
 }
 
 /// One entry of a classic menu bar, which can be run without ever opening the menu.
@@ -478,6 +493,45 @@ fn far_from_screens(normal: RECT, width: i32, height: i32) -> RECT {
     tries.into_iter().find(|rect| unsafe { MonitorFromRect(rect, MONITOR_DEFAULTTONEAREST) } == own).unwrap_or(tries[0])
 }
 
+/// Whether this window's thread is the one in front, whose input is the person's.
+pub fn front_thread(hwnd: Hwnd) -> bool {
+    let thread = |hwnd: HWND| unsafe { GetWindowThreadProcessId(hwnd, null_mut()) };
+    thread(raw(hwnd)) == thread(unsafe { GetForegroundWindow() })
+}
+
+pub fn is_winforms(hwnd: Hwnd) -> bool {
+    class(hwnd).starts_with("WindowsForms10.")
+}
+
+/// Run `work` with the window moved off every screen, where nothing covers it, then put it back.
+/// WinForms raises a click only when the window really shows at the spot of the release: covered,
+/// it takes the press and drops the click. Its own coordinates do not change on the way.
+pub fn uncovered<T>(hwnd: Hwnd, work: impl FnOnce() -> T) -> T {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SWP_ASYNCWINDOWPOS;
+    let mut was: RECT = unsafe { zeroed() };
+    if unsafe { GetWindowRect(raw(hwnd), &mut was) } == 0 {
+        return work();
+    }
+    let (width, height) = (was.right - was.left, was.bottom - was.top);
+    let away = far_from_screens(was, width, height);
+    let (dx, dy) = (was.left - away.left, was.top - away.top);
+    let before: Vec<Hwnd> = own_windows(hwnd).collect();
+    let flags = SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE;
+    unsafe { SetWindowPos(raw(hwnd), null_mut(), away.left, away.top, 0, 0, flags) };
+    let result = work();
+    // The way back does not wait on the app, which may still be running what the click started.
+    // A dialog it opened meanwhile, centred on the window, comes back with it.
+    let back = flags | SWP_ASYNCWINDOWPOS;
+    unsafe { SetWindowPos(raw(hwnd), null_mut(), was.left, was.top, 0, 0, back) };
+    for opened in own_windows(hwnd).filter(|w| !before.contains(w)) {
+        let mut at: RECT = unsafe { zeroed() };
+        if unsafe { GetWindowRect(raw(opened), &mut at) } != 0 && !on_screen(at.left + (at.right - at.left) / 2, at.top + (at.bottom - at.top) / 2) {
+            unsafe { SetWindowPos(raw(opened), null_mut(), at.left + dx, at.top + dy, 0, 0, back) };
+        }
+    }
+    result
+}
+
 /// Show a minimized window, far off every screen and without activating it, while no app can take
 /// the foreground. A restored window comes forward on its own when its app still counts it as its
 /// active window, as Chromium does, and Windows lets it whenever deskcrew could not stop it: so
@@ -710,7 +764,8 @@ pub fn identity(hwnd: Hwnd) -> (u32, u64) {
 /// is not enough: two windows of one app share a process, and keys must not reach the other one.
 pub fn front_is(root: Hwnd, surfaces: &[Hwnd]) -> bool {
     let front = foreground();
-    if front == root || surfaces.contains(&front) {
+    // A dialog that holds all of the window's input counts, owned by it or not.
+    if front == root || surfaces.contains(&front) || (!enabled(root) && key_window(root) == front) {
         return true;
     }
     let mut owner = front;
@@ -884,8 +939,8 @@ pub fn is_qt(hwnd: Hwnd) -> bool {
     class(hwnd).starts_with("Qt")
 }
 
-/// Windows that read keys only while they hold keyboard focus in their own app: WPF, and Qt, which
-/// takes a shortcut only in the window it thinks is active.
+/// Windows that read keys only while they hold keyboard focus in their own app: WPF, Qt, which
+/// takes a shortcut only in the window it thinks is active, and Firefox.
 pub fn keys_need_focus(hwnd: Hwnd) -> bool {
     is_wpf(hwnd) || is_qt(hwnd) || is_firefox(hwnd)
 }

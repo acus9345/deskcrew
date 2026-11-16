@@ -946,7 +946,7 @@ impl Service {
         let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !by_message);
         if let (Some(node), true) = (&node, plain) {
             let classic = !act::needs_pen_at(tracked.hwnd, x, y);
-            let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press(node), false) };
+            let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press_behind(node, tracked.hwnd), false) };
             if tried_mouse {
                 return Err(act::NEEDS_MOUSE.into());
             }
@@ -968,7 +968,7 @@ impl Service {
         if node.is_none() && plain && act::needs_pen_at(tracked.hwnd, x, y) {
             self.read(tracked, view, false)?;
             if let Some(found) = control_at(view, x, y)
-                && let Some(pressed) = act::press(found)
+                && let Some(pressed) = act::press_behind(found, tracked.hwnd)
             {
                 return pressed.map(|route| format!("{route} on '{}' under {word}", found.parts.name));
             }
@@ -1328,11 +1328,14 @@ impl Service {
         // says where its caret is gets watched while the text goes in.
         let classic = hwnd.and_then(win::caret_in).is_some();
         let watched = (!classic).then(|| field.as_ref().map(|node| node.element.clone()));
+        // An app that takes typing only with focus inside itself, in front already, has that focus
+        // and the keyboard: typing reaches it with nothing moving, as --real would.
+        let real = flags.real || (target.is_none() && win::keys_need_focus(tracked.hwnd) && win::front_is(tracked.hwnd, &view.surfaces));
         self.watching_caret(who, tracked.hwnd, watched, || {
             if hwnd.and_then(win::caret_in).is_none() {
                 self.overlay.typing(who, text.chars().count());
             }
-            if flags.real {
+            if real {
                 let points: Vec<(i32, i32)> = place.into_iter().collect();
                 let to_end = real::chord("ctrl+end")?;
                 return self.with_front(tracked, view, &points, || {
@@ -1401,7 +1404,10 @@ impl Service {
                     }
                     act::post_text_watched(hwnd, text, &self.stop, follow)
                 }
-                (None, _) if win::is_chromium(tracked.hwnd) => act::post_text(tracked.hwnd, text, &self.stop),
+                (None, _) if win::is_chromium(tracked.hwnd) => {
+                    act::wake_page(tracked.hwnd);
+                    act::post_text(tracked.hwnd, text, &self.stop)
+                }
                 (None, _) if win::keys_need_focus(tracked.hwnd) => act::post_text_focused(tracked.hwnd, text, &self.stop),
                 (None, _) => act::post_text_watched(win::keyboard_target(tracked.hwnd), text, &self.stop, follow),
             }
@@ -1451,23 +1457,63 @@ impl Service {
             reply
         })
     }
+    /// Store apps read Enter, Escape, Backspace and Delete only from the real keyboard: as window
+    /// messages they take none of them, even in front. Where the app has a button that does what the
+    /// key does, as Calculator does, that button is pressed through accessibility instead, in the back.
+    fn key_by_button(&self, tracked: &Tracked, chord: &real::Chord) -> Option<Reply> {
+        const BUTTONS: [(u16, &str); 4] = [(0x0D, "equalButton"), (0x1B, "clearButton"), (0x08, "backSpaceButton"), (0x2E, "clearEntryButton")];
+        if chord.modified || chord.keys.len() != 1 || win::class(tracked.hwnd) != "ApplicationFrameWindow" {
+            return None;
+        }
+        // A window found once to have none of these buttons is not read again for them.
+        static WITHOUT: Mutex<std::collections::BTreeSet<Hwnd>> = Mutex::new(std::collections::BTreeSet::new());
+        let (_, id) = BUTTONS.iter().find(|(vk, _)| *vk == chord.keys[0].0)?;
+        if WITHOUT.lock().unwrap().contains(&tracked.hwnd) {
+            return None;
+        }
+        let (mut nodes, mut hidden, mut quiet) = (Vec::new(), 0, Vec::new());
+        self.uia.read(tracked.hwnd, false, &mut nodes, &mut hidden, &mut quiet).ok()?;
+        if !nodes.iter().any(|node| BUTTONS.iter().any(|(_, id)| node.control_id == *id)) {
+            WITHOUT.lock().unwrap().insert(tracked.hwnd);
+            return None;
+        }
+        let node = nodes.iter().find(|node| node.control_id == *id)?;
+        Some(act::press_behind(node, tracked.hwnd)?.map(|route| format!("{route} on '{}'", node.parts.name)))
+    }
+
     fn key(&self, flags: &Flags, tracked: &Tracked, view: &View, spec: &str) -> Reply {
         if real::is_risky(spec) && !flags.force {
             return Err(format!("{spec} is refused: it can end the session or open the shell (--force to allow)"));
         }
         let chord = real::chord(spec)?;
-        if let Some(ms) = flags.hold {
-            if !flags.real {
-                return act::post_hold(tracked.hwnd, &chord, Duration::from_millis(ms.min(HOLD_MOST_MS)), &self.stop);
+        let hold = flags.hold.map(|ms| Duration::from_millis(ms.min(HOLD_MOST_MS)));
+        let keyboard = || -> Reply {
+            match hold {
+                Some(hold) => self.with_front(tracked, view, &[], || real::hold_chord(&chord, hold))?,
+                None => self.with_front(tracked, view, &[], || real::check_front(tracked.hwnd, &view.surfaces).map(|_| real::press_chord(&chord)))??,
             }
-            self.with_front(tracked, view, &[], || real::hold_chord(&chord, Duration::from_millis(ms.min(HOLD_MOST_MS))))?;
-            return Ok("keyboard".into());
-        }
+            Ok("keyboard".into())
+        };
         if flags.real {
-            self.with_front(tracked, view, &[], || real::check_front(tracked.hwnd, &view.surfaces).map(|_| real::press_chord(&chord)))??;
-            return Ok("keyboard".into());
+            return keyboard();
         }
-        act::post_key(tracked.hwnd, &chord, spec)
+        if hold.is_none()
+            && let Some(pressed) = self.key_by_button(tracked, &chord)
+        {
+            return pressed;
+        }
+        act::wake_page(tracked.hwnd);
+        let posted = match hold {
+            Some(hold) => act::post_hold(tracked.hwnd, &chord, hold, &self.stop),
+            None => act::post_key(tracked.hwnd, &chord, spec),
+        };
+        // A window the person has in front shares their keyboard, so its keys cannot be posted with
+        // the app's own keyboard state. It already has the keyboard, which reaches it with nothing
+        // moving, as --real would.
+        match posted {
+            Err(why) if why.contains(act::IN_FRONT) && win::front_is(tracked.hwnd, &view.surfaces) => keyboard(),
+            other => other,
+        }
     }
 
     fn select(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, item: &str) -> Reply {
@@ -1542,7 +1588,7 @@ impl Service {
         let (route, finished) = if flags.mouse {
             let done = self.front(tracked, view, &points, Loan::Mouse, || strokes.iter().all(|path| real::stroke(path, button, modifiers, &self.stop, jump)))?;
             ("mouse", done)
-        } else if act::needs_pen_at(tracked.hwnd, x, y) {
+        } else if act::needs_pen_at(tracked.hwnd, x, y) && (flags.real || !act::posts_with_capture(tracked.hwnd)) {
             // The pen has a tip and a barrel button, and holding Shift for it would mean pressing
             // the person's own keyboard.
             if !modifiers.is_empty() || button == MouseButton::Middle {
