@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Linux: agents get their own X pointer (an XInput 2 master pointer named "deskcrew"), so clicks at x,y, drags, drawing, hovering and wheel scrolling leave yours where it is, and nothing is brought forward while the agent's window shows at the point. GTK drawing areas are listed as canvases.
+
 - Fixed: after keys or typing reached Krita or Firefox in the back, your own keys did nothing in that app once you brought it forward, until you clicked inside it. deskcrew left the app active with nothing focused, and Windows does not focus a window it sees as active already. The window keeps its focus now.
 - Keys, typing and held keys for a WPF, Qt or Firefox window you have in front go through the keyboard, as `--real` would, instead of asking for `--real`: the window is in front already, so nothing moves. `--real` keys for a window with a dialog open go to the dialog, which used to lose them to its disabled owner.
 - Enter, Escape, Backspace and Delete reach a Store app in the back through its own buttons where it has them, as Calculator does (Equals, Clear, Backspace, Clear entry). Store apps read those keys only from the real keyboard.
