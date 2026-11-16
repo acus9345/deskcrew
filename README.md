@@ -374,7 +374,7 @@ desk-pilot always moved your real pointer; deskcrew only does with `--real` or `
 
 ## Limits
 
-- The Windows version is the tested one. The macOS version has never been run (see [macOS](#macos)), and Linux is not written.
+- The Windows version is the tested one. The macOS version has never been run (see [macOS](#macos)), and the Linux one runs only in CI, under Xvfb (see [Linux](#linux-x11--xvfb)).
 - On a Mac, pictures use `CGWindowListCreateImage`, which Apple has deprecated. A future macOS may stop it working, and then pictures would need ScreenCaptureKit.
 - On a Mac, typed text goes out as key events carrying the characters. An app that reads key codes instead may get the wrong letters.
 - `notifications`, `down` and `--real` take focus, so they can interrupt what you are doing. A key held with `down` reaches whichever window has focus, and is let go after 30 s, on `quit` and on Ctrl+Alt+Esc. If deskcrew is killed outright it stays down until you press that key.

@@ -383,27 +383,21 @@ pub fn pointer() -> Option<(i32, i32)> {
     Some((reply.root_x as i32, reply.root_y as i32))
 }
 
-pub fn button(which: Button, down: bool) -> Result<(), String> {
-    let x = x()?;
-    fake(x, if down { xproto::BUTTON_PRESS_EVENT } else { xproto::BUTTON_RELEASE_EVENT }, which.number(), None)?;
-    x.conn.flush().map_err(|e| e.to_string())
-}
-
-pub fn click(px: i32, py: i32, which: Button, count: u32, hold: Duration) -> Result<(), String> {
-    move_to(px, py)?;
+pub fn click(by: By, px: i32, py: i32, which: Button, count: u32, hold: Duration) -> Result<(), String> {
+    move_by(by, px, py)?;
     thread::sleep(MOVE_SETTLE);
     for _ in 0..count.max(1) {
-        button(which, true)?;
+        button_by(by, which.number(), true)?;
         thread::sleep(hold.max(KEY_GAP));
-        button(which, false)?;
+        button_by(by, which.number(), false)?;
         thread::sleep(KEY_GAP);
     }
     Ok(())
 }
 
 /// Wheel notches: positive is up, or right when sideways.
-pub fn wheel(px: i32, py: i32, notches: i32, sideways: bool) -> Result<(), String> {
-    move_to(px, py)?;
+pub fn wheel(by: By, px: i32, py: i32, notches: i32, sideways: bool) -> Result<(), String> {
+    move_by(by, px, py)?;
     thread::sleep(MOVE_SETTLE);
     let number = match (sideways, notches > 0) {
         (false, true) => 4,
@@ -411,31 +405,172 @@ pub fn wheel(px: i32, py: i32, notches: i32, sideways: bool) -> Result<(), Strin
         (true, true) => 7,
         (true, false) => 6,
     };
-    let x = x()?;
     for _ in 0..notches.unsigned_abs() {
-        fake(x, xproto::BUTTON_PRESS_EVENT, number, None)?;
-        fake(x, xproto::BUTTON_RELEASE_EVENT, number, None)?;
+        button_by(by, number, true)?;
+        button_by(by, number, false)?;
     }
-    x.conn.flush().map_err(|e| e.to_string())
+    Ok(())
 }
 
-pub fn stroke(path: &[(f32, f32)], button: Button, stop: &dyn Fn() -> bool, moved: &mut dyn FnMut(usize, i32, i32)) -> Result<bool, String> {
+pub fn stroke(by: By, path: &[(f32, f32)], button: Button, stop: &dyn Fn() -> bool, moved: &mut dyn FnMut(usize, i32, i32)) -> Result<bool, String> {
     let Some(first) = path.first() else { return Ok(true) };
-    move_to(first.0 as i32, first.1 as i32)?;
+    move_by(by, first.0 as i32, first.1 as i32)?;
     thread::sleep(MOVE_SETTLE);
-    self::button(button, true)?;
+    button_by(by, button.number(), true)?;
     let mut finished = true;
     for (at, point) in path.iter().enumerate().skip(1) {
         if stop() {
             finished = false;
             break;
         }
-        move_to(point.0 as i32, point.1 as i32)?;
+        move_by(by, point.0 as i32, point.1 as i32)?;
         moved(at, point.0 as i32, point.1 as i32);
         thread::sleep(Duration::from_millis(4));
     }
-    self::button(button, false)?;
+    button_by(by, button.number(), false)?;
     Ok(finished)
+}
+
+// ---- The agents' own pointer. ----
+//
+// X can have more than one pointer: XInput 2 adds a "master" pointer with its own place on the
+// screen, and a test device whose made-up presses and moves are real input to every app, XInput 2
+// ones such as GTK, Qt and Chrome included. Agents use one of their own, so the person's pointer
+// never moves. Moving it has to be a made-up move of that device: a warp makes no motion events.
+
+const AGENT_POINTER: &str = "deskcrew";
+
+struct Agent {
+    /// The test device of the agents' master pointer: the one made-up input goes through.
+    device: u8,
+    xtest_opcode: u8,
+    /// XInput's first event number, which device event numbers count from.
+    first_event: u8,
+}
+
+static AGENT: OnceLock<Option<Agent>> = OnceLock::new();
+
+/// The agents' pointer, made the first time it is needed and kept by the X server for the next
+/// run. None where the X server has no XInput 2, as some remote displays do.
+fn agent() -> Option<&'static Agent> {
+    AGENT.get_or_init(|| make_agent().ok()).as_ref()
+}
+
+fn make_agent() -> Result<Agent, String> {
+    use x11rb::{connection::RequestConnection as _, protocol::xinput::{self, ConnectionExt as _}};
+    let x = x()?;
+    let err = |e: &dyn std::fmt::Display| e.to_string();
+    x.conn.xinput_xi_query_version(2, 2).map_err(|e| err(&e))?.reply().map_err(|e| err(&e))?;
+    let find = || -> Result<Option<u8>, String> {
+        let devices = x.conn.xinput_xi_query_device(0u16).map_err(|e| err(&e))?.reply().map_err(|e| err(&e))?.infos;
+        let master = devices.iter().find(|d| d.type_ == xinput::DeviceType::MASTER_POINTER && d.name == format!("{AGENT_POINTER} pointer").as_bytes());
+        Ok(master.and_then(|m| {
+            devices
+                .iter()
+                .find(|d| d.type_ == xinput::DeviceType::SLAVE_POINTER && d.attachment == m.deviceid && d.name.ends_with(b"XTEST pointer"))
+                .and_then(|d| u8::try_from(d.deviceid).ok())
+        }))
+    };
+    let device = match find()? {
+        Some(device) => device,
+        None => {
+            let add = xinput::HierarchyChange {
+                len: 0,
+                data: xinput::HierarchyChangeData::AddMaster(xinput::HierarchyChangeDataAddMaster { send_core: true, enable: true, name: AGENT_POINTER.as_bytes().to_vec() }),
+            };
+            x.conn.xinput_xi_change_hierarchy(&[add]).map_err(|e| err(&e))?.check().map_err(|e| err(&e))?;
+            find()?.ok_or("the X server made no test device for the agents' pointer")?
+        }
+    };
+    let opcode = |name| x.conn.extension_information(name).ok().flatten().ok_or(format!("no {name} extension"));
+    Ok(Agent { device, xtest_opcode: opcode(x11rb::protocol::xtest::X11_EXTENSION_NAME)?.major_opcode, first_event: opcode(xinput::X11_EXTENSION_NAME)?.first_event })
+}
+
+/// Whether agents have a pointer of their own here.
+pub fn own_pointer() -> bool {
+    agent().is_some()
+}
+
+/// One made-up event of the agents' test device, with the place for a move. XTest takes a device's
+/// position as a second event after the first, which x11rb's request does not carry, so the
+/// request is put together here.
+fn agent_event(agent: &Agent, kind: u8, detail: u8, at: Option<(i32, i32)>) -> Result<(), String> {
+    use std::io::IoSlice;
+    use x11rb::connection::RequestConnection;
+    let x = x()?;
+    let words: u16 = if at.is_some() { 17 } else { 9 };
+    let mut request = Vec::with_capacity(words as usize * 4);
+    request.extend([agent.xtest_opcode, 2]);
+    request.extend(words.to_ne_bytes());
+    request.extend([agent.first_event + kind, detail, 0, 0]);
+    request.extend([0u8; 28]);
+    request[35] = agent.device;
+    if let Some((px, py)) = at {
+        // The device's place, as its first two values, in screen pixels.
+        request.extend([agent.first_event, agent.device, 0, 0, 0, 0, 2, 0]);
+        for value in [px, py, 0, 0, 0, 0] {
+            request.extend(value.to_ne_bytes());
+        }
+    }
+    x.conn.send_request_without_reply(&[IoSlice::new(&request)], Vec::new()).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+const DEVICE_BUTTON_PRESS: u8 = 3;
+const DEVICE_BUTTON_RELEASE: u8 = 4;
+const DEVICE_MOTION: u8 = 5;
+
+/// Input by the agents' pointer, or by the display's own one where there is no other.
+#[derive(Clone, Copy, PartialEq)]
+pub enum By {
+    Person,
+    Agent,
+}
+
+pub fn move_by(by: By, px: i32, py: i32) -> Result<(), String> {
+    match (by, agent()) {
+        (By::Agent, Some(agent)) => {
+            agent_event(agent, DEVICE_MOTION, 0, Some((px, py)))?;
+            x()?.conn.flush().map_err(|e| e.to_string())
+        }
+        _ => move_to(px, py),
+    }
+}
+
+fn button_by(by: By, number: u8, down: bool) -> Result<(), String> {
+    match (by, agent()) {
+        (By::Agent, Some(agent)) => {
+            agent_event(agent, if down { DEVICE_BUTTON_PRESS } else { DEVICE_BUTTON_RELEASE }, number, None)?;
+            x()?.conn.flush().map_err(|e| e.to_string())
+        }
+        _ => {
+            let x = x()?;
+            fake(x, if down { xproto::BUTTON_PRESS_EVENT } else { xproto::BUTTON_RELEASE_EVENT }, number, None)?;
+            x.conn.flush().map_err(|e| e.to_string())
+        }
+    }
+}
+
+/// Whether the window, rather than another one on top of it, shows at this point of the screen,
+/// so a press there reaches it without bringing it forward.
+pub fn shows_at(window: u32, px: i32, py: i32) -> bool {
+    let Ok(x) = x() else { return false };
+    let Some(top) = x.conn.translate_coordinates(x.root, x.root, px as i16, py as i16).ok().and_then(|c| c.reply().ok()).map(|r| r.child) else { return false };
+    if top == x11rb::NONE {
+        return false;
+    }
+    // The window manager's frame around it is on top, not the window itself.
+    let mut at = window;
+    for _ in 0..8 {
+        if at == top {
+            return true;
+        }
+        match x.conn.query_tree(at).ok().and_then(|c| c.reply().ok()) {
+            Some(tree) if tree.parent != x.root && tree.parent != x11rb::NONE => at = tree.parent,
+            _ => return false,
+        }
+    }
+    false
 }
 
 /// A key and the modifiers held with it, as X keysyms.

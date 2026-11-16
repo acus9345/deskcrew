@@ -6,7 +6,7 @@
 use super::{
     atspi::{self, Node, Obj},
     overlay::Overlay,
-    x::{self, Bounds, Button, Window},
+    x::{self, Bounds, Button, By, Window},
 };
 use crate::{
     lines::{self, Seen},
@@ -611,21 +611,43 @@ impl Service {
         }
         let (px, py) = centre(rect);
         let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
-        self.front(tracked, || {
+        // The agents' own pointer leaves the person's where it is. Held keys belong to the
+        // display's own keyboard, which the apps pair with the person's pointer, so those clicks
+        // still use that one.
+        let by = self.pointer_for(&with);
+        self.with_pointer(by, tracked, (px, py), || {
             x::modifiers(&with, true)?;
-            let clicked = x::click(px, py, button, count, hold);
+            let clicked = x::click(by, px, py, button, count, hold);
             x::modifiers(&with, false)?;
             clicked
-        })?;
-        Ok("pointer".into())
+        })
+    }
+
+    /// The agents' own pointer where there is one and no keys are held with it.
+    fn pointer_for(&self, held: &[u32]) -> By {
+        if held.is_empty() && x::own_pointer() { By::Agent } else { By::Person }
+    }
+
+    /// Run pointer work: with the agents' own pointer where the window shows at the point, with
+    /// nothing brought forward and the person's pointer untouched; otherwise with the window
+    /// brought forward for the moment. Agents take turns on a pointer.
+    fn with_pointer(&self, by: By, tracked: &Tracked, (px, py): (i32, i32), work: impl FnOnce() -> Result<(), String>) -> Reply {
+        if by == By::Agent && x::shows_at(tracked.window, px, py) {
+            let _turn = self.real_input.lock().unwrap();
+            work()?;
+            return Ok("own pointer".into());
+        }
+        self.front(tracked, work)?;
+        Ok(if by == By::Agent { "own pointer, window brought forward" } else { "pointer" }.into())
     }
 
     fn hover(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let (px, py) = self.point_of(word, who, tracked, view)?;
         self.cursor_on(who, tracked, (px, py, 0, 0), false);
         let _turn = self.real_input.lock().unwrap();
-        x::move_to(px, py)?;
-        Ok("pointer".into())
+        let by = self.pointer_for(&[]);
+        x::move_by(by, px, py)?;
+        Ok(if by == By::Agent { "own pointer" } else { "pointer" }.into())
     }
 
     fn set(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
@@ -824,8 +846,8 @@ impl Service {
         }
         let notches = if words[at] == "up" || words[at] == "right" { times } else { -times };
         let notches = if sideways { -notches } else { notches };
-        self.front(tracked, || x::wheel(px, py, notches, sideways))?;
-        Ok("pointer".into())
+        let by = self.pointer_for(&[]);
+        self.with_pointer(by, tracked, (px, py), || x::wheel(by, px, py, notches, sideways))
     }
 
     fn strokes(&self, who: &str, tracked: &Tracked, strokes: &[Vec<(f32, f32)>], button: Button, modifiers: &[u32]) -> Reply {
@@ -841,21 +863,34 @@ impl Service {
         if let Some(&(px, py)) = strokes.first().and_then(|s| s.first()) {
             self.cursor_on(who, tracked, (px as i32, py as i32, 0, 0), false);
         }
-        // The drawn cursor rides along with the pen.
-        let finished = self.front(tracked, || {
+        // The drawn cursor rides along with the pen. The agents' own pointer needs the window to
+        // show along the whole stroke, or it would draw on whatever covers it.
+        let by = self.pointer_for(modifiers);
+        let shows = by == By::Agent && strokes.iter().flatten().all(|p| x::shows_at(tracked.window, p.0 as i32, p.1 as i32));
+        let finished = std::cell::Cell::new(true);
+        let draw = || {
             x::modifiers(modifiers, true)?;
             let res = (|| {
                 for stroke in strokes {
-                    if !x::stroke(stroke, button, &stop, &mut |_, px, py| self.overlay.jump(who, px, py))? {
-                        return Ok(false);
+                    if !x::stroke(by, stroke, button, &stop, &mut |_, px, py| self.overlay.jump(who, px, py))? {
+                        finished.set(false);
+                        return Ok(());
                     }
                 }
-                Ok(true)
+                Ok(())
             })();
             let _ = x::modifiers(modifiers, false);
             res
-        })?;
-        if finished { Ok("pointer".into()) } else { Err(STOPPED.into()) }
+        };
+        let route = if shows {
+            let _turn = self.real_input.lock().unwrap();
+            draw()?;
+            "own pointer".to_string()
+        } else {
+            self.front(tracked, draw)?;
+            if by == By::Agent { "own pointer, window brought forward" } else { "pointer" }.to_string()
+        };
+        if finished.get() { Ok(route) } else { Err(STOPPED.into()) }
     }
 
     fn drag(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {

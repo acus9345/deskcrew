@@ -105,6 +105,28 @@ if command -v xclip >/dev/null && [ -n "$picture" ]; then
 elif ! command -v xclip >/dev/null && ! command -v xsel >/dev/null; then
     echo "SKIPPED the clipboard checks: neither xclip nor xsel is installed"
 fi
+# Pointer work goes by the agents' own X pointer, so the person's stays where it is, and nothing
+# is brought forward while the window shows at the point.
+if command -v xdotool >/dev/null; then
+    xdotool mousemove 7 7
+    if [ -n "$plain" ]; then
+        # The toolkit-free window flips Gift wrap on a press of any button inside it.
+        expect "own pointer" click 'Gift wrap' --right -w "Deskcrew Form"
+        expect 'checkbox "Gift wrap" [off]' see "Deskcrew Form" -f
+    else
+        expect "own pointer" drag Canvas Notes -w "Deskcrew Form"
+        sleep 0.5
+        if ! grep -qE "canvas stroke [1-9][0-9]* moves" "$log"; then echo "FAILED: the canvas got no stroke from the agents' pointer"; failed=1; fi
+        expect "own pointer" click Canvas --right -w "Deskcrew Form"
+        sleep 0.3
+        if ! grep -qF "canvas press 3" "$log"; then echo "FAILED: the canvas got no right press from the agents' pointer"; failed=1; fi
+    fi
+    where=$(xdotool getmouselocation | cut -d' ' -f1-2)
+    echo "the person's pointer: $where"
+    if [ "$where" != "x:7 y:7" ]; then echo "FAILED: the person's pointer moved to $where"; failed=1; fi
+else
+    echo "SKIPPED the own pointer checks: xdotool is not installed"
+fi
 # Each agent's drawn cursor is on the screen, in its colour: Claude's is 208,111,89.
 if command -v xwd >/dev/null; then
     run click Name -w "Deskcrew Form" --agent Claude
