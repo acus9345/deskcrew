@@ -1034,18 +1034,17 @@ impl Service {
             thread::sleep(MENU_OPEN);
             self.read(tracked, view, false).ok()?;
         }
-        // In GTK's, only the field Ctrl+L focused will do.
-        let element = if role == "file chooser" {
-            view.nodes.values().map(|n| &n.element).find(|e| atspi::editable(e) && atspi::focused(e))?.clone()
-        } else {
-            field(view)?
-        };
+        let element = field(view)?;
         Some((|| {
             atspi::set_text(&element, path)?;
-            if !atspi::focused(&element) {
-                let _ = atspi::focus(&element);
+            // The field's own activate action accepts the dialog, as Enter in it would, and needs
+            // no keyboard focus, which a dialog that is not the active window does not show.
+            if atspi::perform(&element, &["activate"]).is_err() {
+                if !atspi::focused(&element) {
+                    let _ = atspi::focus(&element);
+                }
+                self.keyboard(tracked, || x::press(&x::chord("enter")?, Duration::ZERO))?;
             }
-            self.keyboard(tracked, || x::press(&x::chord("enter")?, Duration::ZERO))?;
             // The dialog closes a moment after: wait, so the reply says so.
             let started = Instant::now();
             while started.elapsed() < DIALOG_CLOSE {
