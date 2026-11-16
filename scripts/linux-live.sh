@@ -105,6 +105,24 @@ if command -v xclip >/dev/null && [ -n "$picture" ]; then
 elif ! command -v xclip >/dev/null && ! command -v xsel >/dev/null; then
     echo "SKIPPED the clipboard checks: neither xclip nor xsel is installed"
 fi
+# Commands the Linux version gained: tables, file dialogs and notifications (GTK window only).
+if [ -z "$plain" ]; then
+    expect "3 rows, 2 columns" table Stock -w "Deskcrew Form"
+    expect "Plums	30" table Stock -w "Deskcrew Form"
+    expect "ok" click "Open file" -w "Deskcrew Form"
+    sleep 1
+    expect "dialog closed" pick-file /etc/hostname -w "Deskcrew Form"
+    sleep 0.5
+    if ! grep -qF "picked /etc/hostname" "$log"; then echo "FAILED: the file dialog did not get the path"; failed=1; fi
+    python3 -c "
+from gi.repository import Gio, GLib
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+bus.call_sync('org.freedesktop.Notifications', '/org/freedesktop/Notifications', 'org.freedesktop.Notifications', 'Notify',
+    GLib.Variant('(susssasa{sv}i)', ('deskcrew-test', 0, '', 'Build finished', 'all checks passed', [], {}, 5000)), None, Gio.DBusCallFlags.NONE, 2000, None)
+" || echo "(sending the test notification failed)"
+    sleep 0.5
+    expect "Build finished: all checks passed" notifications
+fi
 # Pointer work goes by the agents' own X pointer, so the person's stays where it is, and nothing
 # is brought forward while the window shows at the point.
 if command -v xdotool >/dev/null; then

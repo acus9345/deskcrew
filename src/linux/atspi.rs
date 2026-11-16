@@ -213,6 +213,7 @@ fn role(role_name: &str) -> Option<&'static str> {
         "link" => "link",
         "image" | "icon" => "image",
         "drawing area" | "canvas" => "canvas",
+        "table" | "tree table" => "table",
         "menu item" | "menu" => "menuitem",
         "page tab" => "tab",
         "slider" => "slider",
@@ -230,7 +231,7 @@ fn skipped(role_name: &str) -> bool {
 }
 
 fn acts(role: &str) -> bool {
-    !matches!(role, "" | "image" | "progress" | "header" | "document")
+    !matches!(role, "" | "image" | "progress" | "header" | "document" | "table")
 }
 
 fn outside(rect: Bounds, window: Bounds) -> bool {
@@ -576,4 +577,85 @@ pub fn select_child(parent: &Obj, child: &Obj) -> Result<(), String> {
     }
     let done: bool = call(&holder, "org.a11y.atspi.Selection", "SelectChild", &(index,))?;
     if done { Ok(()) } else { Err("the app refused that entry".into()) }
+}
+
+/// A table's cells as text: the rows asked for, and how many there are in all.
+pub struct Table {
+    pub headers: Vec<String>,
+    pub rows: Vec<Vec<String>>,
+    pub total_rows: usize,
+    pub total_columns: usize,
+}
+
+const TABLE: &str = "org.a11y.atspi.Table";
+
+fn object(reference: (String, OwnedObjectPath)) -> Option<Obj> {
+    let (bus, path) = reference;
+    (path.as_str() != "/org/a11y/atspi/null").then(|| Obj { bus, path: path.as_str().to_string() })
+}
+
+/// Rows `skip` onward of the table this control is, or is in, as GTK's and Qt's tables and
+/// LibreOffice's sheets give them: a cell or a row names its table too. A list with no table
+/// behind it gives one column, a row per item.
+pub fn table(obj: &Obj, skip: usize, rows: usize, columns: usize) -> Result<Table, String> {
+    let mut owner = Some(obj.clone());
+    for _ in 0..4 {
+        match &owner {
+            Some(at) if interfaces(at).iter().any(|i| i == TABLE) => break,
+            Some(at) => owner = parent(at),
+            None => break,
+        }
+    }
+    let Some(owner) = owner.filter(|o| interfaces(o).iter().any(|i| i == TABLE)) else {
+        let items: Vec<Obj> = children(obj);
+        let total_rows = items.len();
+        let rows = items.iter().skip(skip).take(rows).map(|item| {
+            let cells = children(item);
+            if cells.is_empty() { vec![full_text(item)] } else { cells.iter().take(columns).map(full_text).collect() }
+        });
+        let rows: Vec<Vec<String>> = rows.collect();
+        let total_columns = rows.iter().map(Vec::len).max().unwrap_or(0);
+        return Ok(Table { headers: Vec::new(), rows, total_rows, total_columns });
+    };
+    let total_rows = property::<i32>(&owner, TABLE, "NRows")?.max(0) as usize;
+    let total_columns = property::<i32>(&owner, TABLE, "NColumns")?.max(0) as usize;
+    let mut headers = Vec::new();
+    for column in 0..total_columns.min(columns) as i32 {
+        let header = call::<_, (String, OwnedObjectPath)>(&owner, TABLE, "GetColumnHeader", &(column,)).ok().and_then(object).map(|h| full_text(&h)).unwrap_or_default();
+        let header = if header.is_empty() { call::<_, String>(&owner, TABLE, "GetColumnDescription", &(column,)).unwrap_or_default() } else { header };
+        headers.push(header);
+    }
+    if headers.iter().all(String::is_empty) {
+        headers.clear();
+    }
+    let mut cells = Vec::new();
+    for row in skip.min(total_rows)..total_rows.min(skip + rows) {
+        let mut line = Vec::new();
+        for column in 0..total_columns.min(columns) {
+            let cell = call::<_, (String, OwnedObjectPath)>(&owner, TABLE, "GetAccessibleAt", &(row as i32, column as i32)).ok().and_then(object);
+            line.push(cell.map(|c| full_text(&c)).unwrap_or_default());
+        }
+        cells.push(line);
+    }
+    Ok(Table { headers, rows: cells, total_rows, total_columns })
+}
+
+/// Where a field's caret is on the screen, as its top left and height, after the last character
+/// when it is at the end.
+pub fn caret(obj: &Obj) -> Option<(i32, i32, i32)> {
+    const TEXT: &str = "org.a11y.atspi.Text";
+    let offset: i32 = property(obj, TEXT, "CaretOffset").ok()?;
+    let count: i32 = property(obj, TEXT, "CharacterCount").unwrap_or(0);
+    let extents = |at: i32| call::<_, (i32, i32, i32, i32)>(obj, TEXT, "GetCharacterExtents", &(at, SCREEN)).ok().filter(|e| e.3 > 0);
+    if offset < count
+        && let Some((x, y, _, h)) = extents(offset)
+    {
+        return Some((x, y, h));
+    }
+    if let Some((x, y, w, h)) = extents((offset - 1).max(0)).filter(|_| count > 0) {
+        return Some((x + w, y, h));
+    }
+    // An empty field: the start of its box, a little in.
+    let (x, y, _, h) = rect(obj)?;
+    (h > 4).then_some((x + 3, y + 3, h - 6))
 }

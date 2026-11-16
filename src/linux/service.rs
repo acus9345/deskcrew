@@ -61,6 +61,11 @@ const WAIT_MOST_MS: u64 = 60_000;
 const WAIT_STEP: Duration = Duration::from_millis(200);
 const MAX_WINDOWS: usize = 40;
 const MAX_GET_CHARS: usize = 20_000;
+const TABLE_CHARS: usize = 6000;
+const MAX_TABLE_ROWS: usize = 500;
+const MAX_TABLE_COLUMNS: usize = 20;
+const MAX_CELL_CHARS: usize = 60;
+const DIALOG_CLOSE: Duration = Duration::from_secs(3);
 const HOLD_MOST: Duration = Duration::from_secs(30);
 const FRONT_SETTLE: Duration = Duration::from_millis(120);
 /// How long a window takes to notice it has the keyboard, and to finish with the last key.
@@ -749,11 +754,21 @@ impl Service {
             None => None,
         };
         self.overlay.typing(who, text.chars().count());
+        // The agent's cursor turns into a caret where the text goes in.
+        let caret_at = |field: &Obj| {
+            if let Some((cx, cy, h)) = atspi::caret(field) {
+                self.overlay.caret(who, cx, cy, h);
+            }
+        };
+        if let Some(field) = &field {
+            caret_at(field);
+        }
         if !flags.paste
             && let Some(field) = &field
             && atspi::editable(field)
             && atspi::insert_text(field, text).is_ok()
         {
+            caret_at(field);
             return Ok("text".into());
         }
         // Focusing a field makes some apps, Chrome among them, raise their window, so a field that
@@ -784,6 +799,9 @@ impl Service {
             let _ = x::activate(person);
         }
         let typed = typed?;
+        if let Some(field) = &field {
+            caret_at(field);
+        }
         if typed < text.chars().count() {
             return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
         }
@@ -978,6 +996,64 @@ impl Service {
         }
     }
 
+    /// Fill a GTK or Qt file dialog's file name with this path and accept it with Enter, which
+    /// works in any language. GTK's Open dialog shows its location field on Ctrl+L. The dialog can
+    /// be this window, or one its app opened over it.
+    fn pick_file(&self, tracked: &Tracked, view: &mut View, path: &str) -> Reply {
+        let pid = self.window_of(tracked)?.pid;
+        if let Some(done) = self.fill_file_dialog(tracked, view, path) {
+            return done;
+        }
+        for window in x::list().into_iter().filter(|w| w.pid == pid && w.id != tracked.window) {
+            let dialog = Tracked { id: 0, window: window.id, view: Mutex::new(View::default()) };
+            let mut dialog_view = dialog.view.lock().unwrap();
+            if let Some(done) = self.fill_file_dialog(&dialog, &mut dialog_view, path) {
+                return done;
+            }
+        }
+        Err("no file dialog in this window or one its app opened: open it first, then pick-file".into())
+    }
+
+    /// None if this window has no field for a file name, even after Ctrl+L.
+    fn fill_file_dialog(&self, tracked: &Tracked, view: &mut View, path: &str) -> Option<Reply> {
+        let field = |view: &View| {
+            let fields: Vec<&Obj> = view.nodes.values().filter(|n| n.parts.role == "edit").map(|n| &n.element).filter(|e| atspi::editable(e)).collect();
+            fields.iter().find(|e| atspi::focused(e)).or(fields.first()).map(|e| (*e).clone())
+        };
+        self.read(tracked, view, false).ok()?;
+        // Only a dialog, never a main window that happens to have a text field: GTK names its
+        // file dialogs as such, and Qt's are dialogs.
+        let role = view.element.as_ref().map(atspi::role_name).unwrap_or_default();
+        if !matches!(role.as_str(), "file chooser" | "dialog") {
+            return None;
+        }
+        let element = match field(view) {
+            Some(element) => element,
+            None => {
+                self.keyboard(tracked, || x::press(&x::chord("ctrl+l")?, Duration::ZERO)).ok()?;
+                thread::sleep(MENU_OPEN);
+                self.read(tracked, view, false).ok()?;
+                field(view)?
+            }
+        };
+        Some((|| {
+            atspi::set_text(&element, path)?;
+            if !atspi::focused(&element) {
+                let _ = atspi::focus(&element);
+            }
+            self.keyboard(tracked, || x::press(&x::chord("enter")?, Duration::ZERO))?;
+            // The dialog closes a moment after: wait, so the reply says so.
+            let started = Instant::now();
+            while started.elapsed() < DIALOG_CLOSE {
+                thread::sleep(WAIT_STEP);
+                if x::find(tracked.window).is_none() {
+                    return Ok("dialog closed".into());
+                }
+            }
+            Ok("dialog still open: see what it asks".into())
+        })())
+    }
+
     fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let (own, words) = parse(words);
         let flags = own.merged(flags);
@@ -1001,6 +1077,7 @@ impl Service {
             ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
             ("draw", rest) => self.draw(who, &flags, tracked, view, rest),
             ("wait", [text]) => self.wait(&flags, tracked, view, text),
+            ("pick-file", [path]) => self.pick_file(tracked, view, path),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
         }
     }
@@ -1157,6 +1234,42 @@ impl Service {
             return Err("that is a password field: its text stays hidden".into());
         }
         Ok(atspi::full_text(&view.nodes[&id].element).chars().take(MAX_GET_CHARS).collect())
+    }
+
+    /// A table's rows, as many as fit in one reply, with its column names first. `--from N`
+    /// starts at row N.
+    fn table(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
+        let word = words.first().ok_or("table needs a control")?;
+        let tracked = self.pick(who, flags.window.as_deref())?;
+        let mut view = tracked.view.lock().unwrap();
+        if !view.read_once {
+            self.read(&tracked, &mut view, false)?;
+        }
+        let Target::Control(id) = self.resolve(word, who, &tracked, &mut view)? else { return Err("table needs a control".into()) };
+        let skip = flags.from.saturating_sub(1);
+        let table = atspi::table(&view.nodes[&id].element, skip, MAX_TABLE_ROWS, MAX_TABLE_COLUMNS)?;
+        let clip = |cells: &[String]| cells.iter().map(|cell| lines::clip(cell, MAX_CELL_CHARS)).collect::<Vec<_>>().join("	");
+        let mut out = vec![format!("{} rows, {} columns", table.total_rows, table.total_columns)];
+        if !table.headers.is_empty() {
+            out.push(clip(&table.headers));
+        }
+        let mut size = out.iter().map(String::len).sum::<usize>();
+        let mut shown = 0;
+        for row in &table.rows {
+            let line = clip(row);
+            if size + line.len() > TABLE_CHARS && shown > 0 {
+                break;
+            }
+            size += line.len() + 1;
+            out.push(line);
+            shown += 1;
+        }
+        let last = skip + shown;
+        if last < table.total_rows {
+            out.push(format!("rows {}-{last} of {} shown: table {word} --from {} reads on", skip + 1, table.total_rows, last + 1));
+        }
+        Ok(out.join("
+"))
     }
 
     fn save_screen(&self, who: &str, rect: Bounds, edge: u32) -> Reply {
@@ -1368,7 +1481,12 @@ impl Service {
                 Ok(if gone.is_empty() { "nothing was held".into() } else { format!("let go of keys held by {}", gone.join(", ")) })
             }
             "cursor" => Err("the Linux version never borrows anyone's cursor: on X11 it uses the display's pointer for points and drawing only".into()),
-            "notifications" | "table" | "pick-file" => Err(format!("{command} is not on the Linux version yet")),
+            "table" => self.table(who, &flags, args),
+            "notifications" => match args.first().map(String::as_str) {
+                // Notifications are not a window here, so there is nothing to close.
+                Some("close") => Ok("ok".into()),
+                _ => super::notifications::list(),
+            },
             "resume" => {
                 STOP.store(false, Ordering::Relaxed);
                 Ok("ok".into())
@@ -1399,7 +1517,7 @@ impl Service {
                 self.act(who, &flags, &with_expect(steps))
             }
             "click" | "hover" | "set" | "clear" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "show" | "select" | "type" | "key"
-            | "down" | "scroll" | "drag" | "draw" | "wait" => {
+            | "down" | "scroll" | "drag" | "draw" | "wait" | "pick-file" => {
                 let mut step = vec![command.clone()];
                 step.extend(args.iter().cloned());
                 self.act(who, &flags, &with_expect(vec![step]))
@@ -1437,6 +1555,7 @@ pub fn run() {
         quit: AtomicBool::new(false),
         overlay: Overlay::start(),
     });
+    super::notifications::watch();
     let server = service.clone();
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {

@@ -3,10 +3,10 @@ import sys
 import gi
 gi.require_version('Gtk', '3.0')
 gi.require_version('Gdk', '3.0')
-from gi.repository import Gdk, Gtk
+from gi.repository import Gdk, Gio, GLib, Gtk
 
 win = Gtk.Window(title='Deskcrew Form')
-win.set_default_size(420, 460)
+win.set_default_size(420, 640)
 win.move(60, 60)
 grid = Gtk.Grid(row_spacing=8, column_spacing=8, margin=12)
 win.add(grid)
@@ -60,6 +60,43 @@ canvas.connect('button-press-event', canvas_down)
 canvas.connect('motion-notify-event', canvas_move)
 canvas.connect('button-release-event', canvas_up)
 grid.attach(canvas, 1, 6, 1, 1)
+
+# A small table, for reading rows.
+stock = Gtk.ListStore(str, int)
+for fruit, count in (('Apples', 12), ('Pears', 7), ('Plums', 30)):
+    stock.append([fruit, count])
+table = named(Gtk.TreeView(model=stock), 'Stock')
+for at, title in enumerate(('Fruit', 'Count')):
+    table.append_column(Gtk.TreeViewColumn(title, Gtk.CellRendererText(), text=at))
+grid.attach(table, 1, 7, 1, 1)
+
+# A file dialog, which says what was picked.
+def open_file(_):
+    dialog = Gtk.FileChooserDialog(title='Open File', transient_for=win, action=Gtk.FileChooserAction.OPEN)
+    dialog.add_buttons('_Cancel', Gtk.ResponseType.CANCEL, '_Open', Gtk.ResponseType.ACCEPT)
+    def answered(d, response):
+        if response == Gtk.ResponseType.ACCEPT:
+            print(f'picked {d.get_filename()}', flush=True)
+        d.destroy()
+    dialog.connect('response', answered)
+    dialog.show()
+opener = Gtk.Button(label='Open file')
+opener.connect('clicked', open_file)
+grid.attach(opener, 1, 8, 1, 1)
+
+# Stand in for the desktop's notification server, so a notification can be sent on a bare bus.
+NOTIFY = '''<node><interface name="org.freedesktop.Notifications">
+<method name="Notify"><arg type="s" direction="in"/><arg type="u" direction="in"/><arg type="s" direction="in"/>
+<arg type="s" direction="in"/><arg type="s" direction="in"/><arg type="as" direction="in"/><arg type="a{sv}" direction="in"/>
+<arg type="i" direction="in"/><arg type="u" direction="out"/></method></interface></node>'''
+def notified(conn, sender, path, iface, method, args, invocation):
+    invocation.return_value(GLib.Variant('(u)', (1,)))
+def got_bus(conn, name):
+    conn.register_object('/org/freedesktop/Notifications', Gio.DBusNodeInfo.new_for_xml(NOTIFY).interfaces[0], notified, None, None)
+try:
+    Gio.bus_own_name(Gio.BusType.SESSION, 'org.freedesktop.Notifications', Gio.BusNameOwnerFlags.NONE, got_bus, None, None)
+except GLib.Error:
+    pass
 
 button = Gtk.Button(label='Submit')
 button.connect('clicked', submit)

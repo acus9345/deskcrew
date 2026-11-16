@@ -49,6 +49,7 @@ pub enum Command {
     Over { agent: String, window: u32 },
     Press { agent: String, target: (i32, i32, i32, i32) },
     Type { agent: String, keys: usize },
+    Caret { agent: String, x: i32, y: i32, h: i32 },
     Aside { on: bool, done: Sender<()> },
 }
 
@@ -99,6 +100,12 @@ impl Overlay {
     /// Pulse this agent's name tag as it types this many keys.
     pub fn typing(&self, agent: &str, keys: usize) {
         let _ = self.commands.send(Command::Type { agent: agent.into(), keys });
+    }
+
+    /// Show this agent as a caret `h` pixels tall with its top at x,y, where its text goes in. It
+    /// is the arrow again on its next move.
+    pub fn caret(&self, agent: &str, x: i32, y: i32, h: i32) {
+        let _ = self.commands.send(Command::Caret { agent: agent.into(), x, y, h });
     }
 
     /// Hide every cursor while the screen is copied, or bring them back. Returns once done.
@@ -295,6 +302,8 @@ struct Agent {
     glide: Option<Glide>,
     above: Option<XWindow>,
     side: f32,
+    /// Where its caret's top left is and how tall, while it is a caret.
+    caret: Option<(i32, i32, i32)>,
 }
 
 struct Press {
@@ -378,10 +387,14 @@ fn run(inbox: Receiver<Command>) {
                         layer.show(&conn, &look, &picture, start.0 as i32 - tx, start.1 as i32 - ty, !aside);
                         agents.insert(
                             agent.clone(),
-                            Agent { colour, label, pose: motion::Pose::new(), look: (0, 0), layer, tip: (tx, ty), at: start, glide: None, above: None, side },
+                            Agent { colour, label, pose: motion::Pose::new(), look: (0, 0), layer, tip: (tx, ty), at: start, glide: None, above: None, side, caret: None },
                         );
                     }
                     let entry = agents.get_mut(&agent).expect("just added");
+                    // Back to the arrow, which the next frame draws afresh.
+                    if entry.caret.take().is_some() {
+                        entry.look = (i32::MIN, i32::MIN);
+                    }
                     let to = (x as f32, y as f32);
                     if instant {
                         entry.glide = None;
@@ -420,6 +433,19 @@ fn run(inbox: Receiver<Command>) {
                         entry.pose.type_keys(Instant::now(), keys);
                     }
                 }
+                Command::Caret { agent, x, y, h } => {
+                    if let Some(entry) = agents.get_mut(&agent) {
+                        entry.glide = None;
+                        entry.at = (x as f32, y as f32);
+                        entry.caret = Some((x, y, h));
+                        if let Some((picture, cx, cy)) = draw::caret(entry.colour, &entry.label, scale, h, 1.0) {
+                            entry.layer.show(&conn, &look, &picture, x - cx, y - cy, !aside);
+                            if !aside {
+                                entry.layer.stack(&conn, entry.above);
+                            }
+                        }
+                    }
+                }
                 Command::Aside { on, done } => {
                     aside = on;
                     for agent in agents.values_mut() {
@@ -445,6 +471,10 @@ fn run(inbox: Receiver<Command>) {
 fn tick(conn: &RustConnection, look: &Look, scale: f32, agents: &mut HashMap<String, Agent>, presses: &mut Vec<Press>, aside: bool, restacked: &mut Instant) {
     let now = Instant::now();
     for agent in agents.values_mut() {
+        // A caret stays where the text goes in until the agent moves on.
+        if agent.caret.is_some() {
+            continue;
+        }
         if let Some(glide) = &mut agent.glide {
             let t = (glide.started.elapsed().as_millis() as f32 / glide.ms.max(1) as f32).min(1.0);
             agent.at = motion::along(glide.from, glide.middle, glide.to, motion::ease(t));
