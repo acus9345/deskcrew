@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.27] - 2026-11-16
+
 - Linux gets `table`, `pick-file` and `notifications`, and the typing caret. Tested in CI on a GTK window under Xvfb: a three-row table, a GTK Open dialog filled from its location field, and a notification sent on the session bus.
 
 - Linux: agents get their own X pointer (an XInput 2 master pointer named "deskcrew"), so clicks at x,y, drags, drawing, hovering and wheel scrolling leave yours where it is, and nothing is brought forward while the agent's window shows at the point. GTK drawing areas are listed as canvases.
