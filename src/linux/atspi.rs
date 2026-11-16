@@ -212,6 +212,7 @@ fn role(role_name: &str) -> Option<&'static str> {
         "label" | "static" | "caption" | "paragraph" => "",
         "link" => "link",
         "image" | "icon" => "image",
+        "drawing area" | "canvas" => "canvas",
         "menu item" | "menu" => "menuitem",
         "page tab" => "tab",
         "slider" => "slider",
