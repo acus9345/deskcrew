@@ -1027,14 +1027,18 @@ impl Service {
         if !matches!(role.as_str(), "file chooser" | "dialog") {
             return None;
         }
-        let element = match field(view) {
-            Some(element) => element,
-            None => {
-                self.keyboard(tracked, || x::press(&x::chord("ctrl+l")?, Duration::ZERO)).ok()?;
-                thread::sleep(MENU_OPEN);
-                self.read(tracked, view, false).ok()?;
-                field(view)?
-            }
+        // GTK's dialog keeps hidden fields, its search box among them: Ctrl+L shows its location
+        // field and puts the keyboard there. Qt's has its file name field focused already.
+        if role == "file chooser" || field(view).is_none() {
+            self.keyboard(tracked, || x::press(&x::chord("ctrl+l")?, Duration::ZERO)).ok()?;
+            thread::sleep(MENU_OPEN);
+            self.read(tracked, view, false).ok()?;
+        }
+        // In GTK's, only the field Ctrl+L focused will do.
+        let element = if role == "file chooser" {
+            view.nodes.values().map(|n| &n.element).find(|e| atspi::editable(e) && atspi::focused(e))?.clone()
+        } else {
+            field(view)?
         };
         Some((|| {
             atspi::set_text(&element, path)?;

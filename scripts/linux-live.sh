@@ -113,7 +113,11 @@ if [ -z "$plain" ]; then
     sleep 1
     expect "dialog closed" pick-file /etc/hostname -w "Deskcrew Form"
     sleep 0.5
-    if ! grep -qF "picked /etc/hostname" "$log"; then echo "FAILED: the file dialog did not get the path"; failed=1; fi
+    if ! grep -qF "picked /etc/hostname" "$log"; then
+        echo "FAILED: the file dialog did not get the path"; failed=1
+        run windows
+        run see "Open File" -f
+    fi
     python3 -c "
 from gi.repository import Gio, GLib
 bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
