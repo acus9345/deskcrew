@@ -361,7 +361,19 @@ mod tests {
         #[cfg(not(windows))]
         let (waiter, args): (&str, &[&str]) = (if Path::new("/bin/sleep").exists() { "/bin/sleep" } else { "/usr/bin/sleep" }, &["30"]);
         fs::copy(waiter, &target).unwrap();
-        let mut running = std::process::Command::new(&target).args(args).stdout(std::process::Stdio::null()).spawn().unwrap();
+        // Linux refuses to run a file another thread's new process still holds open for writing,
+        // as one started by a test running alongside can for a moment.
+        let mut spawned = std::process::Command::new(&target).args(args).stdout(std::process::Stdio::null()).spawn();
+        for _ in 0..50 {
+            match &spawned {
+                Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    spawned = std::process::Command::new(&target).args(args).stdout(std::process::Stdio::null()).spawn();
+                }
+                _ => break,
+            }
+        }
+        let mut running = spawned.unwrap();
         std::thread::sleep(std::time::Duration::from_millis(300));
         let source = dir.join("new-build");
         fs::write(&source, "the new build").unwrap();
