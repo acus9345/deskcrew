@@ -1,0 +1,620 @@
+// The drawn cursors. One thread owns every window and steps them once per display frame while
+// anything is moving, then sleeps on its message queue, so an idle overlay costs no CPU.
+mod draw;
+mod layer;
+
+use crate::motion::{self, Point, Rgb};
+use crate::real;
+use crate::win::Hwnd;
+use draw::{Mask, PRESS_SETTLE_MS, caret, outline_margin, posed, press};
+use layer::{Layer, text_mask};
+use std::{
+    mem::zeroed,
+    ptr::null_mut,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        mpsc::{self, Receiver, Sender},
+    },
+    thread::{self, JoinHandle},
+    time::{Duration, Instant},
+};
+use windows_sys::Win32::{
+    Foundation::{LPARAM, LRESULT, WPARAM},
+    Graphics::Dwm::DwmFlush,
+    System::LibraryLoader::GetModuleHandleW,
+    System::Threading::{GetCurrentThreadId, INFINITE},
+    UI::{
+        HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext},
+        Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, VK_ESCAPE},
+        WindowsAndMessaging::{
+            CallNextHookEx, DispatchMessageW, GetSystemMetrics, HHOOK, MSG, MSLLHOOKSTRUCT, MsgWaitForMultipleObjects, SetWindowsHookExW,
+            UnhookWindowsHookEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
+            PostThreadMessageW, QS_ALLINPUT, SM_CXSCREEN, SM_CYSCREEN, WM_APP, WM_HOTKEY,
+        },
+    },
+};
+
+/// An action fires this long after asking to move, even if drawing has fallen behind.
+const ARRIVAL_TIMEOUT: Duration = Duration::from_millis(900);
+const FLASH_IN_MS: f32 = 110.0;
+const STACK_EVERY: Duration = Duration::from_millis(50);
+const FLASH_HOLD_MS: f32 = 480.0;
+const FLASH_OUT_MS: f32 = 300.0;
+/// Past this size the glow is too much to redraw every frame, so a big control just fades in.
+const FLASH_MOST_PIXELS: i64 = 500_000;
+const REST_AFTER: Duration = Duration::from_secs(6);
+const REST_FADE_MS: f32 = 160.0;
+const ARRIVE_FROM: f32 = 90.0;
+const APPEAR_MS: f32 = 140.0;
+const SHIELD_LINGER: Duration = Duration::from_millis(30);
+/// The longest typing waits for its caret to reach the screen.
+const CARET_WAIT: Duration = Duration::from_millis(50);
+const LABEL_PIXELS: f32 = 11.0;
+const WH_MOUSE_LL: i32 = 14;
+const LLMHF_INJECTED: u32 = 1;
+
+/// Mouse events the shield has stopped. Some classic controls answer an accessibility request by
+/// quietly clicking with the real mouse, so nothing synthetic gets through while one runs.
+static BLOCKED: AtomicUsize = AtomicUsize::new(0);
+
+unsafe extern "system" fn shield(code: i32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+    unsafe {
+        if code >= 0 {
+            let event = &*(lparam as *const MSLLHOOKSTRUCT);
+            if event.flags & LLMHF_INJECTED != 0 && event.dwExtraInfo != real::OURS {
+                BLOCKED.fetch_add(1, Ordering::Relaxed);
+                return 1;
+            }
+        }
+        CallNextHookEx(null_mut(), code, wparam, lparam)
+    }
+}
+
+#[derive(Clone, Copy)]
+pub struct Rect {
+    pub x: i32,
+    pub y: i32,
+    pub w: i32,
+    pub h: i32,
+}
+
+enum Command {
+    Move { agent: String, to: Point, arrived: Sender<()> },
+    Jump { agent: String, to: Point },
+    Over { agent: String, window: Hwnd },
+    Press { agent: String, target: Rect },
+    Type { agent: String, keys: usize },
+    Caret { agent: String, x: i32, y: i32, h: i32, shown: Sender<()> },
+    Aside { on: bool, cleared: Sender<()> },
+    Shield { on: bool, ready: Sender<()> },
+    Quit,
+}
+
+pub fn screen_size() -> (i32, i32) {
+    make_aware();
+    unsafe { (GetSystemMetrics(SM_CXSCREEN), GetSystemMetrics(SM_CYSCREEN)) }
+}
+
+/// Work in real screen pixels, so accessibility bounds and the overlay agree.
+pub fn make_aware() {
+    unsafe { SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2) };
+}
+
+#[cfg(test)]
+pub fn label_for_test(text: &str, px: i32) -> draw::Mask {
+    text_mask(text, px)
+}
+
+pub struct Overlay {
+    commands: Sender<Command>,
+    thread: u32,
+    worker: JoinHandle<Stats>,
+}
+
+impl Overlay {
+    /// `stop` goes up when the person presses Ctrl+Alt+Esc.
+    pub fn start(stop: Arc<AtomicBool>) -> Overlay {
+        let (commands, inbox) = mpsc::channel();
+        let (ready, thread) = mpsc::channel();
+        let worker = thread::spawn(move || run(inbox, ready, stop));
+        Overlay { commands, thread: thread.recv().unwrap_or(0), worker }
+    }
+
+    fn send(&self, command: Command) {
+        let _ = self.commands.send(command);
+        unsafe { PostThreadMessageW(self.thread, WM_APP, 0, 0) };
+    }
+
+    /// Glide there and return once the cursor has arrived.
+    pub fn move_to(&self, agent: &str, x: i32, y: i32) {
+        let (arrived, wait) = mpsc::channel();
+        self.send(Command::Move { agent: agent.to_string(), to: (x as f32, y as f32), arrived });
+        let _ = wait.recv_timeout(ARRIVAL_TIMEOUT);
+    }
+
+    /// Follow a path the real pointer is walking, with no glide of its own.
+    pub fn jump(&self, agent: &str, x: i32, y: i32) {
+        self.send(Command::Jump { agent: agent.to_string(), to: (x as f32, y as f32) });
+    }
+
+    /// Keep this agent's cursor and press effects just above this window, so that whatever covers
+    /// the window covers them too.
+    pub fn over(&self, agent: &str, window: Hwnd) {
+        self.send(Command::Over { agent: agent.to_string(), window });
+    }
+
+    /// Clear every cursor off the screen for a screen copy, or bring them back.
+    pub fn aside(&self, on: bool) {
+        let (cleared, wait) = mpsc::channel();
+        self.send(Command::Aside { on, cleared });
+        let _ = wait.recv_timeout(ARRIVAL_TIMEOUT);
+    }
+
+    fn shield_up(&self, on: bool) {
+        let (ready, wait) = mpsc::channel();
+        self.send(Command::Shield { on, ready });
+        let _ = wait.recv_timeout(ARRIVAL_TIMEOUT);
+    }
+
+    /// Run something that must not touch the real mouse. True if it tried to.
+    pub fn shielded<T>(&self, work: impl FnOnce() -> T) -> (T, bool) {
+        self.shield_up(true);
+        let before = BLOCKED.load(Ordering::Relaxed);
+        let out = work();
+        // Hidden clicks can follow the call by a moment.
+        thread::sleep(SHIELD_LINGER);
+        let tried = BLOCKED.load(Ordering::Relaxed) != before;
+        self.shield_up(false);
+        (out, tried)
+    }
+
+    /// Light up the control this agent just pressed.
+    pub fn press(&self, agent: &str, target: Rect) {
+        self.send(Command::Press { agent: agent.to_string(), target });
+    }
+
+    /// Pulse this agent's name tag as it types this many keys.
+    pub fn typing(&self, agent: &str, keys: usize) {
+        self.send(Command::Type { agent: agent.to_string(), keys });
+    }
+
+    /// Show this agent as a caret `h` pixels tall with its top at x,y, where its text goes in, and
+    /// pulse its tag for the key just typed. Its next move brings the arrow back. Returns once
+    /// the caret is on the screen, so typing never runs ahead of it.
+    pub fn caret(&self, agent: &str, x: i32, y: i32, h: i32) {
+        let (shown, wait) = mpsc::channel();
+        self.send(Command::Caret { agent: agent.to_string(), x, y, h, shown });
+        let _ = wait.recv_timeout(CARET_WAIT);
+    }
+
+    pub fn stop(self) -> Stats {
+        self.send(Command::Quit);
+        self.worker.join().unwrap_or_default()
+    }
+}
+
+/// How smooth the motion really was.
+#[derive(Default)]
+pub struct Stats {
+    frames: u32,
+    moving_ms: f32,
+    longest_gap_ms: f32,
+    flights: u32,
+}
+
+impl Stats {
+    pub fn summary(&self) -> String {
+        let rate = self.frames as f32 * 1000.0 / self.moving_ms.max(1.0);
+        format!(
+            "{} moves, {rate:.0} frames per second while moving, longest gap {:.1} ms",
+            self.flights, self.longest_gap_ms
+        )
+    }
+}
+
+struct Flight {
+    from: Point,
+    middle: Point,
+    to: Point,
+    started: Instant,
+    ms: f32,
+    arrived: Sender<()>,
+}
+
+struct Agent {
+    name: String,
+    colour: Rgb,
+    label: Mask,
+    scale: f32,
+    pose: motion::Pose,
+    look: (i32, i32),
+    typing_at: Option<i32>,
+    layer: Layer,
+    tip: (i32, i32),
+    at: Point,
+    side: f32,
+    flight: Option<Flight>,
+    last_active: Instant,
+    alpha: u8,
+    visible: bool,
+    aside: bool,
+    appeared: Instant,
+    over: Option<Hwnd>,
+}
+
+impl Agent {
+    fn new(name: &str, to: Point, taken: &[Rgb], scale: f32) -> Option<Agent> {
+        let colour = motion::colour_for(name, taken);
+        let label = text_mask(name, (LABEL_PIXELS * scale) as i32);
+        let (picture, x, y) = posed(colour, &label, scale, 0.0, 1.0)?;
+        Some(Agent {
+            name: name.to_string(),
+            colour,
+            label,
+            scale,
+            pose: motion::Pose::new(),
+            look: (0, 0),
+            typing_at: None,
+            layer: Layer::new(&picture),
+            tip: (x, y),
+            at: (to.0 + ARRIVE_FROM * scale, to.1 + ARRIVE_FROM * scale),
+            side: if taken.len().is_multiple_of(2) { 1.0 } else { -1.0 },
+            flight: None,
+            last_active: Instant::now(),
+            alpha: 255,
+            visible: false,
+            aside: false,
+            appeared: Instant::now(),
+            over: None,
+        })
+    }
+
+    fn draw(&self) {
+        let arriving = (self.appeared.elapsed().as_secs_f32() * 1000.0 / APPEAR_MS).min(1.0);
+        let alpha = if self.aside { 0 } else { (self.alpha as f32 * arriving) as u8 };
+        self.layer.present(self.at.0.round() as i32 - self.tip.0, self.at.1.round() as i32 - self.tip.1, alpha);
+    }
+
+    fn jump(&mut self, to: Point) {
+        self.last_active = Instant::now();
+        self.alpha = 255;
+        self.at = to;
+        self.draw();
+        if !self.visible {
+            self.layer.show();
+            self.visible = true;
+        }
+    }
+
+    fn stack(&self, force: bool) {
+        match self.over {
+            Some(window) => self.layer.above(window, force),
+            None => self.layer.raise(),
+        }
+    }
+
+    fn fly(&mut self, to: Point, arrived: Sender<()>) {
+        self.last_active = Instant::now();
+        self.alpha = 255;
+        if !self.visible {
+            self.appeared = Instant::now();
+            self.draw();
+            self.layer.show();
+            self.visible = true;
+        }
+        self.side = -self.side;
+        if self.typing_at.take().is_some() {
+            self.pose.reset();
+            self.redraw(Instant::now());
+        }
+        let from = self.at;
+        let ms = motion::travel_ms(from, to) as f32;
+        self.flight = Some(Flight { from, middle: motion::bow(from, to, self.side), to, started: Instant::now(), ms, arrived });
+    }
+
+    /// One frame of travel. True while the cursor is still in the air.
+    fn step(&mut self, now: Instant) -> bool {
+        let Some(flight) = &self.flight else { return false };
+        let t = now.duration_since(flight.started).as_secs_f32() * 1000.0 / flight.ms;
+        self.at = motion::along(flight.from, flight.middle, flight.to, motion::ease(t));
+        self.last_active = now;
+        self.draw();
+        if t < 1.0 {
+            return true;
+        }
+        let _ = flight.arrived.send(());
+        self.flight = None;
+        false
+    }
+
+    /// Lean the arrow into its travel and pulse the tag while typing, redrawing only when the look
+    /// changes. True while the pose is still changing.
+    fn hold(&mut self, now: Instant) -> bool {
+        if !self.visible {
+            return false;
+        }
+        // A caret jumps along as letters go in; that is not travel to lean into.
+        let busy = if self.typing_at.is_some() { self.pose.squeeze(now) < 1.0 } else { self.pose.follow(now, self.at, self.scale) };
+        if self.pose.look(now) != self.look {
+            self.redraw(now);
+        }
+        busy
+    }
+
+    /// Draw the pose as it is now: the arrow, or the caret while typing.
+    fn redraw(&mut self, now: Instant) {
+        self.look = self.pose.look(now);
+        let (lean, squeeze) = self.pose.shown(now);
+        let drawn = match self.typing_at {
+            Some(height) => caret(self.colour, &self.label, self.scale, height, squeeze),
+            None => posed(self.colour, &self.label, self.scale, lean, squeeze),
+        };
+        if let Some((picture, x, y)) = drawn {
+            self.layer.reshape(&picture);
+            self.tip = (x, y);
+            self.draw();
+        }
+    }
+
+    /// Fade away once nothing has happened for a while. True while fading.
+    fn rest(&mut self, now: Instant) -> bool {
+        if !self.visible || self.flight.is_some() {
+            return false;
+        }
+        let idle = now.duration_since(self.last_active);
+        if idle < REST_AFTER {
+            return false;
+        }
+        let faded = (idle - REST_AFTER).as_secs_f32() * 1000.0 / REST_FADE_MS;
+        if faded >= 1.0 {
+            self.layer.hide();
+            self.visible = false;
+            return false;
+        }
+        self.alpha = (255.0 * (1.0 - faded)) as u8;
+        self.draw();
+        true
+    }
+}
+
+struct Flash {
+    layer: Layer,
+    x: i32,
+    y: i32,
+    started: Instant,
+    aside: bool,
+    colour: Rgb,
+    target: Rect,
+    scale: f32,
+    animated: bool,
+    settled: bool,
+    over: Option<Hwnd>,
+}
+
+impl Flash {
+    fn new(colour: Rgb, target: Rect, scale: f32, over: Option<Hwnd>) -> Option<Flash> {
+        let margin = outline_margin(scale);
+        let animated = (target.w as i64) * (target.h as i64) <= FLASH_MOST_PIXELS;
+        let first = if animated { 0.0 } else { PRESS_SETTLE_MS };
+        let layer = Layer::new(&press(colour, target.w, target.h, scale, first)?);
+        let settled = !animated;
+        let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now(), aside: false, colour, target, scale, animated, settled, over };
+        flash.layer.present(flash.x, flash.y, 0);
+        flash.stack();
+        flash.layer.show();
+        Some(flash)
+    }
+
+    fn stack(&self) {
+        match self.over {
+            Some(window) => self.layer.above(window, false),
+            None => self.layer.raise(),
+        }
+    }
+
+    /// Draw this frame. False once it has faded out.
+    fn step(&mut self, now: Instant) -> bool {
+        let ms = now.duration_since(self.started).as_secs_f32() * 1000.0;
+        if !self.settled {
+            self.settled = ms >= PRESS_SETTLE_MS;
+            if let Some(frame) = press(self.colour, self.target.w, self.target.h, self.scale, ms.min(PRESS_SETTLE_MS)) {
+                self.layer.repaint(&frame);
+            }
+        }
+        let opacity = if ms < FLASH_IN_MS && !self.animated {
+            ms / FLASH_IN_MS
+        } else if ms < FLASH_HOLD_MS {
+            1.0
+        } else {
+            1.0 - (ms - FLASH_HOLD_MS) / FLASH_OUT_MS
+        };
+        let alpha = if self.aside { 0.0 } else { opacity.clamp(0.0, 1.0) * 255.0 };
+        self.layer.present(self.x, self.y, alpha as u8);
+        opacity > 0.0
+    }
+}
+
+fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> Stats {
+    let mut stats = Stats::default();
+    let mut agents: Vec<Agent> = Vec::new();
+    let mut flashes: Vec<Flash> = Vec::new();
+    let mut last_frame: Option<Instant> = None;
+    let mut aside = false;
+    let mut shields = 0;
+    let mut hook: HHOOK = null_mut();
+    let mut stacked = Instant::now();
+    let mut waiting: Vec<(String, Hwnd)> = Vec::new();
+    unsafe {
+        make_aware();
+        // Windows only gives a thread a message queue once it asks for a message.
+        let mut message: MSG = zeroed();
+        PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
+        let _ = ready.send(GetCurrentThreadId());
+        RegisterHotKey(null_mut(), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_ESCAPE as u32);
+    }
+    let scale = (unsafe { GetDpiForSystem() } as f32 / 96.0).max(1.0);
+
+    loop {
+        unsafe {
+            let mut message: MSG = zeroed();
+            while PeekMessageW(&mut message, null_mut(), 0, 0, PM_REMOVE) != 0 {
+                if message.message == WM_HOTKEY {
+                    stop.store(true, Ordering::Relaxed);
+                    real::release_all();
+                }
+                DispatchMessageW(&message);
+            }
+        }
+        for command in inbox.try_iter() {
+            match command {
+                Command::Quit => return stats,
+                Command::Over { agent, window } => {
+                    match agents.iter_mut().find(|a| a.name == agent) {
+                        Some(found) => {
+                            found.over = Some(window);
+                            found.stack(false);
+                        }
+                        None => {
+                            waiting.retain(|(name, _)| *name != agent);
+                            waiting.push((agent, window));
+                        }
+                    }
+                }
+                Command::Move { agent, to, arrived } => {
+                    if !agents.iter().any(|a| a.name == agent) {
+                        let taken: Vec<Rgb> = agents.iter().map(|a| a.colour).collect();
+                        agents.extend(Agent::new(&agent, to, &taken, scale));
+                    }
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        if let Some(at) = waiting.iter().position(|(name, _)| *name == agent) {
+                            found.over = Some(waiting.swap_remove(at).1);
+                        }
+                        found.stack(false);
+                        found.aside = aside;
+                        found.fly(to, arrived);
+                        stats.flights += 1;
+                    }
+                }
+                Command::Jump { agent, to } => {
+                    if !agents.iter().any(|a| a.name == agent) {
+                        let taken: Vec<Rgb> = agents.iter().map(|a| a.colour).collect();
+                        agents.extend(Agent::new(&agent, to, &taken, scale));
+                    }
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        if let Some(at) = waiting.iter().position(|(name, _)| *name == agent) {
+                            found.over = Some(waiting.swap_remove(at).1);
+                        }
+                        found.jump(to);
+                        found.stack(false);
+                    }
+                }
+                Command::Press { agent, target } => {
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        found.last_active = Instant::now();
+                        flashes.extend(Flash::new(found.colour, target, scale, found.over));
+                        found.stack(true);
+                    }
+                }
+                Command::Type { agent, keys } => {
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        found.last_active = Instant::now();
+                        found.pose.type_keys(Instant::now(), keys);
+                    }
+                }
+                Command::Caret { agent, x, y, h, shown } => {
+                    if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        let now = Instant::now();
+                        found.last_active = now;
+                        found.alpha = 255;
+                        found.at = (x as f32, y as f32);
+                        found.typing_at = Some(h);
+                        found.pose.key(now);
+                        found.redraw(now);
+                        if !found.visible {
+                            found.layer.show();
+                            found.visible = true;
+                        }
+                        unsafe { DwmFlush() };
+                    }
+                    let _ = shown.send(());
+                }
+                Command::Shield { on, ready } => {
+                    shields = if on { shields + 1 } else { shields - 1 };
+                    unsafe {
+                        if shields == 1 && hook.is_null() {
+                            hook = SetWindowsHookExW(WH_MOUSE_LL, Some(shield), GetModuleHandleW(std::ptr::null()), 0);
+                        } else if shields == 0 && !hook.is_null() {
+                            UnhookWindowsHookEx(hook);
+                            hook = null_mut();
+                        }
+                    }
+                    let _ = ready.send(());
+                }
+                Command::Aside { on, cleared } => {
+                    aside = on;
+                    for agent in &mut agents {
+                        agent.aside = on;
+                        if agent.visible {
+                            agent.draw();
+                        }
+                    }
+                    for flash in &mut flashes {
+                        flash.aside = on;
+                        flash.step(Instant::now());
+                    }
+                    if on {
+                        // The second flush covers a composition already under way at the first.
+                        unsafe {
+                            DwmFlush();
+                            DwmFlush();
+                        }
+                    }
+                    let _ = cleared.send(());
+                }
+            }
+        }
+
+        let now = Instant::now();
+        // Windows change order on their own, so the stack has to keep following.
+        if now.duration_since(stacked) >= STACK_EVERY {
+            stacked = now;
+            flashes.iter().for_each(Flash::stack);
+            agents.iter().filter(|a| a.visible).for_each(|a| a.stack(false));
+        }
+        let mut flying = false;
+        let mut fading = false;
+        let mut posing = false;
+        for agent in &mut agents {
+            flying |= agent.step(now);
+            posing |= agent.hold(now);
+            fading |= agent.rest(now);
+        }
+        flashes.retain_mut(|flash| flash.step(now));
+
+        if flying {
+            if let Some(last) = last_frame {
+                let gap = now.duration_since(last).as_secs_f32() * 1000.0;
+                stats.frames += 1;
+                stats.moving_ms += gap;
+                stats.longest_gap_ms = stats.longest_gap_ms.max(gap);
+            }
+            last_frame = Some(now);
+        } else {
+            last_frame = None;
+        }
+
+        if flying || fading || posing || !flashes.is_empty() {
+            unsafe { DwmFlush() };
+            continue;
+        }
+        let wake = agents
+            .iter()
+            .filter(|a| a.visible)
+            .map(|a| (REST_AFTER.saturating_sub(now.duration_since(a.last_active))).as_millis() as u32 + 1)
+            .min()
+            .map(|left| left.min(STACK_EVERY.as_millis() as u32))
+            .unwrap_or(INFINITE);
+        unsafe { MsgWaitForMultipleObjects(0, std::ptr::null(), 0, wake, QS_ALLINPUT) };
+    }
+}
