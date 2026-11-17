@@ -6,6 +6,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- A review of the whole codebase, fixed:
+  - **Safety:** the cursor prompt answers only to the person's own click; commands go only to a service running as the same account; risky shortcuts are judged on the keys actually pressed, held keys included (`alt+f04` and `down ctrl` then `key q` are caught), and on `down` and `--with` too; focus, close, place, clip and notifications stop with Ctrl+Alt+Esc like every action.
+  - **Privacy:** the log and traces keep content replies (clipboard, `get`, `fetch`, `reg`, file reads, table cells) as their length; the bench keeps its sign-in copy out of the shared Public folder.
+  - **Agents side by side:** `shot --marks` can no longer deadlock against another agent's action (all three systems); held keys and buttons belong to the agent that held them, and `up` lets go of only its own; refs no longer shift to another control when a same-named one appears.
+  - **Windows:** `--expect` always waits for text (not as milliseconds), per step in a `do` and on browser drawing too; a step's own `-w` or `--risk` is refused instead of dropped; a browser paste that landed is not pasted again; PowerShell strings handle typographic quotes; shell commands no longer hang on output a leftover process holds; Store apps match by their own process; `launch` passes arguments where it can; WINWORD.EXE shows as winword.
+  - **Mac:** minimized windows can be restored; typing never splits an emoji; a failed paste puts the clipboard back; the stop keys come back on if macOS switches their tap off; `select` picks a table row by its text; click outlines stay out of screen copies.
+  - **Linux:** a click no longer lets go of keys held with `down`; sideways scrolling goes the right way; text with accents goes in whole; a paste takes its turn on the one clipboard; accessibility calls time out after 2 s; region and screen shots set where the next `click x,y` goes.
+  - **Docs and tooling:** the README, skill and plugin manifest describe the macOS and Linux versions as they are; the demo recorder and the MCP smoke test no longer hang or crash.
 - Each agent's cursor and name tag wear its own brand colour: Claude orange, Codex ChatGPT green, Gemini blue, Copilot magenta, Windsurf teal, Antigravity dark navy, Amp coral, Kiro purple, Cursor black, Grok charcoal and OpenCode light grey. A dark tag gets a faint light edge so it still shows on a dark screen. Antigravity, Grok and Zed are now recognised by name, and every known agent, the demo's included, has a colour no other agent shares.
 
 ## [0.1.27] - 2026-11-16
