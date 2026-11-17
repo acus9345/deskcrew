@@ -71,13 +71,18 @@ pub fn bus() -> Result<&'static Connection, String> {
                 address
             }
         };
+        // One frozen app must cost a timeout, not hang every read: libatspi waits 800 ms.
         zbus::blocking::connection::Builder::address(address.as_str())
+            .map(|b| b.method_timeout(ATSPI_TIMEOUT))
             .and_then(|b| b.build())
             .map_err(|e| format!("could not join the accessibility bus: {e}"))
     })
     .as_ref()
     .map_err(Clone::clone)
 }
+
+/// How long one accessibility call may take before the app counts as not answering.
+const ATSPI_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 
 fn call<B, R>(obj: &Obj, iface: &str, method: &str, body: &B) -> Result<R, String>
 where
@@ -430,7 +435,8 @@ pub fn set_text(obj: &Obj, text: &str) -> Result<(), String> {
 /// caret after it.
 pub fn insert_text(obj: &Obj, text: &str) -> Result<(), String> {
     let end: i32 = property(obj, "org.a11y.atspi.Text", "CharacterCount").unwrap_or(0);
-    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(end, text, text.chars().count() as i32))?;
+    // The length is in bytes: GTK hands it to gtk_editable_insert_text, which counts bytes.
+    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(end, text, text.len() as i32))?;
     if !done {
         return Err("the app refused the text".into());
     }

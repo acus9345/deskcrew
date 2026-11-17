@@ -95,12 +95,16 @@ struct Refs {
 impl Refs {
     /// The same control keeps its number across reads, even if the app rebuilt it.
     fn assign(&mut self, nodes: Vec<Node>) -> BTreeMap<u32, Node> {
+        // Controls the app kept claim their numbers first, so a new control with the same role
+        // and name never takes the number of one further down the window.
+        let mut taken = std::collections::HashSet::new();
+        let claimed: Vec<Option<u32>> = nodes.iter().map(|node| self.by_key.get(&node.key).copied().filter(|id| taken.insert(*id))).collect();
         let mut out: BTreeMap<u32, Node> = BTreeMap::new();
-        for node in nodes {
-            let known = self.by_key.get(&node.key).copied().filter(|id| !out.contains_key(id));
+        for (node, known) in nodes.into_iter().zip(claimed) {
             let same = self.by_identity.entry(node.identity.clone()).or_default();
-            let id = known.or_else(|| same.iter().copied().find(|id| !out.contains_key(id))).unwrap_or_else(|| {
+            let id = known.or_else(|| same.iter().copied().find(|id| taken.insert(*id))).unwrap_or_else(|| {
                 self.next += 1;
+                taken.insert(self.next);
                 self.next
             });
             if !same.contains(&id) {
@@ -565,11 +569,13 @@ impl Service {
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let button = flags.mouse_button()?;
         let count = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
-        let mut with = match &flags.with {
-            Some(spec) => x::chord(spec)?.modifiers,
+        let held = self.held_keys(who);
+        // Only the --with keys go down and up for this click: keys held with down stay down.
+        let own: Vec<u32> = match &flags.with {
+            Some(spec) => x::chord(spec)?.modifiers.into_iter().filter(|m| !held.contains(m)).collect(),
             None => Vec::new(),
         };
-        with.extend(self.held_keys(who));
+        let with: Vec<u32> = own.iter().chain(&held).copied().collect();
         let (rect, element) = match self.resolve(word, who, tracked, view)? {
             Target::Point(px, py) => ((px - 6, py - 6, 12, 12), None),
             Target::Control(id) => {
@@ -621,9 +627,9 @@ impl Service {
         // still use that one.
         let by = self.pointer_for(&with);
         self.with_pointer(by, tracked, (px, py), || {
-            x::modifiers(&with, true)?;
+            x::modifiers(&own, true)?;
             let clicked = x::click(by, px, py, button, count, hold);
-            x::modifiers(&with, false)?;
+            x::modifiers(&own, false)?;
             clicked
         })
     }
@@ -780,13 +786,20 @@ impl Service {
             let _ = atspi::focus(field);
         }
         if flags.paste {
-            let mut saved = x::SavedClipboard::take();
-            saved.lend(text)?;
-            thread::sleep(PASTE_SETTLE);
-            let sent = self.keyboard(tracked, || x::press(&x::chord("ctrl+v")?, Duration::ZERO));
-            thread::sleep(PASTE_SETTLE);
-            saved.put_back()?;
-            sent?;
+            // The display has one clipboard: it is lent and put back while this agent has the
+            // keyboard, so two agents pasting at once take turns.
+            self.keyboard(tracked, || {
+                let mut saved = x::SavedClipboard::take();
+                if let Err(error) = saved.lend(text) {
+                    let _ = saved.put_back();
+                    return Err(error);
+                }
+                thread::sleep(PASTE_SETTLE);
+                let sent = x::chord("ctrl+v").and_then(|paste| x::press(&paste, Duration::ZERO));
+                thread::sleep(PASTE_SETTLE);
+                saved.put_back()?;
+                sent
+            })?;
             return Ok("paste".into());
         }
         let stop = || STOP.load(Ordering::Relaxed);
@@ -810,10 +823,13 @@ impl Service {
 
     fn key(&self, who: &str, flags: &Flags, tracked: &Tracked, spec: &str) -> Reply {
         let mut chord = x::chord(spec)?;
-        if x::is_risky(&chord) && !flags.force {
+        let held = self.held_keys(who);
+        // Keys held with down are pressed too, so they count: down ctrl, then key q, is ctrl+q.
+        let pressed = x::Chord { modifiers: chord.modifiers.iter().chain(&held).copied().collect(), key: chord.key };
+        if x::is_risky(&pressed) && !flags.force {
             return Err(format!("'{spec}' can quit or close things: ask the person, then add --force"));
         }
-        chord.modifiers.retain(|m| !self.held_keys(who).contains(m));
+        chord.modifiers.retain(|m| !held.contains(m));
         let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
         self.keyboard(tracked, || x::press(&chord, hold))?;
         Ok("keys".into())
@@ -862,8 +878,8 @@ impl Service {
         {
             return Ok("scroll bar".into());
         }
+        // Positive is up, or right when sideways, as x::wheel takes it.
         let notches = if words[at] == "up" || words[at] == "right" { times } else { -times };
-        let notches = if sideways { -notches } else { notches };
         let by = self.pointer_for(&[]);
         self.with_pointer(by, tracked, (px, py), || x::wheel(by, px, py, notches, sideways))
     }
@@ -1283,6 +1299,18 @@ impl Service {
         let (small, scale) = frame.shrink(edge);
         let path = shot::path_for(who, 0);
         small.save(&path)?;
+        // x,y in this picture are what the agent's next click x,y means, in its current window.
+        let mut agents = self.agents.lock().unwrap();
+        let state = agents.entry(who.to_string()).or_default();
+        if let Some(window) = state.current {
+            let frames = Frames { x: rect.0, y: rect.1, scale };
+            match state.shots.get_mut(&window) {
+                Some(last) => last.frames = frames,
+                None => {
+                    state.shots.insert(window, LastShot { hash: 0, frame: Frame { w: 0, h: 0, pixels: Vec::new() }, frames });
+                }
+            }
+        }
         Ok(format!("{} {}x{} scale {:.2}", path.display(), small.w, small.h, scale))
     }
 
@@ -1442,6 +1470,11 @@ impl Service {
             steps
         };
         let window_spec = || args.first().map(String::as_str).or(flags.window.as_deref());
+        // Commands that change windows or the clipboard stop with every action on Ctrl+Alt+Esc.
+        let changes = matches!(command.as_str(), "focus" | "close" | "place") || (command == "clip" && !args.is_empty());
+        if changes && STOP.load(Ordering::Relaxed) {
+            return Err(STOPPED.into());
+        }
         match command.as_str() {
             "help" => Ok(HELP.into()),
             "windows" => self.windows_list(who, args.first()),

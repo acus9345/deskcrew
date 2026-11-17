@@ -619,6 +619,20 @@ pub fn handle(words: &[String]) -> Option<Result<String, String>> {
     })
 }
 
+/// Text made safe inside a PowerShell single-quoted string: PowerShell ends such a string at the
+/// typographic single quotes too, so each of them is doubled along with the plain one.
+#[cfg(windows)]
+fn ps_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -655,18 +669,4 @@ mod tests {
         assert!(handle(&["click".to_string(), "e1".to_string()]).is_none());
         assert!(handle(&["run".to_string(), "echo hi".to_string()]).is_some());
     }
-}
-
-/// Text made safe inside a PowerShell single-quoted string: PowerShell ends such a string at the
-/// typographic single quotes too, so each of them is doubled along with the plain one.
-#[cfg(windows)]
-fn ps_escape(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
-            out.push(c);
-        }
-        out.push(c);
-    }
-    out
 }

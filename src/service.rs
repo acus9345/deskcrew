@@ -194,12 +194,19 @@ struct Refs {
 impl Refs {
     /// The same control keeps its number across reads, even if the app rebuilt it.
     fn assign(&mut self, nodes: Vec<Node>) -> BTreeMap<u32, Node> {
+        // Controls the app kept claim their numbers first, so a new control with the same role
+        // and name never takes the number of one further down the window.
+        let mut taken = std::collections::HashSet::new();
+        let claimed: Vec<Option<u32>> = nodes
+            .iter()
+            .map(|node| self.by_runtime.get(&node.runtime).copied().filter(|id| !node.runtime.is_empty() && taken.insert(*id)))
+            .collect();
         let mut out: BTreeMap<u32, Node> = BTreeMap::new();
-        for node in nodes {
-            let known = self.by_runtime.get(&node.runtime).copied().filter(|id| !node.runtime.is_empty() && !out.contains_key(id));
+        for (node, known) in nodes.into_iter().zip(claimed) {
             let same = self.by_identity.entry(node.identity.clone()).or_default();
-            let id = known.or_else(|| same.iter().copied().find(|id| !out.contains_key(id))).unwrap_or_else(|| {
+            let id = known.or_else(|| same.iter().copied().find(|id| taken.insert(*id))).unwrap_or_else(|| {
                 self.next += 1;
+                taken.insert(self.next);
                 self.next
             });
             if !same.contains(&id) {
@@ -2546,20 +2553,6 @@ pub fn run() {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_flags_parsing_fill_and_close() {
-        let words = vec!["rect".to_string(), "10,10".to_string(), "50,50".to_string(), "--fill".to_string(), "--close".to_string()];
-        let (flags, rest) = parse(&words);
-        assert!(flags.fill);
-        assert!(flags.close);
-        assert_eq!(rest, vec!["rect", "10,10", "50,50"]);
-    }
-}
-
 /// Verbs that change windows or the clipboard outside an action's own checks: refused after the
 /// person pressed the stop keys, like every action. Closing the notification panel stays allowed.
 fn changes_things(verb: &str, args: &[String]) -> bool {
@@ -2578,4 +2571,18 @@ fn refuse_risky(chord: &real::Chord, spec: &str, flags: &Flags) -> Result<(), St
         return Err(format!("{spec} is refused: it can end the session or open the shell (--force to allow)"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_flags_parsing_fill_and_close() {
+        let words = vec!["rect".to_string(), "10,10".to_string(), "50,50".to_string(), "--fill".to_string(), "--close".to_string()];
+        let (flags, rest) = parse(&words);
+        assert!(flags.fill);
+        assert!(flags.close);
+        assert_eq!(rest, vec!["rect", "10,10", "50,50"]);
+    }
 }
