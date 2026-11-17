@@ -40,6 +40,9 @@ struct Tag {
 const LIGHT_TAG: f32 = 150.0;
 const DARK_TEXT: Rgb = (28, 28, 30);
 const TEXT_TINT: f32 = 0.08;
+/// A tag this dark or darker gets a faint light edge, so it still shows on a dark screen.
+const DARK_TAG: f32 = 100.0;
+const DARK_TAG_EDGE: f32 = 0.4;
 /// Room around the picture for the ring and its anti-aliased edge.
 const ROOM: f32 = 3.0;
 const OUTLINE_FILL: f32 = 0.18;
@@ -150,9 +153,13 @@ fn ink(mask: &Mask, colour: Rgb) -> Option<Pixmap> {
     Some(text)
 }
 
+fn lightness(colour: Rgb) -> f32 {
+    0.299 * colour.0 as f32 + 0.587 * colour.1 as f32 + 0.114 * colour.2 as f32
+}
+
 /// White text on a dark tag, dark text on a light one.
 fn text_colour(tag: Rgb) -> Rgb {
-    let light = 0.299 * tag.0 as f32 + 0.587 * tag.1 as f32 + 0.114 * tag.2 as f32;
+    let light = lightness(tag);
     let tint = |c: u8| (255.0 - (255.0 - c as f32) * TEXT_TINT).round() as u8;
     if light >= LIGHT_TAG { DARK_TEXT } else { (tint(tag.0), tint(tag.1), tint(tag.2)) }
 }
@@ -207,6 +214,10 @@ fn name_tag(canvas: &mut Pixmap, style: &Tag, colour: Rgb, label: &Mask, s: f32,
     let shrink = Transform::from_row(squeeze, 0.0, 0.0, squeeze, toward.0 * (1.0 - squeeze), toward.1 * (1.0 - squeeze));
     let tag = rounded(at.0, at.1, tag_w, tag_h, style.round * s)?;
     canvas.fill_path(&tag, &paint(colour, 1.0), FillRule::Winding, shrink, None);
+    if lightness(colour) <= DARK_TAG {
+        let edge = Stroke { width: s.max(1.0), ..Stroke::default() };
+        canvas.stroke_path(&tag, &paint((255, 255, 255), DARK_TAG_EDGE), &edge, shrink, None);
+    }
     let text = ink(label, text_colour(colour))?;
     let quality = if squeeze == 1.0 { FilterQuality::Nearest } else { FilterQuality::Bilinear };
     let place = shrink.pre_translate(at.0 + pad, (at.1 + (tag_h - label.h as f32) / 2.0).round());
@@ -440,14 +451,16 @@ mod tests {
         dark.push_rect(tiny_skia::Rect::from_xywh(480.0, 0.0, 480.0, 440.0).unwrap());
         dark.push_rect(tiny_skia::Rect::from_xywh(0.0, 440.0, 960.0, 150.0).unwrap());
         sheet.fill_path(&dark.finish().unwrap(), &paint((30, 30, 34), 1.0), FillRule::Winding, Transform::identity(), None);
-        let spots = [("Claude", (208, 111, 89), 40, 30), ("Mia", (162, 61, 134), 250, 30), ("Codex", (45, 190, 96), 40, 170), ("Claude", (208, 111, 89), 520, 30), ("Mia", (162, 61, 134), 730, 30), ("Cline", (250, 204, 21), 520, 170)];
-        for (name, colour, x, y) in spots {
-            let (picture, _, _) = cursor(colour, &crate::overlay::label_for_test(name, 17), 1.5).unwrap();
-            sheet.draw_pixmap(x, y, picture.as_ref(), &Default::default(), Transform::identity(), None);
+        let names = ["Claude", "Antigravity", "Cursor", "Codex", "Gemini", "Copilot", "Windsurf", "Kiro", "Amp", "Grok", "OpenCode", "Zed"];
+        for (at, name) in names.iter().enumerate() {
+            let (picture, _, _) = cursor(crate::motion::colour_for(name, &[]), &crate::overlay::label_for_test(name, 17), 1.5).unwrap();
+            for side in [0, 480] {
+                sheet.draw_pixmap(side + 20 + (at as i32 % 3) * 150, 20 + (at as i32 / 3) * 50, picture.as_ref(), &Default::default(), Transform::identity(), None);
+            }
         }
         for (x, colour) in [(250, (240, 48, 110)), (730, (217, 119, 87))] {
             let box_picture = press(colour, 130, 90, 1.5, PRESS_SETTLE_MS).unwrap();
-            sheet.draw_pixmap(x, 200, box_picture.as_ref(), &Default::default(), Transform::identity(), None);
+            sheet.draw_pixmap(x, 260, box_picture.as_ref(), &Default::default(), Transform::identity(), None);
         }
         for (at, ms) in [15.0, 45.0, 80.0, 110.0, 150.0, 200.0, 260.0, 320.0].into_iter().enumerate() {
             let frame = press((240, 48, 110), 105, 105, 1.0, ms).unwrap();

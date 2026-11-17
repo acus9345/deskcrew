@@ -70,7 +70,7 @@ fn tools() -> Value {
 /// The name an MCP client gives itself, as the cursor label people know it by.
 fn agent_name(client: &str) -> String {
     let lower = client.to_lowercase();
-    let known = [("claude-code", "Claude Code"), ("claude", "Claude"), ("codex", "Codex"), ("cursor", "Cursor"), ("gemini", "Gemini"), ("copilot", "Copilot"), ("visual studio code", "Copilot"), ("windsurf", "Windsurf"), ("cline", "Cline"), ("zed", "Zed")];
+    let known = [("claude-code", "Claude Code"), ("claude", "Claude"), ("codex", "Codex"), ("cursor", "Cursor"), ("gemini", "Gemini"), ("copilot", "Copilot"), ("visual studio code", "Copilot"), ("windsurf", "Windsurf"), ("cline", "Cline"), ("zed", "Zed"), ("antigravity", "Antigravity"), ("grok", "Grok"), ("kiro", "Kiro")];
     known.iter().find(|(part, _)| lower.contains(part)).map_or_else(|| client.to_string(), |(_, name)| name.to_string())
 }
 

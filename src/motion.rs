@@ -158,42 +158,51 @@ pub fn along(from: Point, middle: Point, to: Point, t: f32) -> Point {
 
 pub type Rgb = (u8, u8, u8);
 
-const PALETTE: [Rgb; 14] = [
-    (208, 111, 89),
-    (162, 61, 134),
-    (21, 101, 240),
-    (45, 190, 96),
-    (138, 92, 246),
-    (20, 184, 196),
+/// Every colour an agent can have, each unlike the rest. The first ones are the agents' own
+/// brands; the rest are for agents without a colour of their own.
+const PALETTE: [Rgb; 18] = [
+    (217, 119, 87),  // Claude: its orange
+    (24, 24, 27),    // Cursor: black
+    (49, 134, 255),  // Gemini: its blue
+    (16, 163, 127),  // Codex: ChatGPT's green
+    (217, 70, 239),  // Copilot: its magenta
+    (52, 232, 187),  // Windsurf: its teal
+    (30, 48, 96),    // Antigravity: dark with a little blue
+    (243, 78, 63),   // Amp: its coral
+    (144, 70, 255),  // Kiro: its purple
+    (82, 82, 91),    // Grok: charcoal
+    (203, 213, 225), // OpenCode: light grey
     (132, 204, 22),
-    (217, 70, 239),
-    (220, 38, 38),
+    (67, 56, 202),
     (56, 189, 248),
     (250, 204, 21),
     (161, 98, 60),
-    (148, 163, 184),
-    (67, 56, 202),
+    (20, 184, 196),
+    (236, 72, 153),
 ];
 
 /// Each coding agent's own place in the palette, by the first word of its name, so
 /// "Claude Code" and "Claude" match and a second "Claude 2" starts from the same colour.
-const AGENT_COLOURS: [(&str, usize); 16] = [
+const AGENT_COLOURS: [(&str, usize); 19] = [
     ("claude", 0),
     ("cursor", 1),
     ("gemini", 2),
-    ("fx", 2),
     ("codex", 3),
     ("copilot", 4),
     ("github", 4),
     ("windsurf", 5),
-    ("aider", 6),
+    ("antigravity", 6),
     ("amp", 7),
-    ("roo", 8),
-    ("continue", 9),
-    ("cline", 10),
-    ("goose", 11),
-    ("opencode", 12),
-    ("kiro", 13),
+    ("kiro", 8),
+    ("grok", 9),
+    ("opencode", 10),
+    ("aider", 11),
+    ("roo", 12),
+    ("continue", 13),
+    ("cline", 14),
+    ("goose", 15),
+    ("zed", 16),
+    ("fx", 17),
 ];
 
 /// A colour from the agent's name, so it keeps its colour between runs, skipping
@@ -749,14 +758,16 @@ mod tests {
         assert_eq!(colour_for("Claude Code", &[]), PALETTE[0]);
         assert_eq!(colour_for("cursor", &[]), PALETTE[1]);
         assert_eq!(colour_for("Gemini CLI", &[]), PALETTE[2]);
+        assert_eq!(colour_for("Codex", &[]), (16, 163, 127));
         assert_eq!(colour_for("GitHub Copilot", &[]), colour_for("Copilot", &[]));
     }
 
     #[test]
     fn every_agent_differs_from_the_rest() {
-        let names = ["Claude Code", "Cursor", "Gemini", "Codex", "Copilot", "Windsurf", "Aider", "Amp", "Roo Code", "Continue", "Cline", "Goose", "OpenCode", "Kiro"];
+        let names = ["Claude Code", "Cursor", "Gemini", "Codex", "Copilot", "Windsurf", "Antigravity", "Amp", "Kiro", "Grok", "OpenCode", "Aider", "Roo Code", "Continue", "Cline", "Goose", "Zed", "fx"];
         let colours: Vec<Rgb> = names.iter().map(|name| colour_for(name, &[])).collect();
         assert!(colours.iter().enumerate().all(|(at, colour)| !colours[..at].contains(colour)));
+        assert!(PALETTE.iter().enumerate().all(|(at, colour)| !PALETTE[..at].contains(colour)));
     }
 
     #[test]

@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- Each agent's cursor and name tag wear its own brand colour: Claude orange, Codex ChatGPT green, Gemini blue, Copilot magenta, Windsurf teal, Antigravity dark navy, Amp coral, Kiro purple, Cursor black, Grok charcoal and OpenCode light grey. A dark tag gets a faint light edge so it still shows on a dark screen. Antigravity, Grok and Zed are now recognised by name, and every known agent, the demo's included, has a colour no other agent shares.
+
 ## [0.1.27] - 2026-11-16
 
 - Linux gets `table`, `pick-file` and `notifications`, and the typing caret. Tested in CI on a GTK window under Xvfb: a three-row table, a GTK Open dialog filled from its location field, and a notification sent on the session bus.

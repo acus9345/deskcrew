@@ -59,7 +59,7 @@ pub fn agent(args: &mut Vec<String>) -> String {
 }
 
 /// Program names of the agents that set nothing in the environment.
-const AGENT_PROGRAMS: [(&str, &str); 13] = [
+const AGENT_PROGRAMS: [(&str, &str); 16] = [
     ("claude", "Claude Code"),
     ("cursor", "Cursor"),
     ("cursor-agent", "Cursor"),
@@ -73,6 +73,9 @@ const AGENT_PROGRAMS: [(&str, &str); 13] = [
     ("amp", "Amp"),
     ("kiro", "Kiro"),
     ("kiro-cli", "Kiro"),
+    ("antigravity", "Antigravity"),
+    ("grok", "Grok"),
+    ("zed", "Zed"),
 ];
 const MOST_ANCESTORS: usize = 16;
 
