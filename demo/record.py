@@ -7,7 +7,7 @@ Only the part of the screen the three windows cover is recorded, without the rea
 pointer. It takes over that part of the screen for about 20 seconds: run it while you are away.
 Needs ffmpeg (on PATH, or `pip install imageio-ffmpeg`).
 """
-import argparse, os, shutil, subprocess, sys, tempfile, threading, time
+import argparse, os, re, shutil, subprocess, sys, tempfile, threading, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HERE)
@@ -117,8 +117,10 @@ def main():
                 fit = lambda point: ','.join(str(int(int(n) * k)) for n in point.split(','))
                 words = ['draw', '; '.join(' '.join(fit(p) for p in stroke.split()) for stroke in words[1].split('; '))] + words[2:]
             reply = run(words + ['--agent', agent])
-            if words[0] == 'shot' and reply:
-                size = tuple(int(n) for n in reply.split()[-3].split('x'))
+            # The reply's first line ends "WxH scale S"; a note can follow on the next lines.
+            found = re.search(r' (\d+)x(\d+) scale ', reply or '') if words[0] == 'shot' else None
+            if found:
+                size = (int(found.group(1)), int(found.group(2)))
 
     for agent, commands in STEPS.items():
         t = threading.Thread(target=act, args=(agent, commands))
@@ -128,11 +130,16 @@ def main():
     for t in agents:
         t.join()
 
-    if recorder:
-        recorder.wait(SECONDS + 10)
-    for window in windows:
-        window.kill() if hasattr(window, 'kill') else None
-    run(['quit'])
+    try:
+        if recorder:
+            recorder.wait(SECONDS + 10)
+    finally:
+        # Even if the recording hangs, nothing is left covering the screen.
+        if recorder and recorder.poll() is None:
+            recorder.kill()
+        for window in windows:
+            window.kill() if hasattr(window, 'kill') else None
+        run(['quit'])
     print('order log:', open(log, encoding='utf-8-sig').read() if os.path.exists(log) else 'none')
     if args.hidden:
         for name in os.listdir(work):

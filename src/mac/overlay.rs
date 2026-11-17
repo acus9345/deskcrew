@@ -316,6 +316,9 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                         for agent in agents.values() {
                             if on { agent.layer.hide() } else { agent.layer.stack(agent.above) }
                         }
+                        for press in &presses {
+                            if on { press.layer.hide() } else { press.layer.stack(press.above) }
+                        }
                     }
                 }
             }

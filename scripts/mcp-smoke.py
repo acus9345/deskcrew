@@ -2,10 +2,14 @@
 
     python scripts/mcp-smoke.py path/to/deskcrew
 """
-import json, os, subprocess, sys
+import json, os, subprocess, sys, threading
 
 server = subprocess.Popen([os.path.abspath(sys.argv[1]), 'mcp'], stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, encoding='utf-8')
 asked = 0
+# A server that stops answering fails the check in a minute rather than hanging CI for hours.
+watchdog = threading.Timer(60, server.kill)
+watchdog.daemon = True
+watchdog.start()
 
 
 def ask(method, params=None):
@@ -13,7 +17,9 @@ def ask(method, params=None):
     asked += 1
     server.stdin.write(json.dumps({'jsonrpc': '2.0', 'id': asked, 'method': method, 'params': params or {}}) + '\n')
     server.stdin.flush()
-    reply = json.loads(server.stdout.readline())
+    line = server.stdout.readline()
+    assert line, f'no reply to {method}: the server stopped answering'
+    reply = json.loads(line)
     assert reply.get('id') == asked, reply
     return reply
 
@@ -29,4 +35,5 @@ assert missing['isError'], missing
 assert 'error' in ask('no/such/method')
 server.stdin.close()
 server.wait(10)
+watchdog.cancel()
 print('mcp ok:', ', '.join(names), '-', version['content'][0]['text'])

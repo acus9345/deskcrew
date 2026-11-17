@@ -160,7 +160,7 @@ pub fn scroll(pid: i32, x: f64, y: f64, lines: i32) -> Result<(), String> {
 pub fn type_text(to: To, text: &str, stop: &dyn Fn() -> bool) -> Result<usize, String> {
     let units: Vec<u16> = text.encode_utf16().collect();
     let mut sent = 0;
-    for piece in units.chunks(TYPE_PIECE) {
+    for piece in pieces(text) {
         if stop() {
             break;
         }
@@ -175,6 +175,20 @@ pub fn type_text(to: To, text: &str, stop: &dyn Fn() -> bool) -> Result<usize, S
         thread::sleep(crate::motion::KEY_EVERY * piece.len() as u32);
     }
     Ok(String::from_utf16_lossy(&units[..sent]).chars().count())
+}
+
+/// The text in runs of at most TYPE_PIECE UTF-16 units, never cutting a character in two.
+fn pieces(text: &str) -> Vec<Vec<u16>> {
+    let mut out: Vec<Vec<u16>> = Vec::new();
+    let mut buffer = [0u16; 2];
+    for c in text.chars() {
+        let units = c.encode_utf16(&mut buffer);
+        match out.last_mut() {
+            Some(piece) if piece.len() + units.len() <= TYPE_PIECE => piece.extend_from_slice(units),
+            _ => out.push(units.to_vec()),
+        }
+    }
+    out
 }
 
 /// A key and its modifiers, from text such as "cmd+s" or "enter". A modifier on its own,
@@ -316,5 +330,13 @@ mod tests {
         assert!(is_risky(&chord("cmd+q").unwrap()));
         assert!(!is_risky(&chord("cmd+c").unwrap()));
         assert_eq!(modifiers("ctrl+shift").unwrap(), kCGEventFlagMaskControl | kCGEventFlagMaskShift);
+    }
+
+    #[test]
+    fn typing_never_cuts_a_character_in_two() {
+        let text = format!("{}\u{1F600}b", "a".repeat(TYPE_PIECE - 1));
+        let pieces = pieces(&text);
+        assert!(pieces.iter().all(|piece| piece.len() <= TYPE_PIECE && String::from_utf16(piece).is_ok()), "{pieces:?}");
+        assert_eq!(pieces.concat(), text.encode_utf16().collect::<Vec<_>>());
     }
 }

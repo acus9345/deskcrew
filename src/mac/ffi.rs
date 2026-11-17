@@ -74,6 +74,7 @@ pub const kAXValueCGPointType: i32 = 1;
 pub const kAXValueCGSizeType: i32 = 2;
 pub const kAXErrorSuccess: AXError = 0;
 
+pub const kCGWindowListOptionAll: u32 = 0;
 pub const kCGWindowListOptionOnScreenOnly: u32 = 1 << 0;
 pub const kCGWindowListOptionIncludingWindow: u32 = 1 << 3;
 pub const kCGWindowListExcludeDesktopElements: u32 = 1 << 4;
@@ -91,6 +92,9 @@ pub const kCGEventMouseMoved: u32 = 5;
 pub const kCGEventLeftMouseDragged: u32 = 6;
 pub const kCGEventRightMouseDragged: u32 = 7;
 pub const kCGEventKeyDown: u32 = 10;
+/// What an event tap hears when macOS has switched it off.
+pub const kCGEventTapDisabledByTimeout: u32 = 0xFFFF_FFFE;
+pub const kCGEventTapDisabledByUserInput: u32 = 0xFFFF_FFFF;
 pub const kCGEventOtherMouseDown: u32 = 25;
 pub const kCGEventOtherMouseUp: u32 = 26;
 pub const kCGEventOtherMouseDragged: u32 = 27;
@@ -253,6 +257,7 @@ unsafe extern "C" {
     pub fn CGEventPost(tap: u32, event: CGEventRef);
     pub fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     pub fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, callback: CGEventTapCallBack, info: *mut c_void) -> *mut c_void;
+    pub fn CGEventTapEnable(tap: *mut c_void, enable: bool);
 }
 
 #[link(name = "CoreText", kind = "framework")]

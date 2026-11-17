@@ -36,11 +36,11 @@ def clean_env(extra_path, config=None, keep_deskcrew=True):
     return env
 
 
-def fresh_config(work):
+def fresh_config():
     """A config folder with only the sign-in, so the person's own CLAUDE.md, skills, plugins and
-    MCP servers stay out of the run. It is deleted after the run."""
-    config = os.path.join(work, 'config')
-    os.makedirs(config)
+    MCP servers stay out of the run. It sits in the person's own temp folder, which other accounts
+    cannot read, never in the shared work folder, and is deleted after the run."""
+    config = tempfile.mkdtemp(prefix='deskcrew-bench-config-')
     shutil.copy(os.path.expanduser('~/.claude/.credentials.json'), os.path.join(config, '.credentials.json'))
     return config
 
@@ -174,7 +174,7 @@ def verify(task, log, answer):
         wrong = [k for k, v in want.items() if o.get(k) != v]
         if wrong:
             return False, 'wrong ' + ', '.join(f'{k}={o.get(k)!r}' for k in wrong)
-        if str(o['number']) not in answer:
+        if not re.search(rf'(?<!\d){o["number"]}(?!\d)', answer):
             return False, 'order number not reported'
         return True, 'ok'
     checks = [e for e in events if e.get('event') == 'check']
@@ -209,7 +209,7 @@ def one_run(args, desk, n):
     # A service of the same version may already run on this desktop: start from a fresh one.
     for stop in setup.get('cleanup', []):
         desk.run(stop, env=clean_env(setup.get('path')), timeout=30)
-    config = fresh_config(work)
+    config = fresh_config()
     try:
         proc = desk.start(line, cwd=work, env=clean_env(setup.get('path'), config, args.tool == 'deskcrew'), out=out)
         lines, wall = tail(out, proc, args.timeout)

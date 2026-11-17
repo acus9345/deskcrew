@@ -16,9 +16,18 @@ pub struct Window {
 
 /// Ordinary app windows on screen, front first. Menus, the Dock and overlays sit on other layers.
 pub fn list() -> Vec<Window> {
+    windows(kCGWindowListOptionOnScreenOnly, None)
+}
+
+/// One window by number, on screen or not: a minimized window is still there to restore.
+pub fn find(id: u32) -> Option<Window> {
+    windows(kCGWindowListOptionAll, Some(id)).into_iter().next()
+}
+
+fn windows(options: u32, only: Option<u32>) -> Vec<Window> {
     let mut out = Vec::new();
     unsafe {
-        let Some(info) = Owned::new(CGWindowListCopyWindowInfo(kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements, kCGNullWindowID)) else {
+        let Some(info) = Owned::new(CGWindowListCopyWindowInfo(options | kCGWindowListExcludeDesktopElements, kCGNullWindowID)) else {
             return out;
         };
         let me = std::process::id() as i32;
@@ -28,7 +37,7 @@ pub fn list() -> Vec<Window> {
                 continue;
             }
             let (Some(id), Some(pid)) = (number(kCGWindowNumber), number(kCGWindowOwnerPID)) else { continue };
-            if pid as i32 == me {
+            if pid as i32 == me || only.is_some_and(|only| only != id as u32) {
                 continue;
             }
             let mut bounds = CGRect::default();
@@ -56,10 +65,6 @@ pub fn list() -> Vec<Window> {
         }
     }
     out
-}
-
-pub fn find(id: u32) -> Option<Window> {
-    list().into_iter().find(|w| w.id == id)
 }
 
 /// The accessibility element for a window number.

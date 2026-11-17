@@ -68,6 +68,8 @@ const PASTE_SETTLE: Duration = Duration::from_millis(150);
 const MENU_OPEN: Duration = Duration::from_millis(200);
 const MENU_DEPTH: usize = 3;
 const LIST_DEPTH: usize = 4;
+/// How far above a matched cell text to look for its selectable row.
+const ROW_UP: usize = 3;
 const LEAST_CHANGE: u32 = 4;
 const STOPPED: &str = "stopped by the person with Ctrl+Option+Esc: ask them before doing more (deskcrew resume clears it)";
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
@@ -534,11 +536,16 @@ impl Service {
 
     /// Let go of held keys: everyone's, or only those held too long or since Ctrl+Option+Esc.
     fn release(&self, all: bool) -> Vec<String> {
+        self.release_where(|_| all)
+    }
+
+    /// Let go of the keys of agents `chosen` picks, and of any held too long or since Ctrl+Option+Esc.
+    fn release_where(&self, chosen: impl Fn(&str) -> bool) -> Vec<String> {
         let stopped = STOP.load(Ordering::Relaxed);
         let mut held = self.held.lock().unwrap();
         let mut gone = Vec::new();
         held.retain(|who, keys| {
-            let keep = !all && !stopped && keys.since.elapsed() < HOLD_MOST;
+            let keep = !chosen(who) && !stopped && keys.since.elapsed() < HOLD_MOST;
             if !keep {
                 let _ = input::modifiers_changed(keys.pid, keys.flags, false);
                 gone.push(who.clone());
@@ -674,10 +681,18 @@ impl Service {
             return Err(format!("no entry named '{item}'"));
         }
         let entry = ax::find_named(&element, item, LIST_DEPTH).ok_or(format!("no entry named '{item}'"))?;
-        if ax::settable(&entry, "AXSelected") {
-            ax::set_bool(&entry, "AXSelected", true)?;
-        } else {
-            ax::perform(&entry, "AXPress")?;
+        // A table or outline row has no text of its own: the match is the text in one of its
+        // cells, and the row around it is what gets selected.
+        let mut row = Some(entry.clone());
+        for _ in 0..ROW_UP {
+            match row {
+                Some(ref at) if !ax::settable(at, "AXSelected") => row = ax::attribute(at, "AXParent"),
+                _ => break,
+            }
+        }
+        match row.filter(|at| ax::settable(at, "AXSelected")) {
+            Some(at) => ax::set_bool(&at, "AXSelected", true)?,
+            None => ax::perform(&entry, "AXPress")?,
         }
         Ok("select".into())
     }
@@ -700,7 +715,10 @@ impl Service {
         if flags.paste {
             let before = field.as_ref().and_then(|f| ax::text(f, "AXValue"));
             let mut saved = apps::SavedClipboard::take();
-            saved.lend(text)?;
+            if let Err(error) = saved.lend(text) {
+                let _ = saved.put_back();
+                return Err(error);
+            }
             let paste = input::chord("cmd+v");
             let sent = paste.and_then(|paste| {
                 if flags.real {
@@ -748,7 +766,8 @@ impl Service {
             input::type_text(input::To::App(tracked.pid), rest, &stop)?
         };
         if typed < rest.chars().count() {
-            return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
+            let first = text.chars().count() - rest.chars().count();
+            return Err(format!("{STOPPED} (typed {} of {} characters)", first + typed, text.chars().count()));
         }
         if let Some(field) = field
             && !flags.real
@@ -793,6 +812,10 @@ impl Service {
         }
         input::modifiers_changed(tracked.pid, chord.flags, true)?;
         let mut held = self.held.lock().unwrap();
+        // One agent holds keys in one app at a time: keys it held in another app go up first.
+        if let Some(old) = held.get(who).filter(|h| h.pid != tracked.pid) {
+            let _ = input::modifiers_changed(old.pid, old.flags, false);
+        }
         let flags = held.get(who).filter(|h| h.pid == tracked.pid).map_or(0, |h| h.flags) | chord.flags;
         held.insert(who.to_string(), Held { pid: tracked.pid, flags, since: Instant::now() });
         Ok("held".into())
@@ -1202,6 +1225,13 @@ impl Service {
             origin = (rect.0.max(left), rect.1.max(top));
         }
         let hash = frame.hash();
+        // The view before the agents: every other command takes the two locks in that order.
+        let marked: Vec<(u32, Bounds)> = if flags.marks {
+            let view = tracked.view.lock().unwrap();
+            view.nodes.iter().filter(|(_, node)| MARKED.contains(&node.parts.role.as_str())).map(|(id, node)| (*id, node.rect)).collect()
+        } else {
+            Vec::new()
+        };
         let mut agents = self.agents.lock().unwrap();
         let state = agents.entry(who.to_string()).or_default();
         let last = state.shots.get(&tracked.window);
@@ -1220,10 +1250,8 @@ impl Service {
         let per_pixel = scale * units;
         if flags.marks {
             let to_image = |value: i32, from: i32| ((value - from) as f32 / per_pixel) as i32;
-            let view = tracked.view.lock().unwrap();
-            for (id, node) in view.nodes.iter().filter(|(_, node)| MARKED.contains(&node.parts.role.as_str())) {
-                let (x, y, w, h) = node.rect;
-                small.mark(to_image(x, origin.0), to_image(y, origin.1), (w as f32 / per_pixel) as i32, (h as f32 / per_pixel) as i32, *id);
+            for (id, (x, y, w, h)) in marked {
+                small.mark(to_image(x, origin.0), to_image(y, origin.1), (w as f32 / per_pixel) as i32, (h as f32 / per_pixel) as i32, id);
             }
         }
         if flags.rulers {
@@ -1376,8 +1404,8 @@ impl Service {
                 Ok(names.join("\n"))
             }
             "up" => {
-                let gone = self.release(true);
-                Ok(if gone.is_empty() { "nothing was held".into() } else { format!("let go of keys held by {}", gone.join(", ")) })
+                let gone = self.release_where(|holder| holder == who);
+                Ok(if gone.iter().any(|holder| holder == who) { "let go".into() } else { "nothing was held".into() })
             }
             "cursor" => Err("the Mac version never borrows the cursor, so there is nothing to set".into()),
             "notifications" => Err("notifications are not on the Mac version yet".into()),
@@ -1439,8 +1467,19 @@ impl Service {
     }
 }
 
+static STOP_TAP: std::sync::atomic::AtomicPtr<c_void> = std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
 /// Ctrl+Option+Esc, seen by a listen-only tap: it can never block or change the person's keys.
 extern "C" fn watch_keys(_proxy: *mut c_void, kind: u32, event: CGEventRef, _info: *mut c_void) -> CGEventRef {
+    // macOS switches a tap off when it thinks it is slow: turn it straight back on, or the stop
+    // keys would quietly stop working.
+    if kind == kCGEventTapDisabledByTimeout || kind == kCGEventTapDisabledByUserInput {
+        let tap = STOP_TAP.load(Ordering::Relaxed);
+        if !tap.is_null() {
+            unsafe { CGEventTapEnable(tap, true) };
+        }
+        return event;
+    }
     if kind == kCGEventKeyDown && !event.is_null() {
         let code = unsafe { CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) };
         let flags = unsafe { CGEventGetFlags(event) };
@@ -1458,6 +1497,7 @@ fn watch_stop_keys() {
         if tap.is_null() {
             return;
         }
+        STOP_TAP.store(tap, Ordering::Relaxed);
         let source = CFMachPortCreateRunLoopSource(std::ptr::null(), tap, 0);
         if !source.is_null() {
             CFRunLoopAddSource(CFRunLoopGetMain(), source, kCFRunLoopCommonModes);
