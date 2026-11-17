@@ -404,7 +404,7 @@ mod tests {
             let now = start + Duration::from_millis(ms);
             pose.follow(now, at, scale);
             let (lean, squeeze) = pose.shown(now);
-            let (picture, x, y) = posed((208, 111, 89), &label, scale, lean, squeeze).unwrap();
+            let (picture, x, y) = posed((217, 119, 87), &label, scale, lean, squeeze).unwrap();
             let mut sheet = Pixmap::new(width, height).unwrap();
             sheet.fill(Color::from_rgba8(250, 249, 246, 255));
             sheet.draw_pixmap(at.0 as i32 - x, at.1 as i32 - y, picture.as_ref(), &Default::default(), Transform::identity(), None);

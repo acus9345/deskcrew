@@ -1,6 +1,6 @@
 """Count the pixels of one colour in an X window dump, to check the drawn cursors show.
 
-    xwd -root -silent | python3 scripts/xwd-colour.py 208 111 89
+    xwd -root -silent | python3 scripts/xwd-colour.py 217 119 87
 
 Prints the count. Reads the XWD format directly, so it needs nothing beyond Python.
 """
