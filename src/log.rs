@@ -18,8 +18,12 @@ pub fn path() -> PathBuf {
 
 /// Add one command and how it went.
 pub fn record(who: &str, words: &[String], ok: bool, reply: &str) {
-    let first = reply.lines().next().unwrap_or("").trim();
-    let first: String = first.chars().take(REPLY_CHARS).collect();
+    // A reply that is content, such as the clipboard or a file, is kept as its length only.
+    let first: String = if crate::trace::reads_content(words) {
+        length(reply)
+    } else {
+        reply.lines().next().unwrap_or("").trim().chars().take(REPLY_CHARS).collect()
+    };
     let line = format!("{} {} {} {}  ->  {}\n", now(), quoted(who), if ok { "ok" } else { "failed" }, hidden(words), first);
     let file = path();
     if let Some(folder) = file.parent() {
@@ -28,7 +32,11 @@ pub fn record(who: &str, words: &[String], ok: bool, reply: &str) {
     if fs::metadata(&file).is_ok_and(|m| m.len() > KEEP_BYTES)
         && let Ok(text) = fs::read_to_string(&file)
     {
-        let half = text.len() / 2;
+        // The middle, moved on to a character's start: a byte inside one cannot be cut at.
+        let mut half = text.len() / 2;
+        while !text.is_char_boundary(half) {
+            half += 1;
+        }
         let cut = text[half..].find('\n').map(|at| half + at + 1).unwrap_or(half);
         let _ = fs::write(&file, &text[cut..]);
     }

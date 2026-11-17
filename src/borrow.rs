@@ -26,6 +26,8 @@ use windows_sys::Win32::{
 };
 
 const ANSWER_MS: u32 = 60_000;
+/// How recent the person's own input must be for a button press on the prompt to count.
+const PERSON_CLICK_MS: u32 = 1_000;
 const FIRST_BUTTON: i32 = 100;
 const EVERY_AGENT: &str = "*";
 const OFF: &str = "the person has not let agents borrow the cursor. They can allow it by running: deskcrew cursor ask";
@@ -39,11 +41,13 @@ fn wide(text: &str) -> Vec<u16> {
 unsafe extern "system" fn answer(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match message {
-            WM_COMMAND => {
+            // Only the person's own click answers: a message any program can post does not.
+            WM_COMMAND if clicked_by_person(hwnd) => {
                 ANSWER.store((w & 0xFFFF) as i32 - FIRST_BUTTON, Ordering::SeqCst);
                 DestroyWindow(hwnd);
                 0
             }
+            WM_COMMAND => 0,
             WM_TIMER | WM_CLOSE => {
                 DestroyWindow(hwnd);
                 0
@@ -54,6 +58,28 @@ unsafe extern "system" fn answer(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM)
             }
             _ => DefWindowProcW(hwnd, message, w, l),
         }
+    }
+}
+
+/// Whether the real pointer is on the prompt and the person used the mouse or keyboard just now:
+/// a button press another program posts moves neither.
+fn clicked_by_person(hwnd: HWND) -> bool {
+    use windows_sys::Win32::{
+        Foundation::{POINT, RECT},
+        System::SystemInformation::GetTickCount,
+        UI::{
+            Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
+            WindowsAndMessaging::{GetCursorPos, GetWindowRect},
+        },
+    };
+    unsafe {
+        let (mut at, mut rect): (POINT, RECT) = (std::mem::zeroed(), std::mem::zeroed());
+        let mut last = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
+        if GetCursorPos(&mut at) == 0 || GetWindowRect(hwnd, &mut rect) == 0 || GetLastInputInfo(&mut last) == 0 {
+            return false;
+        }
+        let inside = at.x >= rect.left && at.x < rect.right && at.y >= rect.top && at.y < rect.bottom;
+        inside && GetTickCount().wrapping_sub(last.dwTime) < PERSON_CLICK_MS
     }
 }
 

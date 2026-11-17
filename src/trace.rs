@@ -110,7 +110,9 @@ fn events(dir: &Path) -> Vec<Value> {
 
 /// A reply with what was read or typed left out: values after `=`, and the whole of a reply that
 /// is content, such as `get` or `fetch`.
-fn redact(words: &[String], reply: &str) -> String {
+/// Whether a command's whole reply is content from the screen, files, the web or the system,
+/// such as `get`, `clip` or `fetch`, which records keep only the length of.
+pub fn reads_content(words: &[String]) -> bool {
     let command = verb(words);
     let clip_read = command == "clip" && !words.iter().any(|w| w == "set" || w == "clear");
     let file_read = command == "file" && words.iter().any(|w| w == "read" || w == "find");
@@ -121,7 +123,11 @@ fn redact(words: &[String], reply: &str) -> String {
         CONTENT.contains(&first) && (first != "clip" || parts.next().is_none_or(|next| next != "set" && next != "clear"))
     };
     let do_reads = command == "do" && words.iter().skip_while(|w| *w != "do").skip(1).any(|script| script.split(';').any(|step| reads(step.trim())));
-    if (CONTENT.contains(&command) && (command != "clip" || clip_read)) || file_read || do_reads {
+    (CONTENT.contains(&command) && (command != "clip" || clip_read)) || file_read || do_reads
+}
+
+fn redact(words: &[String], reply: &str) -> String {
+    if reads_content(words) {
         return format!("<{} characters>", reply.chars().count());
     }
     let mut lines: Vec<String> = reply.lines().take(REPLY_LINES).map(redact_line).collect();

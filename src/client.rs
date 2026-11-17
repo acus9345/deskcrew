@@ -237,7 +237,12 @@ pub fn run(mut args: Vec<String>) -> i32 {
             let _ = out.write_all(b"\n");
             reply[0] as i32
         }
-        Ok(_) => 1,
+        Ok(_) => {
+            let error = "the deskcrew service sent nothing back";
+            log_reply(false, error);
+            eprintln!("{error}");
+            1
+        }
         Err(error) => {
             log_reply(false, &error);
             eprintln!("{error}");

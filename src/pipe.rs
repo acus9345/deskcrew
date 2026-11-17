@@ -8,7 +8,7 @@ use windows_sys::Win32::{
     },
     System::{
         Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
             PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
         },
         RemoteDesktop::ProcessIdToSessionId,
@@ -52,6 +52,36 @@ fn read_desktop() -> String {
     String::from_utf16_lossy(&name[..end]).chars().filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_').collect()
 }
 
+/// The account a process runs as, as the bytes of its security id.
+fn account_of(pid: u32) -> Option<Vec<u8>> {
+    use windows_sys::Win32::{
+        Security::{GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
+        System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
+    };
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
+        if process.is_null() {
+            return None;
+        }
+        let mut token = std::ptr::null_mut();
+        let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
+        CloseHandle(process);
+        if opened == 0 {
+            return None;
+        }
+        // A TOKEN_USER and the SID it points into, aligned for the struct.
+        let mut buffer = vec![0u64; 64];
+        let mut needed = 0;
+        let read = GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), (buffer.len() * 8) as u32, &mut needed);
+        CloseHandle(token);
+        if read == 0 {
+            return None;
+        }
+        let sid = (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid;
+        Some(std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize).to_vec())
+    }
+}
+
 pub struct Pipe(HANDLE);
 
 // One thread uses a pipe at a time; it only crosses to the thread that serves it.
@@ -82,7 +112,15 @@ impl Pipe {
                 CreateFileW(name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, 0, std::ptr::null_mut())
             };
             if handle != INVALID_HANDLE_VALUE {
-                return Ok(Pipe(handle));
+                let pipe = Pipe(handle);
+                // Pipe names are shared by every account on the computer: commands, typed text
+                // among them, only go to a service running as this same account.
+                let mut server = 0;
+                let same = unsafe { GetNamedPipeServerProcessId(handle, &mut server) } != 0 && account_of(server).is_some_and(|theirs| Some(theirs) == account_of(unsafe { GetCurrentProcessId() }));
+                if !same {
+                    return Err(io::Error::new(io::ErrorKind::PermissionDenied, "the deskcrew pipe belongs to another account's program: not sending it anything"));
+                }
+                return Ok(pipe);
             }
             if unsafe { GetLastError() } != ERROR_PIPE_BUSY {
                 return Err(io::Error::last_os_error());
