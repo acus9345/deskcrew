@@ -92,7 +92,12 @@ fn image_name(pid: u32) -> String {
             return String::new();
         }
         let path = utf16(&buffer[..size as usize]);
-        path.rsplit('\\').next().unwrap_or("").trim_end_matches(".exe").to_string()
+        let name = path.rsplit('\\').next().unwrap_or("");
+        // Office and others are stored in capitals: WINWORD.EXE is winword too.
+        match name.len().checked_sub(4).and_then(|cut| Some((cut, name.get(cut..)?))) {
+            Some((cut, extension)) if extension.eq_ignore_ascii_case(".exe") => name[..cut].to_string(),
+            _ => name.to_string(),
+        }
     }
 }
 

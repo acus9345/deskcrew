@@ -81,11 +81,16 @@ fn start(app: &str, args: &str) -> Result<(), String> {
     if let Some(alias) = alias.filter(|path| path.exists()) {
         return shell_open(&alias.to_string_lossy(), args);
     }
+    // A Start Menu entry opened through Explorer takes no arguments, so with arguments the app's
+    // own name (App Paths, PATH) goes first, and an entry that is a program file is run directly.
+    if !args.is_empty() && shell_open(app, args).is_ok() {
+        return Ok(());
+    }
     let apps = start_menu();
     if let Some((_, id)) = apps.iter().find(|(name, _)| name.to_lowercase() == lower) {
-        return shell_open("explorer.exe", &format!(r"shell:AppsFolder\{id}"));
+        return open_entry(id, args);
     }
-    if shell_open(app, args).is_ok() {
+    if args.is_empty() && shell_open(app, args).is_ok() {
         return Ok(());
     }
     let close: Vec<&str> = apps.iter().filter(|(name, _)| name.to_lowercase().contains(&lower)).map(|(name, _)| name.as_str()).collect();
@@ -93,10 +98,19 @@ fn start(app: &str, args: &str) -> Result<(), String> {
         [] => Err(format!("no app named '{app}' in the Start Menu or on PATH")),
         [only] => {
             let found = apps.iter().find(|(name, _)| name == only);
-            shell_open("explorer.exe", &format!(r"shell:AppsFolder\{}", found.map_or("", |(_, id)| id)))
+            open_entry(found.map_or("", |(_, id)| id), args)
         }
         many => Err(format!("'{app}' could be: {}", many.iter().take(8).copied().collect::<Vec<_>>().join(", "))),
     }
+}
+
+/// Open a Start Menu entry: a program file directly, so it gets its arguments, and anything else
+/// (Store apps, shortcuts by id) through Explorer.
+fn open_entry(id: &str, args: &str) -> Result<(), String> {
+    if !args.is_empty() && id.to_lowercase().ends_with(".exe") && std::path::Path::new(id).exists() {
+        return shell_open(id, args);
+    }
+    shell_open("explorer.exe", &format!(r"shell:AppsFolder\{id}"))
 }
 
 /// Start an app and return its first new window, if one appears in time. Unless `front` is set,

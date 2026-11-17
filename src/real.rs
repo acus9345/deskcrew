@@ -198,35 +198,64 @@ enum Held {
     Mouse(Button),
 }
 
-static HELD: Mutex<Vec<Held>> = Mutex::new(Vec::new());
+/// What is held down, and which agent holds it.
+static HELD: Mutex<Vec<(String, Held)>> = Mutex::new(Vec::new());
 static HOLDS: AtomicU64 = AtomicU64::new(0);
 
-fn hold(held: Held) {
-    HELD.lock().unwrap().push(held);
+/// The real keyboard and mouse are shared, so only one agent holds anything at a time.
+fn may_hold(who: &str) -> Result<(), String> {
+    match HELD.lock().unwrap().iter().find(|(holder, _)| holder != who) {
+        Some((holder, _)) => Err(format!("{holder} is holding a key or button: wait for it to let go")),
+        None => Ok(()),
+    }
+}
+
+fn hold(who: &str, held: Held) {
+    HELD.lock().unwrap().push((who.to_string(), held));
     let this = HOLDS.fetch_add(1, Ordering::Relaxed) + 1;
+    let who = who.to_string();
     thread::spawn(move || {
         thread::sleep(HOLD_LIMIT);
         if HOLDS.load(Ordering::Relaxed) == this {
-            release_all();
+            release_of(&who);
         }
     });
 }
 
 /// Keys stay down across commands, so they let go by themselves if the agent forgets.
-pub fn hold_keys(chord: &Chord) {
+pub fn hold_keys(who: &str, chord: &Chord) -> Result<(), String> {
+    may_hold(who)?;
     set_keys(chord, true);
-    hold(Held::Keys(chord.keys.clone()));
+    hold(who, Held::Keys(chord.keys.clone()));
+    Ok(())
 }
 
-pub fn hold_button(x: i32, y: i32, button: Button) {
+pub fn hold_button(who: &str, x: i32, y: i32, button: Button) -> Result<(), String> {
+    may_hold(who)?;
     move_to(x, y);
     thread::sleep(ARRIVE);
     press_button(button, true);
-    hold(Held::Mouse(button));
+    hold(who, Held::Mouse(button));
+    Ok(())
 }
 
+/// Let go of what one agent holds.
+pub fn release_of(who: &str) -> usize {
+    release(|holder| holder == who)
+}
+
+/// Let go of everything every agent holds.
 pub fn release_all() -> usize {
-    let held: Vec<Held> = HELD.lock().unwrap().drain(..).collect();
+    release(|_| true)
+}
+
+fn release(chosen: impl Fn(&str) -> bool) -> usize {
+    let held: Vec<Held> = {
+        let mut all = HELD.lock().unwrap();
+        let (gone, kept): (Vec<_>, Vec<_>) = all.drain(..).partition(|(holder, _)| chosen(holder));
+        *all = kept;
+        gone.into_iter().map(|(_, held)| held).collect()
+    };
     for item in held.iter().rev() {
         match item {
             Held::Keys(keys) => set_keys(&Chord { keys: keys.clone(), modified: false }, false),
@@ -289,7 +318,7 @@ fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
         "ctrl" | "control" => (VK_CONTROL, false),
         "shift" => (VK_SHIFT, false),
         "alt" => (VK_MENU, false),
-        "win" | "meta" | "cmd" => (VK_LWIN, true),
+        "win" | "meta" | "cmd" | "windows" | "super" => (VK_LWIN, true),
         _ => {
             if let Some(number) = lower.strip_prefix('f').and_then(|n| n.parse::<u16>().ok())
                 && (1..=24).contains(&number) {
@@ -342,16 +371,22 @@ pub fn chord(spec: &str) -> Result<Chord, String> {
     Ok(Chord { modified: keys.len() > 1, keys })
 }
 
-/// Extra modifiers do not make a shortcut safe, so ctrl+alt+f4 counts as alt+f4.
+/// Extra modifiers do not make a shortcut safe, so ctrl+alt+f4 counts as alt+f4. Keys are
+/// compared once parsed, so alt+f04 is alt+f4 too.
+#[cfg(test)]
 pub fn is_risky(spec: &str) -> bool {
-    let name = |key: &str| match key.trim().to_lowercase().as_str() {
-        "escape" => "esc".to_string(),
-        "control" => "ctrl".to_string(),
-        "cmd" | "meta" | "windows" | "super" => "win".to_string(),
-        other => other.to_string(),
-    };
-    let pressed: Vec<String> = spec.split('+').map(name).collect();
-    RISKY.iter().any(|risky| risky.split('+').all(|key| pressed.iter().any(|down| down == key)))
+    chord(spec).is_ok_and(|parsed| is_risky_chord(&parsed))
+}
+
+/// Whether pressing this chord, with any keys agents already hold down, makes a risky shortcut.
+pub fn is_risky_chord(pressed: &Chord) -> bool {
+    let mut down: Vec<VIRTUAL_KEY> = pressed.keys.iter().map(|(vk, _)| *vk).collect();
+    for (_, held) in HELD.lock().unwrap().iter() {
+        if let Held::Keys(keys) = held {
+            down.extend(keys.iter().map(|(vk, _)| *vk));
+        }
+    }
+    RISKY.iter().any(|risky| chord(risky).is_ok_and(|risky| risky.keys.iter().all(|(vk, _)| down.contains(vk))))
 }
 
 /// Real keys go to whatever has focus, so they are only sent while the target still has it.
@@ -490,6 +525,8 @@ mod tests {
         assert!(is_risky("ctrl+win+l"));
         assert!(is_risky("cmd+r"));
         assert!(!is_risky("alt+f5"));
+        assert!(is_risky("alt+f04"));
+        assert!(is_risky("super+r"));
     }
 
     #[test]

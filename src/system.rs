@@ -42,6 +42,40 @@ fn cut(text: &str) -> String {
     format!("{kept}\n... cut at {MAX_OUTPUT} characters")
 }
 
+/// How long output may keep coming after the command itself has ended.
+const PIPE_GRACE: Duration = Duration::from_millis(500);
+
+/// A pipe read on its own thread, so what has come can be taken without waiting for its end.
+struct Collected {
+    kept: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    finished: std::sync::mpsc::Receiver<()>,
+}
+
+impl Collected {
+    /// What came, once the pipe ends or the deadline passes, whichever is first.
+    fn take(self, deadline: Instant) -> Vec<u8> {
+        let _ = self.finished.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+        std::mem::take(&mut *self.kept.lock().unwrap())
+    }
+}
+
+fn collect(mut pipe: impl Read + Send + 'static) -> Collected {
+    let kept = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let (done, finished) = std::sync::mpsc::channel();
+    let into = kept.clone();
+    thread::spawn(move || {
+        let mut chunk = [0u8; 8192];
+        while let Ok(read) = pipe.read(&mut chunk) {
+            if read == 0 {
+                break;
+            }
+            into.lock().unwrap().extend_from_slice(&chunk[..read]);
+        }
+        let _ = done.send(());
+    });
+    Collected { kept, finished }
+}
+
 /// Run a command line through the shell, with a time limit. Output and errors come back together.
 pub fn shell(line: &str, limit: Duration) -> Result<(String, Option<i32>), String> {
     #[cfg(windows)]
@@ -57,18 +91,8 @@ pub fn shell(line: &str, limit: Duration) -> Result<(String, Option<i32>), Strin
         command
     };
     let mut child = command.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().map_err(|e| format!("could not start the shell: {e}"))?;
-    let mut out = child.stdout.take().ok_or("no output")?;
-    let mut err = child.stderr.take().ok_or("no output")?;
-    let reader = thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = out.read_to_end(&mut text);
-        text
-    });
-    let errors = thread::spawn(move || {
-        let mut text = Vec::new();
-        let _ = err.read_to_end(&mut text);
-        text
-    });
+    let reader = collect(child.stdout.take().ok_or("no output")?);
+    let errors = collect(child.stderr.take().ok_or("no output")?);
     let started = Instant::now();
     let status = loop {
         if let Some(status) = child.try_wait().map_err(|e| e.to_string())? {
@@ -81,8 +105,11 @@ pub fn shell(line: &str, limit: Duration) -> Result<(String, Option<i32>), Strin
         }
         thread::sleep(Duration::from_millis(20));
     };
-    let mut text = String::from_utf8_lossy(&reader.join().unwrap_or_default()).into_owned();
-    let errors = String::from_utf8_lossy(&errors.join().unwrap_or_default()).into_owned();
+    // A process the command left running can keep the pipes open for ever: what came by the time
+    // limit, or a moment after the command ended, is the output.
+    let deadline = (started + limit).max(Instant::now() + PIPE_GRACE);
+    let mut text = String::from_utf8_lossy(&reader.take(deadline)).into_owned();
+    let errors = String::from_utf8_lossy(&errors.take(deadline)).into_owned();
     if !errors.trim().is_empty() {
         text.push_str(&errors);
     }
@@ -109,7 +136,7 @@ fn processes(filter: Option<&str>) -> Result<String, String> {
     let mut all: Vec<(u32, String)> = crate::client::processes().into_iter().map(|(pid, (_, name))| (pid, name)).collect();
     all.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     #[cfg(windows)]
-    let titles: std::collections::HashMap<u32, String> = crate::win::list().into_iter().map(|w| (crate::win::pid(w.hwnd), w.title)).collect();
+    let titles: std::collections::HashMap<u32, String> = crate::win::list().into_iter().map(|w| (crate::win::content_pid(w.hwnd), w.title)).collect();
     #[cfg(not(windows))]
     let titles: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
     let shown: Vec<String> = all
@@ -196,7 +223,8 @@ fn end(pid: u32) -> Result<(), String> {
 
 /// A web page as readable text: scripts, styles and tags dropped, entities and spacing tidied.
 fn page_text(html: &str) -> String {
-    let lower = html.to_lowercase();
+    // ASCII lowercasing keeps every byte where it was, so offsets found in `lower` fit `html`.
+    let lower = html.to_ascii_lowercase();
     let mut out = String::with_capacity(html.len() / 3);
     let mut at = 0;
     let bytes = html.as_bytes();
@@ -243,7 +271,10 @@ fn fetch(url: &str, raw: bool) -> Result<String, String> {
     if !(url.starts_with("http://") || url.starts_with("https://")) {
         return Err("fetch takes an http:// or https:// address".into());
     }
-    let quoted = url.replace('\'', "''");
+    #[cfg(windows)]
+    let quoted = ps_escape(url);
+    #[cfg(not(windows))]
+    let quoted = url.replace('\'', "'\''");
     #[cfg(windows)]
     let line = format!("$ProgressPreference = 'SilentlyContinue'; (Invoke-WebRequest -UseBasicParsing -TimeoutSec {FETCH_SECONDS} -Uri '{quoted}').Content");
     #[cfg(not(windows))]
@@ -415,7 +446,7 @@ fn trash(path: &Path) -> Result<(), String> {
 fn reg(words: &[String]) -> Result<String, String> {
     let usage = "reg get KEY [name] | reg list KEY | reg set HKCU\\KEY name value";
     let (verb, rest) = words.split_first().ok_or(usage)?;
-    let quote = |s: &str| format!("'{}'", s.replace('\'', "''"));
+    let quote = |s: &str| format!("'{}'", ps_escape(s));
     let line = match (verb.as_str(), rest) {
         ("get", [key]) | ("list", [key]) => format!("reg.exe query {}", quote(key)),
         ("get", [key, name]) => format!("reg.exe query {} /v {}", quote(key), quote(name)),
@@ -518,7 +549,7 @@ fn reg(_words: &[String]) -> Result<String, String> {
 
 fn notify(title: &str, message: &str) -> Result<String, String> {
     #[cfg(windows)]
-    let quote = |s: &str| s.replace('\'', "''");
+    let quote = ps_escape;
     #[cfg(windows)]
     let line = format!(
         "$x = [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText02); \
@@ -624,4 +655,18 @@ mod tests {
         assert!(handle(&["click".to_string(), "e1".to_string()]).is_none());
         assert!(handle(&["run".to_string(), "echo hi".to_string()]).is_some());
     }
+}
+
+/// Text made safe inside a PowerShell single-quoted string: PowerShell ends such a string at the
+/// typographic single quotes too, so each of them is doubled along with the plain one.
+#[cfg(windows)]
+fn ps_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        if matches!(c, '\'' | '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}') {
+            out.push(c);
+        }
+        out.push(c);
+    }
+    out
 }

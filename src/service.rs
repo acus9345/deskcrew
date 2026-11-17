@@ -424,8 +424,10 @@ const CARET_WATCH: Duration = Duration::from_millis(15);
 const CARET_SETTLE: Duration = Duration::from_millis(30);
 const MARKED: [&str; 11] = ["button", "edit", "menuitem", "checkbox", "radio", "combobox", "tab", "item", "link", "slider", "spinner"];
 
+/// The step that checks `--expect`: it always waits for the text, even text such as "42" that
+/// `wait` would read as milliseconds.
 fn expected(flags: &Flags) -> Option<Vec<String>> {
-    flags.expect.as_ref().map(|text| vec!["wait".to_string(), text.clone()])
+    flags.expect.as_ref().map(|text| vec!["expect".to_string(), text.clone()])
 }
 
 enum Target {
@@ -464,6 +466,8 @@ struct Home {
     pids: Vec<u32>,
     leaving: Option<Instant>,
     on_loan: bool,
+    /// The notification panel focus is lent to: the loan ends when it closes, however it closes.
+    panel: Option<Hwnd>,
     /// The person's window from the last time agents worked, kept after the keeper goes idle.
     person: Option<Hwnd>,
 }
@@ -671,6 +675,10 @@ impl Service {
         loop {
             let held = {
                 let mut home = self.home.lock().unwrap();
+                if home.on_loan && home.panel.is_some_and(|panel| win::foreground() != panel) {
+                    home.on_loan = false;
+                    home.panel = None;
+                }
                 let held = home.guard.clone().filter(|_| !home.on_loan).map(|guard| (guard, home.pids.clone()));
                 if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
                     home.guard = None;
@@ -873,6 +881,9 @@ impl Service {
         if flags.mouse {
             let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
             let held = flags.with.as_deref().map(real::chord).transpose()?;
+            if let (Some(chord), Some(spec)) = (&held, &flags.with) {
+                refuse_risky(chord, spec, flags)?;
+            }
             return self.front(tracked, view, &[(x, y)], Loan::Mouse, || {
                 if let Some(chord) = &held {
                     real::set_keys(chord, true);
@@ -886,6 +897,7 @@ impl Service {
         }
         if let Some(with) = &flags.with {
             let chord = real::chord(with)?;
+            refuse_risky(&chord, with, flags)?;
             let times = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
             if !flags.real {
                 return act::post_press(tracked.hwnd, x, y, flags.button(), times, chord.mouse_keys(), &chord.modifiers());
@@ -1032,7 +1044,7 @@ impl Service {
             // A browser takes Ctrl+V as window messages too, once a click has put its page's focus in
             // the field. The field is read back where it can be, and the keyboard is the fallback.
             if !flags.real && win::is_chromium(tracked.hwnd)
-                && let Some(route) = self.paste_in_page(who, tracked, view, target, text)
+                && let Some(route) = self.paste_in_page(who, tracked, view, target)
             {
                 return Ok(route);
             }
@@ -1069,7 +1081,7 @@ impl Service {
 
     /// Ctrl+End and Ctrl+V as window messages into a browser page, after a posted click in the
     /// field if one is named. None if the paste could not be sent or did not show in the field.
-    fn paste_in_page(&self, who: &str, tracked: &Tracked, view: &mut View, target: Option<&String>, text: &str) -> Option<String> {
+    fn paste_in_page(&self, who: &str, tracked: &Tracked, view: &mut View, target: Option<&String>) -> Option<String> {
         let mut node = None;
         if let Some(word) = target {
             let Ok(Target::Control(id)) = self.resolve(word, who, tracked, view) else { return None };
@@ -1090,7 +1102,9 @@ impl Service {
             while node.element.value_text() == before && Instant::now() < until {
                 thread::sleep(SETTLE_STEP);
             }
-            if !node.element.value_text().contains(text) {
+            // A field that changed at all took the paste, even if it reformats or masks what it
+            // shows: pasting again by keyboard would put the text in twice.
+            if node.element.value_text() == before {
                 return None;
             }
         }
@@ -1110,15 +1124,26 @@ impl Service {
                 return Err("refused: that point is not on the window".into());
             }
             self.cursor_on(who, flags, (x, y, 0, 0));
-            win::bring_forward(tracked.hwnd);
-            real::hold_button(x, y, button);
+            // The real mouse is shared: agents take turns with it, and it presses only where this
+            // window really is in front.
+            let _turn = self.real_input.lock().unwrap();
+            if !win::bring_forward(tracked.hwnd) {
+                return Err("Windows would not bring that window forward".into());
+            }
+            let mut family = view.surfaces.clone();
+            family.push(tracked.hwnd);
+            if !win::owns_point(&family, x, y) {
+                return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
+            }
+            real::hold_button(who, x, y, button)?;
             return Ok("held: run up within 30 s".into());
         }
         if !flags.real {
             return Err("holding a key needs --real".into());
         }
         let chord = real::chord(what)?;
-        self.with_front(tracked, view, &[], || real::hold_keys(&chord))?;
+        refuse_risky(&chord, what, flags)?;
+        self.with_front(tracked, view, &[], || real::hold_keys(who, &chord))??;
         Ok("held, and it reaches whatever has focus: run up within 30 s".into())
     }
 
@@ -1143,7 +1168,9 @@ impl Service {
         let chord = real::chord("win+n")?;
         if words.first().is_some_and(|word| word == "close") {
             real::press_chord(&chord);
-            self.home.lock().unwrap().on_loan = false;
+            let mut home = self.home.lock().unwrap();
+            home.on_loan = false;
+            home.panel = None;
             return Ok("ok".into());
         }
         // The panel closes the moment it loses focus, so the focus keeper stands aside until close.
@@ -1159,6 +1186,7 @@ impl Service {
             self.home.lock().unwrap().on_loan = false;
             return Err("the notification panel did not open".into());
         }
+        self.home.lock().unwrap().panel = Some(front);
         thread::sleep(NOTIFICATIONS_SETTLE);
         let tracked = self.track(front);
         self.set_current(who, front);
@@ -1482,10 +1510,8 @@ impl Service {
     }
 
     fn key(&self, flags: &Flags, tracked: &Tracked, view: &View, spec: &str) -> Reply {
-        if real::is_risky(spec) && !flags.force {
-            return Err(format!("{spec} is refused: it can end the session or open the shell (--force to allow)"));
-        }
         let chord = real::chord(spec)?;
+        refuse_risky(&chord, spec, flags)?;
         let hold = flags.hold.map(|ms| Duration::from_millis(ms.min(HOLD_MOST_MS)));
         let keyboard = || -> Reply {
             match hold {
@@ -1748,6 +1774,11 @@ impl Service {
             thread::sleep(Duration::from_millis(ms.min(WAIT_MOST_MS)));
             return Ok("waited".into());
         }
+        self.wait_text(flags, tracked, view, text)
+    }
+
+    /// Wait until the text shows in the window, or is gone with --gone.
+    fn wait_text(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
         let wanted = text.to_lowercase();
         let until = Instant::now() + Duration::from_millis(flags.ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MOST_MS));
         loop {
@@ -1766,7 +1797,25 @@ impl Service {
         }
     }
 
+    /// One step of a do, with the flags it may carry itself: its own --expect is checked after it,
+    /// and flags that would need another window or another go-ahead are refused, not dropped.
     fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+        let (own, _) = parse(words);
+        if own.window.is_some() {
+            return Err("a step cannot pick another window: a do runs in one, so run another command for that window".into());
+        }
+        if matches!(own.risk.as_deref(), Some("medium" | "high")) && !flags.force && !own.force {
+            return Err("declared risky: ask the person, then add --force".into());
+        }
+        let route = self.run_step(who, flags, tracked, view, words)?;
+        if let Some(text) = &own.expect {
+            let waiting = Flags { ms: own.ms.or(flags.ms), ..Flags::default() };
+            self.wait_text(&waiting, tracked, view, text)?;
+        }
+        Ok(route)
+    }
+
+    fn run_step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         self.overlay.over(who, tracked.hwnd);
         let (own, words) = parse(words);
         if let Some(error) = own.button_error {
@@ -1829,6 +1878,7 @@ impl Service {
             ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
             ("draw", _) => self.draw(who, &flags, tracked, view, rest),
             ("wait", [text]) => self.wait(&flags, tracked, view, text),
+            ("expect", [text]) => self.wait_text(&flags, tracked, view, text),
             ("pick-file", [path]) => self.pick_file(who, &flags, tracked, view, path),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
         }
@@ -2216,6 +2266,13 @@ impl Service {
         }
 
         let hash = frame.hash();
+        // The view before the agents: every other command takes the two locks in that order.
+        let marked: Vec<(u32, (i32, i32, i32, i32))> = if flags.marks {
+            let view = tracked.view.lock().unwrap();
+            view.nodes.iter().filter(|(_, node)| MARKED.contains(&node.parts.role.as_str())).map(|(id, node)| (*id, node.rect)).collect()
+        } else {
+            Vec::new()
+        };
         let mut agents = self.agents.lock().unwrap();
         let state = agents.entry(who.to_string()).or_default();
         let last = state.shots.get(&tracked.hwnd);
@@ -2236,10 +2293,8 @@ impl Service {
         let (mut small, scale) = picture.shrink(edge);
         if flags.marks {
             let to_image = |value: i32, from: i32| ((value - from) as f32 / (scale * units)) as i32;
-            let view = tracked.view.lock().unwrap();
-            for (id, node) in view.nodes.iter().filter(|(_, node)| MARKED.contains(&node.parts.role.as_str())) {
-                let (x, y, w, h) = node.rect;
-                small.mark(to_image(x, origin.0), to_image(y, origin.1), ((w as f32) / (scale * units)) as i32, ((h as f32) / (scale * units)) as i32, *id);
+            for (id, (x, y, w, h)) in marked {
+                small.mark(to_image(x, origin.0), to_image(y, origin.1), ((w as f32) / (scale * units)) as i32, ((h as f32) / (scale * units)) as i32, id);
             }
         }
         if flags.rulers {
@@ -2330,6 +2385,9 @@ impl Service {
         }
         let verb = rest.first().map_or("", String::as_str);
         let args = rest.get(1..).unwrap_or(&[]);
+        if changes_things(verb, args) && self.stop.load(Ordering::Relaxed) {
+            return Err(STOPPED.into());
+        }
         match verb {
             "windows" => self.windows_list(who, args.first()),
             "see" => self.see(who, &flags, args),
@@ -2354,7 +2412,7 @@ impl Service {
             },
             "is" => self.is(who, &flags, args),
             "cursor" => self.borrow.set(args.first().map(String::as_str)),
-            "up" => Ok(format!("let go of {}", real::release_all())),
+            "up" => Ok(format!("let go of {}", real::release_of(who))),
             "notifications" => self.notifications(who, args),
             "apps" => {
                 let list = self.windows_list(who, None)?;
@@ -2391,7 +2449,16 @@ impl Service {
                 steps.extend(expected(&flags));
                 self.act(who, &flags, &steps)
             }
-            "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => self.draw_together(who, &flags, args),
+            "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => {
+                let drawn = self.draw_together(who, &flags, args)?;
+                // --expect is checked here too, as on every other action.
+                match expected(&flags) {
+                    Some(step) => self.act(who, &flags, &[step]).map(|found| format!("{drawn}
+{found}")).map_err(|error| format!("{drawn}
+{error}")),
+                    None => Ok(drawn),
+                }
+            }
             "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" | "pick-file" => {
                 let mut steps = vec![rest.clone()];
                 steps.extend(expected(&flags));
@@ -2491,4 +2558,24 @@ mod tests {
         assert!(flags.close);
         assert_eq!(rest, vec!["rect", "10,10", "50,50"]);
     }
+}
+
+/// Verbs that change windows or the clipboard outside an action's own checks: refused after the
+/// person pressed the stop keys, like every action. Closing the notification panel stays allowed.
+fn changes_things(verb: &str, args: &[String]) -> bool {
+    match verb {
+        "focus" | "close" | "place" => true,
+        "clip" => !args.is_empty(),
+        "notifications" => args.first().is_none_or(|word| word != "close"),
+        _ => false,
+    }
+}
+
+/// Shortcuts that end the session or open the shell need --force, however they are written and
+/// whatever keys are already held.
+fn refuse_risky(chord: &real::Chord, spec: &str, flags: &Flags) -> Result<(), String> {
+    if real::is_risky_chord(chord) && !flags.force {
+        return Err(format!("{spec} is refused: it can end the session or open the shell (--force to allow)"));
+    }
+    Ok(())
 }

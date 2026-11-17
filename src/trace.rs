@@ -23,7 +23,7 @@ const ACTIONS: [&str; 22] = [
 ];
 
 /// Commands whose whole reply is content from the screen, files or the web: only its length is kept.
-const CONTENT: [&str; 6] = ["get", "fetch", "table", "run", "processes", "clip"];
+const CONTENT: [&str; 7] = ["get", "fetch", "table", "run", "processes", "clip", "reg"];
 
 pub const HELP: &str = "\
 session start [name] [--shots]   record this agent's commands, and with --shots a picture before and after each action
@@ -114,22 +114,33 @@ fn redact(words: &[String], reply: &str) -> String {
     let command = verb(words);
     let clip_read = command == "clip" && !words.iter().any(|w| w == "set" || w == "clear");
     let file_read = command == "file" && words.iter().any(|w| w == "read" || w == "find");
-    if (CONTENT.contains(&command) && (command != "clip" || clip_read)) || file_read {
+    // A do whose steps read content carries that content in its reply too.
+    let reads = |step: &str| {
+        let mut parts = step.split_whitespace();
+        let first = parts.next().unwrap_or("");
+        CONTENT.contains(&first) && (first != "clip" || parts.next().is_none_or(|next| next != "set" && next != "clear"))
+    };
+    let do_reads = command == "do" && words.iter().skip_while(|w| *w != "do").skip(1).any(|script| script.split(';').any(|step| reads(step.trim())));
+    if (CONTENT.contains(&command) && (command != "clip" || clip_read)) || file_read || do_reads {
         return format!("<{} characters>", reply.chars().count());
     }
-    let mut lines: Vec<String> = reply
-        .lines()
-        .take(REPLY_LINES)
-        .map(|line| match line.find(" =") {
-            Some(at) => format!("{} =<{} characters>", &line[..at], line[at + 2..].chars().count()),
-            None => line.to_string(),
-        })
-        .collect();
+    let mut lines: Vec<String> = reply.lines().take(REPLY_LINES).map(redact_line).collect();
     let total = reply.lines().count();
     if total > REPLY_LINES {
         lines.push(format!("... {} more lines", total - REPLY_LINES));
     }
     lines.join("\n")
+}
+
+/// A control's line with its value and its cells left out: both come after the first " =" or
+/// " | ", while the role and name before them stay.
+fn redact_line(line: &str) -> String {
+    let value = line.find(" =").map(|at| (at, " =<"));
+    let cells = line.find(" | ").map(|at| (at, " |<"));
+    match [value, cells].into_iter().flatten().min_by_key(|(at, _)| *at) {
+        Some((at, mark)) => format!("{}{mark}{} characters>", &line[..at], line[at + 2..].trim_start().chars().count()),
+        None => line.to_string(),
+    }
 }
 
 impl Session {
@@ -154,8 +165,9 @@ impl Session {
         if !ok {
             return None;
         }
+        // Agents sharing a session can act at once: the process and time keep their names apart.
         let number = events(&self.dir).len() + 1;
-        let name = format!("{number:05}-{when}.png");
+        let name = format!("{number:05}-{when}-{}-{}.png", std::process::id(), millis() as u64);
         fs::create_dir_all(&pictures).ok()?;
         fs::copy(&reply[..end], pictures.join(&name)).ok()?;
         Some(format!("shots/{name}"))
@@ -407,6 +419,10 @@ mod tests {
         assert_eq!(redact(&words(&["clip", "set", "pw"]), "ok"), "ok");
         assert_eq!(redact(&words(&["clip"]), "pw"), "<2 characters>");
         assert_eq!(redact(&words(&["-w", "Notes", "file", "read", "a.txt"]), "body"), "<4 characters>");
+        assert_eq!(redact(&words(&["see"]), "e4 item \"Ada\" | ada@example.com | 3"), "e4 item \"Ada\" |<19 characters>");
+        assert_eq!(redact(&words(&["do", "click e1; get e3"]), "ok
+secret"), "<9 characters>");
+        assert_eq!(redact(&words(&["reg", "get", "HKCU\\Key"]), "value"), "<5 characters>");
     }
 
     #[test]

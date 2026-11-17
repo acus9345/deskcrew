@@ -157,7 +157,9 @@ impl Uia {
     pub fn focused_in(&self, hwnd: Hwnd) -> Option<Element> {
         unsafe {
             let element = self.auto.GetFocusedElement().ok()?;
-            (element.CurrentProcessId().ok()? as u32 == crate::win::pid(hwnd)).then_some(Element(element))
+            // A Store app's window belongs to ApplicationFrameHost, but its controls to the app itself.
+            let pid = element.CurrentProcessId().ok()? as u32;
+            (pid == crate::win::pid(hwnd) || pid == crate::win::content_pid(hwnd)).then_some(Element(element))
         }
     }
 
@@ -516,8 +518,10 @@ fn rows_of(element: &IUIAutomationElement, skip: usize, rows: usize, columns: us
         if total_rows == 0 {
             return Err("that control is not a table or grid, or a cell in one".into());
         }
-        // Row-header cells carry no values: drop columns that are empty in every row read.
-        let empty: Vec<usize> = (0..total_columns).filter(|at| cells.iter().all(|row: &Vec<String>| row.get(*at).is_none_or(String::is_empty))).collect();
+        // Row-header cells carry no values: drop columns that are empty in every row read. Only
+        // columns that were read can be judged, and none when no row was read (past the end).
+        let judged = if cells.is_empty() { 0 } else { total_columns.min(columns) };
+        let empty: Vec<usize> = (0..judged).filter(|at| cells.iter().all(|row: &Vec<String>| row.get(*at).is_none_or(String::is_empty))).collect();
         let keep = |at: &usize| !empty.contains(at);
         let cells: Vec<Vec<String>> = cells.into_iter().map(|row| row.into_iter().enumerate().filter(|(at, _)| keep(at)).map(|(_, c)| c).collect()).collect();
         let headers: Vec<String> = headers.into_iter().enumerate().filter(|(at, _)| keep(at)).map(|(_, h)| h).collect();

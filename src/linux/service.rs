@@ -1329,6 +1329,13 @@ impl Service {
             origin = (rect.0.max(left), rect.1.max(top));
         }
         let hash = frame.hash();
+        // The view before the agents: every other command takes the two locks in that order.
+        let marked: Vec<(u32, (i32, i32, i32, i32))> = if flags.marks {
+            let view = tracked.view.lock().unwrap();
+            view.nodes.iter().filter(|(_, node)| MARKED.contains(&node.parts.role.as_str())).map(|(id, node)| (*id, node.rect)).collect()
+        } else {
+            Vec::new()
+        };
         let mut agents = self.agents.lock().unwrap();
         let state = agents.entry(who.to_string()).or_default();
         let last = state.shots.get(&tracked.window);
@@ -1346,10 +1353,8 @@ impl Service {
         let (mut small, scale) = picture.shrink(edge);
         if flags.marks {
             let to_image = |value: i32, from: i32| ((value - from) as f32 / scale) as i32;
-            let view = tracked.view.lock().unwrap();
-            for (id, node) in view.nodes.iter().filter(|(_, node)| MARKED.contains(&node.parts.role.as_str())) {
-                let (nx, ny, w, h) = node.rect;
-                small.mark(to_image(nx, origin.0), to_image(ny, origin.1), (w as f32 / scale) as i32, (h as f32 / scale) as i32, *id);
+            for (id, (nx, ny, w, h)) in marked {
+                small.mark(to_image(nx, origin.0), to_image(ny, origin.1), (w as f32 / scale) as i32, (h as f32 / scale) as i32, id);
             }
         }
         if flags.rulers {
