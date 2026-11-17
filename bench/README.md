@@ -1,0 +1,48 @@
+# Agent benchmark
+
+Gives a headless coding agent the same desktop task several times and measures what it costs:
+wall time, model calls, thinking, the tokens the API reports, cost, and whether the result is
+right. The task windows are throwaway WinForms windows from `app.ps1`, which log what reaches them,
+so the result is checked from the app's side, not from what the agent says.
+
+```bash
+python bench/run.py --tool deskcrew --task order --runs 3 --label mine
+```
+
+```bash
+python bench/report.py --by tool --labels mine
+```
+
+- `--task order` fills an order form, confirms a dialog and reports the order number.
+- `--task stock` finds the item with the lowest stock in an 80-row grid, enters it and reports the check.
+- `--tool` is `deskcrew`, `deskcrew-mcp` (deskcrew as an MCP server, with no skill or rule), `agent-desktop`, `agent-cu`, `mcp-windows` or `windows-mcp`. Each gets its own
+  skill or the instructions its README gives, and the same built-in tools (Bash and Skill). Paths to
+  the other tools go in `bench/tools.json`: `{"agent-desktop": "...exe", "agent-cu": "...exe", "mcp-windows": "...exe"}`.
+- The agent is Claude Code (`claude -p`) with a config folder holding only a copy of your sign-in,
+  deleted after each run, and a work folder under `C:\Users\Public\deskcrew-bench`, outside your
+  profile, so your own CLAUDE.md, skills, plugins and MCP servers are left out. `--model` and
+  `--effort` pick the model and effort.
+
+By default everything runs on a hidden Windows desktop, so nothing can reach your screen, focus,
+mouse or keyboard. Tools that send real input (agent-cu, mcp-windows, Windows-MCP) only work on the
+desktop you see: `--visible` runs there, and only while you are away from the computer.
+
+Results are appended to `bench/results.jsonl`, with each run's tool calls and replies.
+
+`awake.sh` ends the screensaver every two seconds during a `--visible` run, since real input cannot reach the desktop under it. It changes no settings.
+
+## The homepage comparison
+
+`compare.py` reruns it: the order form, deskcrew against the next-best tool (mcp-windows by default), three runs each, and prints the table with how many times faster, lighter and cheaper deskcrew was.
+
+```bash
+python bench/compare.py --visible
+```
+
+mcp-windows sends real input, so this runs on your own desktop: start it only when you will be away for about ten minutes. `--report <label>` prints the table for runs already made, and `--save` writes it to `published/`, with each run's commands but not the tools' replies, which can hold your own window titles.
+
+`published/v0124-order.md` and `published/v0124-stock.md` are the runs behind the README's tables, made on 2026-11-15 with deskcrew 0.1.24; `clean-order.md` and `clean-stock.md` are the earlier ones, from 2026-11-08.
+
+## Reading a window
+
+`reading.py` reads a throwaway test form, Character Map, Calculator and a File Explorer window on `C:\Windows` three times with each tool, and `calc_presses.py` counts what `1 + 2 =` on Calculator takes to follow. Both write their raw output next to them, kept out of git: Windows-MCP reads the whole desktop, so its replies hold the titles of your other windows. Run them while you are away, since Windows-MCP and the opened windows use the desktop you see.
