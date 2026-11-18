@@ -56,33 +56,33 @@ mod win;
 
 fn main() {
     let args: Vec<String> = std::env::args_os().skip(1).map(|a| a.to_string_lossy().into_owned()).collect();
-    // `--agent name` may come first, as it does for every other command.
-    let first = if args.first().is_some_and(|a| a == "--agent") { args.get(2) } else { args.first() };
-    if matches!(first.map(String::as_str), Some("--version" | "-V")) {
-        println!("deskcrew {}", env!("CARGO_PKG_VERSION"));
+    if matches!(args.first().map(String::as_str), Some("service")) {
+        service::run();
         return;
     }
-    match args.first().map(String::as_str) {
-        Some("service") => service::run(),
-        Some("mcp") => mcp::serve(),
+    if matches!(args.first().map(String::as_str), Some("mcp")) {
+        mcp::serve();
+        return;
+    }
+    let mut words = args.clone();
+    let who = client::agent(&mut words);
+    match words.first().map(String::as_str) {
+        Some("--version" | "-V") => println!("deskcrew {}", env!("CARGO_PKG_VERSION")),
         Some("setup") => std::process::exit(setup::run()),
         #[cfg(windows)]
         Some("demo") => {
             let number = |flag: &str, default: u64| {
-                args.iter().position(|a| a == flag).and_then(|i| args.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(default)
+                words.iter().position(|a| a == flag).and_then(|i| words.get(i + 1)).and_then(|s| s.parse().ok()).unwrap_or(default)
             };
-            if args.iter().any(|a| a == "--typing") {
+            if words.iter().any(|a| a == "--typing") {
                 demo::typing();
             } else {
                 demo::run(number("--seconds", 12), number("--linger", 0));
             }
         }
-        Some("--version") => println!("deskcrew {}", env!("CARGO_PKG_VERSION")),
-        Some("log") => println!("{}", log::show(&args)),
+        Some("log") => println!("{}", log::show(&words)),
         Some("session" | "trace") => {
-            let mut rest = args.clone();
-            let who = client::agent(&mut rest);
-            let reply = if rest[0] == "session" { trace::session_command(&who, &rest[1..]) } else { trace::trace_command(&who, &rest[1..]) };
+            let reply = if words[0] == "session" { trace::session_command(&who, &words[1..]) } else { trace::trace_command(&who, &words[1..]) };
             match reply {
                 Ok(text) => println!("{text}"),
                 Err(text) => {
@@ -96,8 +96,6 @@ fn main() {
 {}", service::HELP, system::HELP, trace::HELP),
         _ => {
             // Processes, files, the shell and the like need no window, so they skip the service.
-            let mut words: Vec<String> = args.iter().enumerate().filter(|(at, _)| !(args.get(at.wrapping_sub(1)).is_some_and(|w| w == "--agent") || args[*at] == "--agent")).map(|(_, w)| w.clone()).collect();
-            let who = client::agent(&mut args.clone());
             let session = system::COMMANDS.contains(&words[0].as_str()).then(|| trace::session_of(&who, &mut words)).flatten();
             let started = std::time::Instant::now();
             if let Some(reply) = system::handle(&words) {

@@ -2393,13 +2393,13 @@ impl Service {
             return Err(err.clone());
         }
         flags.modifiers()?;
-        if flags.mouse {
-            self.borrow.allow(who, caller.resolve())?;
-        }
         let verb = rest.first().map_or("", String::as_str);
         let args = rest.get(1..).unwrap_or(&[]);
-        if changes_things(verb, args) && self.stop.load(Ordering::Relaxed) {
+        if stopped_command(verb, args, &flags) && self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
+        }
+        if flags.mouse {
+            self.borrow.allow(who, caller.resolve())?;
         }
         match verb {
             "windows" => self.windows_list(who, args.first()),
@@ -2636,6 +2636,35 @@ fn changes_things(verb: &str, args: &[String]) -> bool {
     }
 }
 
+/// Every command that acts on windows or state and should refuse before prompting if stopped.
+fn stopped_command(verb: &str, args: &[String], flags: &Flags) -> bool {
+    changes_things(verb, args)
+        || (verb == "do" && !flags.dry)
+        || matches!(
+            verb,
+            "launch"
+                | "set"
+                | "type"
+                | "key"
+                | "select"
+                | "scroll"
+                | "show"
+                | "drag"
+                | "draw"
+                | "wait"
+                | "click"
+                | "hover"
+                | "check"
+                | "uncheck"
+                | "toggle"
+                | "expand"
+                | "collapse"
+                | "clear"
+                | "down"
+                | "pick-file"
+        )
+}
+
 /// Shortcuts that end the session or open the shell need --force, however they are written and
 /// whatever keys are already held.
 fn refuse_risky(chord: &real::Chord, spec: &str, flags: &Flags) -> Result<(), String> {
@@ -2713,5 +2742,14 @@ mod tests {
         let step = expected(&expect_flags).unwrap();
         assert_eq!(step.words, vec!["expect", "--real"]);
         assert!(!step.flags.real);
+    }
+
+    #[test]
+    fn stopped_commands_are_caught_before_prompting() {
+        let flags = Flags::default();
+        assert!(stopped_command("click", &[], &flags));
+        assert!(stopped_command("do", &[], &flags));
+        assert!(!stopped_command("do", &[], &Flags { dry: true, ..Flags::default() }));
+        assert!(!stopped_command("see", &[], &flags));
     }
 }
