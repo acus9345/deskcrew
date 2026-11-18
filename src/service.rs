@@ -24,7 +24,6 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINNOACTIVE};
 
 /// What a picture of a window the agent has not read yet says: reading is far cheaper.
 const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
@@ -1845,31 +1844,20 @@ impl Service {
     /// One step of a do, with the flags it may carry itself: its own --expect is checked after it,
     /// and flags that would need another window or another go-ahead are refused, not dropped.
     fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        let (own, _) = parse(words);
+        let (own, words) = parse(words);
+        if let Some(error) = own.flag_error {
+            return Err(error);
+        }
         if own.window.is_some() {
             return Err("a step cannot pick another window: a do runs in one, so run another command for that window".into());
         }
         if matches!(own.risk.as_deref(), Some("medium" | "high")) && !flags.force && !own.force {
             return Err("declared risky: ask the person, then add --force".into());
         }
-        let route = self.run_step(who, flags, tracked, view, words)?;
-        if let Some(text) = &own.expect {
-            let waiting = Flags { ms: own.ms.or(flags.ms), ..Flags::default() };
-            self.wait_text(&waiting, tracked, view, text)?;
-        }
-        Ok(route)
-    }
-
-    fn run_step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        self.overlay.over(who, tracked.hwnd);
-        let (own, words) = parse(words);
-        if let Some(error) = own.flag_error {
-            return Err(error);
-        }
         if own.mouse && !flags.mouse {
             self.borrow.allow(who)?;
         }
-        let flags = Flags {
+        let merged = Flags {
             real: flags.real || own.real,
             mouse: flags.mouse || own.mouse,
             fast: flags.fast || own.fast,
@@ -1891,6 +1879,16 @@ impl Service {
             ms: own.ms.or(flags.ms),
             ..Flags::default()
         };
+        let route = self.run_step(who, &merged, tracked, view, &words)?;
+        if let Some(text) = &own.expect {
+            let waiting = Flags { ms: merged.ms, ..Flags::default() };
+            self.wait_text(&waiting, tracked, view, text)?;
+        }
+        Ok(route)
+    }
+
+    fn run_step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+        self.overlay.over(who, tracked.hwnd);
         let verb = words.first().map_or("", String::as_str);
         let rest = words.get(1..).unwrap_or(&[]);
         let direct_win = verb == "key"
@@ -1904,37 +1902,38 @@ impl Service {
             return Err(COVERED.into());
         }
         match (verb, rest) {
-            ("click", [word]) => self.click(who, &flags, tracked, view, word),
-            ("hover", [word]) => self.hover(who, &flags, tracked, view, word),
-            ("set", [word, value]) => self.set(who, &flags, tracked, view, word, value),
-            ("type", _) if flags.paste => self.paste(who, &flags, tracked, view, rest),
-            ("type", _) => self.type_text(who, &flags, tracked, view, rest),
-            ("clear", [word]) => self.set(who, &flags, tracked, view, word, ""),
-            ("toggle", [word]) => self.click(who, &flags, tracked, view, word),
-            ("check", [word]) => self.ensure(who, &flags, tracked, view, word, ("on", "off")),
-            ("uncheck", [word]) => self.ensure(who, &flags, tracked, view, word, ("off", "on")),
-            ("expand", [word]) => self.ensure(who, &flags, tracked, view, word, ("open", "closed")),
-            ("collapse", [word]) => self.ensure(who, &flags, tracked, view, word, ("closed", "open")),
-            ("down", _) => self.press_down(who, &flags, tracked, view, rest),
-            ("key", [spec]) => self.key(&flags, tracked, view, spec),
-            ("select", [word, item]) => self.select(who, &flags, tracked, view, word, item),
-            ("scroll", _) => self.scroll(who, &flags, tracked, view, rest),
+            ("click", [word]) => self.click(who, flags, tracked, view, word),
+            ("hover", [word]) => self.hover(who, flags, tracked, view, word),
+            ("set", [word, value]) => self.set(who, flags, tracked, view, word, value),
+            ("type", _) if flags.paste => self.paste(who, flags, tracked, view, rest),
+            ("type", _) => self.type_text(who, flags, tracked, view, rest),
+            ("clear", [word]) => self.set(who, flags, tracked, view, word, ""),
+            ("toggle", [word]) => self.click(who, flags, tracked, view, word),
+            ("check", [word]) => self.ensure(who, flags, tracked, view, word, ("on", "off")),
+            ("uncheck", [word]) => self.ensure(who, flags, tracked, view, word, ("off", "on")),
+            ("expand", [word]) => self.ensure(who, flags, tracked, view, word, ("open", "closed")),
+            ("collapse", [word]) => self.ensure(who, flags, tracked, view, word, ("closed", "open")),
+            ("down", _) => self.press_down(who, flags, tracked, view, rest),
+            ("key", [spec]) => self.key(flags, tracked, view, spec),
+            ("select", [word, item]) => self.select(who, flags, tracked, view, word, item),
+            ("scroll", _) => self.scroll(who, flags, tracked, view, rest),
             ("show", [word]) => match self.resolve(word, who, tracked, view)? {
                 Target::Control(id) if view.nodes[&id].can.scroll_item => view.nodes[&id].element.bring_into_view().map(|_| "show".to_string()),
                 Target::Control(_) => Err("that control cannot scroll into view".into()),
                 _ => Err("show needs a control".into()),
             },
-            ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
-            ("draw", _) => self.draw(who, &flags, tracked, view, rest),
-            ("wait", [text]) => self.wait(&flags, tracked, view, text),
-            ("expect", [text]) => self.wait_text(&flags, tracked, view, text),
-            ("pick-file", [path]) => self.pick_file(who, &flags, tracked, view, path),
+            ("drag", [from, to]) => self.drag(who, flags, tracked, view, from, to),
+            ("draw", _) => self.draw(who, flags, tracked, view, rest),
+            ("wait", [text]) => self.wait(flags, tracked, view, text),
+            ("expect", [text]) => self.wait_text(flags, tracked, view, text),
+            ("pick-file", [path]) => self.pick_file(who, flags, tracked, view, path),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
         }
     }
 
     /// Run steps against one window, then report the result as a single set of changes.
-    fn act(&self, who: &str, flags: &Flags, steps: &[Vec<String>]) -> Reply {
+    /// The first `parse_steps` entries come from `do` and still carry per-step flags.
+    fn act(&self, who: &str, flags: &Flags, steps: &[Vec<String>], parse_steps: usize) -> Reply {
         if self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
@@ -1952,12 +1951,17 @@ impl Service {
         self.focus_in(&view.pids);
         let mut routes = Vec::new();
         let mut failure = None;
-        for step in steps {
+        for (at, step) in steps.iter().enumerate() {
             if self.stop.load(Ordering::Relaxed) {
                 failure = Some(STOPPED.to_string());
                 break;
             }
-            match self.step(who, flags, &tracked, view, step) {
+            let result = if at < parse_steps {
+                self.step(who, flags, &tracked, view, step)
+            } else {
+                self.run_step(who, flags, &tracked, view, step)
+            };
+            match result {
                 Ok(route) => routes.push(route),
                 Err(error) => {
                     failure = Some(error);
@@ -2380,6 +2384,9 @@ impl Service {
 
     fn place(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let tracked = self.pick(who, flags.window.as_deref())?;
+        if act::is_shell_window(tracked.hwnd) {
+            return Err("refused: that window is the Windows desktop or taskbar".into());
+        }
         let word = words.first().ok_or("place x,y,w,h|min|max|restore")?;
         // A window in the back stays there: Windows' own minimize, maximize and restore activate
         // the window, which would take the person's keyboard. Their own window is theirs to change.
@@ -2388,38 +2395,19 @@ impl Service {
         let _lock = (!theirs).then(win::ForegroundLock::take);
         let mut said = "ok";
         match word.as_str() {
-            "min" => {
-                if !win::was_minimized(tracked.hwnd) {
-                    win::clear_filled(tracked.hwnd);
-                    win::show(tracked.hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE })?;
-                }
-            }
-            "max" if theirs => {
-                win::commit_shown(tracked.hwnd);
-                win::clear_filled(tracked.hwnd);
-                win::show(tracked.hwnd, SW_MAXIMIZE)?;
-            }
+            "min" => win::place_min(tracked.hwnd, theirs)?,
+            "max" if theirs => win::place_max_front(tracked.hwnd)?,
             "max" => {
                 if !win::fill_screen_behind(tracked.hwnd)? {
                     said = "ok: it fills the screen in the back; Windows' own maximize would have brought it forward";
                 }
             }
-            "restore" if theirs => {
-                if win::was_minimized(tracked.hwnd) || unsafe { IsZoomed(tracked.hwnd as _) != 0 } {
-                    win::commit_shown(tracked.hwnd);
-                    win::clear_filled(tracked.hwnd);
-                    win::show(tracked.hwnd, SW_RESTORE)?;
-                } else {
-                    win::restore_behind(tracked.hwnd)?;
-                }
-            }
+            "restore" if theirs => win::place_restore_front(tracked.hwnd)?,
             "restore" | "show" => win::restore_behind(tracked.hwnd)?,
             box_text => {
                 let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
-                win::commit_shown(tracked.hwnd);
-                win::clear_filled(tracked.hwnd);
-                win::place(tracked.hwnd, x, y, w, h)?;
+                win::place_rect(tracked.hwnd, x, y, w, h)?;
             }
         }
         // Should the app have come forward all the same, the person gets their window back.
@@ -2508,19 +2496,20 @@ impl Service {
                 if matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
                     return Err("declared risky: ask the person, then add --force".into());
                 }
+                let raw_steps = steps.len();
                 steps.extend(expected(&flags));
-                self.act(who, &flags, &steps)
+                self.act(who, &flags, &steps, raw_steps)
             }
             "click" if !args.is_empty() => {
                 let mut steps: Vec<Vec<String>> = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
                 steps.extend(expected(&flags));
-                self.act(who, &flags, &steps)
+                self.act(who, &flags, &steps, 0)
             }
             "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => {
                 let drawn = self.draw_together(who, &flags, args)?;
                 // --expect is checked here too, as on every other action.
                 match expected(&flags) {
-                    Some(step) => self.act(who, &flags, &[step]).map(|found| format!("{drawn}
+                    Some(step) => self.act(who, &flags, &[step], 0).map(|found| format!("{drawn}
 {found}")).map_err(|error| format!("{drawn}
 {error}")),
                     None => Ok(drawn),
@@ -2542,12 +2531,12 @@ impl Service {
                 }
                 let mut steps = vec![rest.clone()];
                 steps.extend(expected(&flags));
-                self.act(who, &flags, &steps)
+                self.act(who, &flags, &steps, 0)
             }
             "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" | "pick-file" => {
                 let mut steps = vec![rest.clone()];
                 steps.extend(expected(&flags));
-                self.act(who, &flags, &steps)
+                self.act(who, &flags, &steps, 0)
             }
             "" | "help" => Ok(HELP.to_string()),
             _ => Err(format!("unknown command '{verb}': deskcrew help")),
@@ -2778,5 +2767,8 @@ mod tests {
         let ok = parse(&["key".into(), "a".into(), "--hold".into(), "250".into()]);
         assert!(ok.0.flag_error.is_none());
         assert_eq!(ok.0.hold, Some(250));
+        let literal_force = parse(&["key".into(), "win+e".into(), "--".into(), "--force".into()]);
+        assert!(!literal_force.0.force);
+        assert_eq!(literal_force.1, vec!["key", "win+e", "--force"]);
     }
 }

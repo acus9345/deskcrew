@@ -21,8 +21,12 @@ pub const NEEDS_REAL: &str = "no background way to do this here: add --real";
 pub const IN_FRONT: &str = "goes to the window in front";
 pub const NEEDS_MOUSE: &str = "this control only answers the real mouse: try click x,y on it, or --mouse to ask the person to borrow their cursor";
 const MINIMIZED_WPF: &str = "refused: this WPF window is minimized, and it takes no keys until it is shown again. Windows would not let deskcrew show it off screen without it coming forward just now. Ask the person to restore it, or add --real";
-/// Closing one of these takes the person's desktop with it.
+/// Closing or moving one of these takes the person's desktop with it.
 const SHELL_WINDOWS: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+
+pub fn is_shell_window(hwnd: Hwnd) -> bool {
+    SHELL_WINDOWS.contains(&win::class(hwnd).as_str())
+}
 pub const NO_PEN: &str = "Windows would not take pen input here: --mouse asks the person to borrow their cursor";
 const WHEEL_DELTA: i32 = 120;
 const ACCESS_DENIED: u32 = 5;
@@ -1025,19 +1029,16 @@ pub fn is_shell_win_shortcut(chord: &Chord) -> bool {
 /// window equivalent without using the real keyboard. `None` if no direct equivalent exists.
 pub fn win_shortcut(chord: &Chord, target: Option<Hwnd>) -> Option<Result<String, String>> {
     use windows::Win32::UI::Shell::{IShellDispatch, IShellDispatch4, IShellDispatch5, IShellDispatch6};
-    use windows_sys::Win32::UI::WindowsAndMessaging::SW_MAXIMIZE;
     let action = WinShortcut::from_chord(chord)?;
     if action.needs_window() {
         let hwnd = target?;
-        if SHELL_WINDOWS.contains(&win::class(hwnd).as_str()) {
+        if is_shell_window(hwnd) {
             return Some(Err("refused: that window is the Windows desktop or taskbar".into()));
         }
         return Some(match action {
             WinShortcut::MaximizeWindow => (|| {
                 if win::foreground() == hwnd {
-                    win::commit_shown(hwnd);
-                    win::clear_filled(hwnd);
-                    win::show(hwnd, SW_MAXIMIZE)?;
+                    win::place_max_front(hwnd)?;
                 } else {
                     win::fill_screen_behind(hwnd)?;
                 }
@@ -1087,7 +1088,7 @@ pub fn win_shortcut(chord: &Chord, target: Option<Hwnd>) -> Option<Result<String
 }
 
 pub fn close_window(hwnd: Hwnd) -> Result<(), String> {
-    if SHELL_WINDOWS.contains(&win::class(hwnd).as_str()) {
+    if is_shell_window(hwnd) {
         return Err("refused: that window is the Windows desktop or taskbar".into());
     }
     post(hwnd, WM_CLOSE, 0, 0)

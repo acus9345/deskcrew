@@ -385,52 +385,110 @@ fn announce(stand_in: Hwnd, shown: bool) {
     unsafe { NotifyWinEvent(if shown { EVENT_OBJECT_SHOW } else { EVENT_OBJECT_HIDE }, raw(stand_in), OBJID_WINDOW, CHILDID_SELF as i32) };
 }
 
+type ReadySignal = std::sync::Arc<(std::sync::Mutex<Option<bool>>, std::sync::Condvar)>;
+
 /// A minimized window shown off screen for a while, and how to put it back.
 struct OffScreen {
     hwnd: Hwnd,
     placement: windows_sys::Win32::UI::WindowsAndMessaging::WINDOWPLACEMENT,
     _lock: Option<ForegroundLock>,
     restore_minimized: bool,
+    front: Hwnd,
+    ready: ReadySignal,
 }
 
-/// Minimized windows shown off screen now, and how many agents are working in each. The last one
-/// to finish minimizes it again.
-static OFF_SCREEN: std::sync::Mutex<std::collections::BTreeMap<Hwnd, (usize, OffScreen)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+/// Minimized windows shown off screen now, keyed with a generation token and agent refcount.
+/// The last agent in a matching generation minimizes it again.
+static OFF_SCREEN: std::sync::Mutex<std::collections::BTreeMap<Hwnd, (u64, usize, OffScreen)>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+static NEXT_OFF_SCREEN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
-/// Join the agents working in a window shown off screen, showing it there if it is minimized.
-/// `Some(true)` if this call just showed it off screen, `Some(false)` if already shown, `None`
-/// if it could not be shown.
-fn share_off_screen(hwnd: Hwnd) -> Option<bool> {
-    let mut shown = OFF_SCREEN.lock().unwrap();
-    if let Some((count, _)) = shown.get_mut(&hwnd) {
-        *count += 1;
-        return Some(false);
+static WINDOW_LOCKS: std::sync::Mutex<std::collections::BTreeMap<Hwnd, std::sync::Weak<std::sync::Mutex<()>>>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+fn window_lock(hwnd: Hwnd) -> std::sync::Arc<std::sync::Mutex<()>> {
+    let mut map = WINDOW_LOCKS.lock().unwrap();
+    if let Some(lock) = map.get(&hwnd).and_then(std::sync::Weak::upgrade) {
+        return lock;
+    }
+    if map.len() > 64 {
+        map.retain(|_, v| v.strong_count() > 0);
+    }
+    let lock = std::sync::Arc::new(std::sync::Mutex::new(()));
+    map.insert(hwnd, std::sync::Arc::downgrade(&lock));
+    lock
+}
+
+enum ShareOutcome {
+    Created(u64, ReadySignal),
+    Existing(u64, ReadySignal),
+    SelfActivated(Hwnd),
+    Unavailable,
+}
+
+struct ReadyGuard(ReadySignal);
+
+impl ReadyGuard {
+    fn set(&self, ok: bool) {
+        let mut locked = self.0.0.lock().unwrap();
+        if locked.is_none() {
+            *locked = Some(ok);
+            self.0.1.notify_all();
+        }
+    }
+}
+
+impl Drop for ReadyGuard {
+    fn drop(&mut self) {
+        self.set(false);
+    }
+}
+
+fn share_off_screen_inner(hwnd: Hwnd) -> ShareOutcome {
+    {
+        let mut shown = OFF_SCREEN.lock().unwrap();
+        if let Some((epoch, count, off)) = shown.get_mut(&hwnd) {
+            *count += 1;
+            return ShareOutcome::Existing(*epoch, std::sync::Arc::clone(&off.ready));
+        }
     }
     if !minimized(hwnd) {
-        return None;
+        return ShareOutcome::Unavailable;
     }
-    let off = show_off_screen(hwnd)?;
-    shown.insert(hwnd, (1, off));
-    Some(true)
+    match show_off_screen(hwnd) {
+        ShownOffScreen::Ok(off) => {
+            let epoch = NEXT_OFF_SCREEN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let ready = std::sync::Arc::clone(&off.ready);
+            OFF_SCREEN.lock().unwrap().insert(hwnd, (epoch, 1, off));
+            ShareOutcome::Created(epoch, ready)
+        }
+        ShownOffScreen::SelfActivated(front) => ShareOutcome::SelfActivated(front),
+        ShownOffScreen::Failed => ShareOutcome::Unavailable,
+    }
 }
 
-fn leave_off_screen(hwnd: Hwnd) {
+fn leave_off_screen_inner(hwnd: Hwnd, epoch: u64) -> Option<OffScreen> {
     let mut shown = OFF_SCREEN.lock().unwrap();
-    let last = match shown.get_mut(&hwnd) {
-        Some((count, _)) => {
+    let remove = match shown.get_mut(&hwnd) {
+        Some((entry_epoch, count, _)) if *entry_epoch == epoch => {
             *count -= 1;
             *count == 0
         }
-        None => false,
+        _ => false,
     };
-    if last {
-        shown.remove(&hwnd);
-    }
+    remove.then(|| shown.remove(&hwnd).map(|(_, _, off)| off)).flatten()
+}
+
+fn leave_off_screen(hwnd: Hwnd, epoch: u64) {
+    let lock = window_lock(hwnd);
+    let _guard = lock.lock().unwrap();
+    let dropped = leave_off_screen_inner(hwnd, epoch);
+    drop(dropped);
 }
 
 /// While held, covered browser and Electron windows are drawn and take input. Dropping it lets
 /// Chromium hide them again once no agent is working in one, and minimizes again one that was.
-pub struct KeptDrawn(Option<Hwnd>, Option<Hwnd>);
+pub struct KeptDrawn(Option<Hwnd>, Option<(Hwnd, u64)>);
 
 /// Turn a window's minimize and restore animations off or back on.
 fn animations(hwnd: Hwnd, on: bool) {
@@ -440,14 +498,11 @@ fn animations(hwnd: Hwnd, on: bool) {
 }
 
 fn settle_behind(hwnd: Hwnd, front: Hwnd) {
-    if !front_thread(hwnd) && front != 0 && foreground() != front && pid(foreground()) == pid(hwnd) && !bring_forward(front) {
+    let now = foreground();
+    if front != 0 && front != hwnd && now != front && (now == hwnd || pid(now) == pid(hwnd)) && !bring_forward(front) {
         stop_flashing(front);
     }
     stop_flashing(hwnd);
-}
-
-pub fn clear_filled(hwnd: Hwnd) {
-    FILLED.lock().unwrap().remove(&hwnd);
 }
 
 /// Make a window in the back fill its screen, short of the taskbar, without activating it:
@@ -456,8 +511,10 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
     let front = foreground();
-    let _lock = (!front_thread(hwnd)).then(ForegroundLock::take);
-    commit_shown(hwnd);
+    let lock = window_lock(hwnd);
+    let guard = lock.lock().unwrap();
+    let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
+    commit_shown_inner(hwnd);
     if unsafe { IsZoomed(raw(hwnd)) } != 0 {
         return Ok(true);
     }
@@ -465,6 +522,8 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
         FILLED.lock().unwrap().remove(&hwnd);
         show(hwnd, SW_SHOWNOACTIVATE)?;
         if unsafe { IsZoomed(raw(hwnd)) } != 0 {
+            drop(_fg_lock);
+            drop(guard);
             settle_behind(hwnd, front);
             return Ok(false);
         }
@@ -482,6 +541,8 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
             }
         }
     }
+    drop(_fg_lock);
+    drop(guard);
     settle_behind(hwnd, front);
     Ok(false)
 }
@@ -489,12 +550,10 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
 /// Windows made to fill their screen in the back, and where each was before.
 static FILLED: std::sync::Mutex<std::collections::BTreeMap<Hwnd, RECT>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
-/// Restore a window in the back without activating it: from minimized, maximized, or filling its
-/// screen, back to where it was.
-pub fn restore_behind(hwnd: Hwnd) -> Result<(), String> {
+fn restore_behind_inner(hwnd: Hwnd) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
     let was_iconic = unsafe { IsIconic(raw(hwnd)) != 0 } && !OFF_SCREEN.lock().unwrap().contains_key(&hwnd);
-    commit_shown(hwnd);
+    commit_shown_inner(hwnd);
     if unsafe { IsIconic(raw(hwnd)) } != 0 {
         show(hwnd, SW_SHOWNOACTIVATE)?;
     }
@@ -512,19 +571,79 @@ pub fn restore_behind(hwnd: Hwnd) -> Result<(), String> {
     Ok(())
 }
 
+/// Restore a window in the back without activating it: from minimized, maximized, or filling its
+/// screen, back to where it was.
+pub fn restore_behind(hwnd: Hwnd) -> Result<(), String> {
+    let lock = window_lock(hwnd);
+    let _guard = lock.lock().unwrap();
+    restore_behind_inner(hwnd)
+}
+
 /// If `hwnd` was only shown off-screen temporarily, put it back at its real normal position so
 /// `KeptDrawn::drop` won't re-minimize it after an explicit restore/snap/maximize.
-pub fn commit_shown(hwnd: Hwnd) {
+/// Returns `true` if the off-screen window originally had `WPF_RESTORETOMAXIMIZED` set.
+fn commit_shown_inner(hwnd: Hwnd) -> bool {
     let removed = OFF_SCREEN.lock().unwrap().remove(&hwnd);
-    if let Some((_, mut off)) = removed {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, SetWindowPlacement};
+    if let Some((_, _, mut off)) = removed {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, SetWindowPlacement, WPF_RESTORETOMAXIMIZED};
+        let was_zoomed = (off.placement.flags & WPF_RESTORETOMAXIMIZED) != 0;
         off.restore_minimized = false;
         let _lock = off._lock.take();
+        let ready = std::sync::Arc::clone(&off.ready);
         off.placement.flags = 0;
         off.placement.showCmd = SW_SHOWNOACTIVATE as u32;
         unsafe { SetWindowPlacement(raw(hwnd), &off.placement) };
         animations(hwnd, true);
+        let mut locked = ready.0.lock().unwrap();
+        if locked.is_none() {
+            *locked = Some(true);
+            ready.1.notify_all();
+        }
+        was_zoomed
+    } else {
+        false
     }
+}
+
+pub fn place_min(hwnd: Hwnd, theirs: bool) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, SW_SHOWMINNOACTIVE};
+    let lock = window_lock(hwnd);
+    let _guard = lock.lock().unwrap();
+    if !was_minimized(hwnd) {
+        FILLED.lock().unwrap().remove(&hwnd);
+        show(hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE })?;
+    }
+    Ok(())
+}
+
+pub fn place_max_front(hwnd: Hwnd) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::SW_MAXIMIZE;
+    let lock = window_lock(hwnd);
+    let _guard = lock.lock().unwrap();
+    commit_shown_inner(hwnd);
+    FILLED.lock().unwrap().remove(&hwnd);
+    show(hwnd, SW_MAXIMIZE)
+}
+
+pub fn place_restore_front(hwnd: Hwnd) -> Result<(), String> {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_RESTORE};
+    let lock = window_lock(hwnd);
+    let _guard = lock.lock().unwrap();
+    if was_minimized(hwnd) || unsafe { IsZoomed(raw(hwnd)) != 0 } {
+        commit_shown_inner(hwnd);
+        FILLED.lock().unwrap().remove(&hwnd);
+        show(hwnd, SW_RESTORE)
+    } else {
+        restore_behind_inner(hwnd)
+    }
+}
+
+pub fn place_rect(hwnd: Hwnd, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+    let lock = window_lock(hwnd);
+    let _guard = lock.lock().unwrap();
+    commit_shown_inner(hwnd);
+    FILLED.lock().unwrap().remove(&hwnd);
+    place(hwnd, x, y, w, h)
 }
 
 pub fn was_minimized(hwnd: Hwnd) -> bool {
@@ -561,8 +680,10 @@ pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
     let front = foreground();
-    let _lock = (!front_thread(hwnd)).then(ForegroundLock::take);
-    commit_shown(hwnd);
+    let lock = window_lock(hwnd);
+    let guard = lock.lock().unwrap();
+    let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
+    commit_shown_inner(hwnd);
     FILLED.lock().unwrap().remove(&hwnd);
     if unsafe { IsIconic(raw(hwnd)) } != 0 {
         show(hwnd, SW_SHOWNOACTIVATE)?;
@@ -578,6 +699,8 @@ pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
             place(hwnd, x, y, w, h)?;
         }
     }
+    drop(_fg_lock);
+    drop(guard);
     settle_behind(hwnd, front);
     Ok(())
 }
@@ -605,9 +728,11 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
     }
     let front = foreground();
     let theirs = front == hwnd;
-    let _lock = (!front_thread(hwnd)).then(ForegroundLock::take);
+    let lock = window_lock(hwnd);
+    let guard = lock.lock().unwrap();
+    let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
     let was_iconic_on_screen = unsafe { IsIconic(raw(hwnd)) != 0 } && !OFF_SCREEN.lock().unwrap().contains_key(&hwnd);
-    commit_shown(hwnd);
+    let restored_maximized = commit_shown_inner(hwnd);
     if was_iconic_on_screen {
         FILLED.lock().unwrap().remove(&hwnd);
     }
@@ -618,10 +743,11 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
     let idx = monitors.iter().position(|(m, _)| *m == current).unwrap_or(0);
     let target = if next { (idx + 1) % monitors.len() } else { (idx + monitors.len() - 1) % monitors.len() };
     let (src_work, dst_work) = (monitors[idx].1, monitors[target].1);
-    let zoomed = unsafe { IsZoomed(raw(hwnd)) } != 0;
+    let os_zoomed = unsafe { IsZoomed(raw(hwnd)) } != 0;
+    let zoomed = restored_maximized || os_zoomed;
     let filled = FILLED.lock().unwrap().remove(&hwnd);
     if zoomed || filled.is_some() {
-        if zoomed {
+        if os_zoomed {
             show(hwnd, SW_SHOWNOACTIVATE)?;
         }
         let normal = match filled {
@@ -640,6 +766,8 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
         let (nx, ny, nw, nh) = move_monitor_rect(outer_rect(hwnd), src_work, dst_work);
         place(hwnd, nx, ny, nw, nh)?;
     }
+    drop(_fg_lock);
+    drop(guard);
     settle_behind(hwnd, front);
     Ok(true)
 }
@@ -650,7 +778,9 @@ pub fn minimize_or_restore(hwnd: Hwnd) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MINIMIZE, SW_SHOWMINNOACTIVE};
     let front = foreground();
     let theirs = front == hwnd;
-    let _lock = (!theirs).then(ForegroundLock::take);
+    let lock = window_lock(hwnd);
+    let guard = lock.lock().unwrap();
+    let _fg_lock = (!theirs).then(ForegroundLock::take);
     if was_minimized(hwnd) {
         if minimized(hwnd) {
             FILLED.lock().unwrap().remove(&hwnd);
@@ -662,12 +792,14 @@ pub fn minimize_or_restore(hwnd: Hwnd) -> Result<(), String> {
             FILLED.lock().unwrap().remove(&hwnd);
             show(hwnd, SW_RESTORE)?;
         } else {
-            restore_behind(hwnd)?;
+            restore_behind_inner(hwnd)?;
         }
     } else {
         FILLED.lock().unwrap().remove(&hwnd);
         show(hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE })?;
     }
+    drop(_fg_lock);
+    drop(guard);
     if !theirs {
         settle_behind(hwnd, front);
     } else {
@@ -731,17 +863,30 @@ pub fn uncovered<T>(hwnd: Hwnd, work: impl FnOnce() -> T) -> T {
 /// not activate from `SW_SHOWNOACTIVATE`, so it still proceeds when Windows withheld the lock (for
 /// instance in a non-foreground sandbox desktop or right after user input), and any unexpected
 /// activation is reversed immediately by `show_off_screen` and `keep_drawn`.
-fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
+enum ShownOffScreen {
+    Ok(OffScreen),
+    SelfActivated(Hwnd),
+    Failed,
+}
+
+fn show_off_screen(hwnd: Hwnd) -> ShownOffScreen {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowPlacement, HWND_BOTTOM, SW_SHOWNOACTIVATE, SetWindowPlacement, WINDOWPLACEMENT, WS_EX_TOPMOST,
     };
-    let lock = if is_wpf(hwnd) { ForegroundLock::try_take() } else { Some(ForegroundLock::try_take()?) };
+    let lock = if is_wpf(hwnd) {
+        ForegroundLock::try_take()
+    } else {
+        match ForegroundLock::try_take() {
+            Some(lock) => Some(lock),
+            None => return ShownOffScreen::Failed,
+        }
+    };
     let front = foreground();
     unsafe {
         let mut placement: WINDOWPLACEMENT = zeroed();
         placement.length = size_of::<WINDOWPLACEMENT>() as u32;
         if GetWindowPlacement(raw(hwnd), &mut placement) == 0 {
-            return None;
+            return ShownOffScreen::Failed;
         }
         let normal = placement.rcNormalPosition;
         let (width, height) = ((normal.right - normal.left).max(1), (normal.bottom - normal.top).max(1));
@@ -752,22 +897,20 @@ fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
         animations(hwnd, false);
         if SetWindowPlacement(raw(hwnd), &away) == 0 {
             animations(hwnd, true);
-            return None;
+            return ShownOffScreen::Failed;
         }
         if GetWindowLongPtrW(raw(hwnd), GWL_EXSTYLE) as u32 & WS_EX_TOPMOST == 0 {
             SetWindowPos(raw(hwnd), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
-        let shown = OffScreen { hwnd, placement, _lock: lock, restore_minimized: true };
+        let ready = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        let shown = OffScreen { hwnd, placement, _lock: lock, restore_minimized: true, front, ready };
         // Should it come forward all the same, the person gets their window back at once.
         let now = foreground();
         if now != front && (now == hwnd || pid(now) == pid(hwnd)) {
             drop(shown);
-            if front != 0 && !bring_forward(front) {
-                stop_flashing(front);
-            }
-            return None;
+            return ShownOffScreen::SelfActivated(front);
         }
-        Some(shown)
+        ShownOffScreen::Ok(shown)
     }
 }
 
@@ -789,8 +932,8 @@ impl Drop for OffScreen {
 impl Drop for KeptDrawn {
     fn drop(&mut self) {
         // Minimized again first, while the foreground lock is still held.
-        if let Some(hwnd) = self.1 {
-            leave_off_screen(hwnd);
+        if let Some((hwnd, epoch)) = self.1 {
+            leave_off_screen(hwnd, epoch);
         }
         let Some(stand_in) = self.0 else { return };
         let mut working = KEPT_DRAWN.lock().unwrap();
@@ -813,29 +956,80 @@ impl Drop for KeptDrawn {
 /// let it come forward over the person's window just then, it stays minimized.
 pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
     let chromium = is_chromium(hwnd);
-    let front = foreground();
     let off_screen = if minimized(hwnd) || OFF_SCREEN.lock().unwrap().contains_key(&hwnd) {
         if !(chromium || is_wpf(hwnd) || pixels) {
             return KeptDrawn(None, None);
         }
-        let Some(newly_shown) = share_off_screen(hwnd) else {
-            return KeptDrawn(None, None);
+        let op_lock = window_lock(hwnd);
+        let outcome = {
+            let _guard = op_lock.lock().unwrap();
+            share_off_screen_inner(hwnd)
         };
-        if !chromium {
-            thread::sleep(SHOWN_WAIT);
-            if newly_shown {
-                let now = foreground();
-                if now != front && (now == hwnd || pid(now) == pid(hwnd)) {
-                    leave_off_screen(hwnd);
-                    if front != 0 && !bring_forward(front) {
-                        stop_flashing(front);
+        let shown = match outcome {
+            ShareOutcome::Unavailable => return KeptDrawn(None, None),
+            ShareOutcome::SelfActivated(front) => {
+                if front != 0 && !bring_forward(front) {
+                    stop_flashing(front);
+                }
+                return KeptDrawn(None, None);
+            }
+            ShareOutcome::Created(epoch, ready) if !chromium => {
+                let signal = ReadyGuard(std::sync::Arc::clone(&ready));
+                thread::sleep(SHOWN_WAIT);
+                let mut bring_back = 0;
+                let keep = {
+                    let _guard = op_lock.lock().unwrap();
+                    let found = OFF_SCREEN
+                        .lock()
+                        .unwrap()
+                        .get(&hwnd)
+                        .filter(|(e, ..)| *e == epoch)
+                        .map(|(_, _, off)| off.front);
+                    if let Some(front) = found {
+                        let now = foreground();
+                        if now != front && (now == hwnd || pid(now) == pid(hwnd)) {
+                            let removed = OFF_SCREEN.lock().unwrap().remove(&hwnd);
+                            signal.set(false);
+                            drop(removed);
+                            bring_back = front;
+                            false
+                        } else {
+                            signal.set(true);
+                            true
+                        }
+                    } else {
+                        signal.set(true);
+                        true
+                    }
+                };
+                if !keep {
+                    if bring_back != 0 && !bring_forward(bring_back) {
+                        stop_flashing(bring_back);
                     }
                     return KeptDrawn(None, None);
                 }
+                Some((hwnd, epoch))
             }
-            return KeptDrawn(None, Some(hwnd));
+            ShareOutcome::Created(epoch, ready) => {
+                ReadyGuard(ready).set(true);
+                Some((hwnd, epoch))
+            }
+            ShareOutcome::Existing(epoch, ready) if !chromium => {
+                let mut ok = ready.0.lock().unwrap();
+                while ok.is_none() {
+                    ok = ready.1.wait(ok).unwrap();
+                }
+                if !ok.unwrap_or(false) {
+                    return KeptDrawn(None, None);
+                }
+                Some((hwnd, epoch))
+            }
+            ShareOutcome::Existing(epoch, _) => Some((hwnd, epoch)),
+        };
+        if !chromium {
+            return KeptDrawn(None, shown);
         }
-        Some(hwnd)
+        shown
     } else if chromium && holds_input(hwnd) {
         None
     } else {
