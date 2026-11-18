@@ -28,12 +28,14 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Who is asking, so each agent keeps its own cursor. A flag beats the environment.
 pub fn agent(args: &mut Vec<String>) -> String {
-    if let Some(at) = args.iter().position(|a| a == "--agent")
-        && at + 1 < args.len() {
-            let name = args.remove(at + 1);
-            args.remove(at);
-            return name;
-        }
+    let limit = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    if let Some(at) = args[..limit].iter().position(|a| a == "--agent")
+        && at + 1 < limit
+    {
+        let name = args.remove(at + 1);
+        args.remove(at);
+        return name;
+    }
     let has = |name: &str| env::var_os(name).is_some();
     if let Ok(name) = env::var("DESKCREW_AGENT") {
         name
@@ -77,7 +79,12 @@ const AGENT_PROGRAMS: [(&str, &str); 16] = [
     ("grok", "Grok"),
     ("zed", "Zed"),
 ];
-const MOST_ANCESTORS: usize = 16;
+pub const MOST_ANCESTORS: usize = 16;
+
+/// Display name for a known agent program stem, or `None` if it is not a recognised agent binary.
+pub fn agent_program(program: &str) -> Option<&'static str> {
+    AGENT_PROGRAMS.iter().find(|(known, _)| *known == program).map(|(_, name)| *name)
+}
 
 /// Every process's parent and lower-case program name, without folder or `.exe`.
 #[cfg(not(windows))]
@@ -127,7 +134,7 @@ fn launched_by() -> Option<&'static str> {
     for _ in 0..MOST_ANCESTORS {
         let (parent, _) = parents.get(&id)?;
         let (_, program) = parents.get(parent)?;
-        if let Some((_, name)) = AGENT_PROGRAMS.iter().find(|(known, _)| known == program) {
+        if let Some(name) = agent_program(program) {
             return Some(name);
         }
         id = *parent;

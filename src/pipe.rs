@@ -8,8 +8,8 @@ use windows_sys::Win32::{
     },
     System::{
         Pipes::{
-            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE, PIPE_REJECT_REMOTE_CLIENTS,
-            PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
+            ConnectNamedPipe, CreateNamedPipeW, DisconnectNamedPipe, GetNamedPipeClientProcessId, GetNamedPipeServerProcessId, PIPE_READMODE_BYTE,
+            PIPE_REJECT_REMOTE_CLIENTS, PIPE_TYPE_BYTE, PIPE_UNLIMITED_INSTANCES, PIPE_WAIT, WaitNamedPipeW,
         },
         RemoteDesktop::ProcessIdToSessionId,
         Threading::GetCurrentProcessId,
@@ -188,6 +188,12 @@ impl Pipe {
         Ok(message)
     }
 
+    /// The process id of the connected client, learned from Windows over the pipe handle.
+    pub fn client_pid(&self) -> Option<u32> {
+        let mut pid = 0;
+        (unsafe { GetNamedPipeClientProcessId(self.0, &mut pid) } != 0 && pid != 0).then_some(pid)
+    }
+
     /// Let the reply drain before the pipe closes.
     pub fn finish(&self) {
         unsafe {
@@ -249,5 +255,26 @@ mod tests {
     fn invalid_pipe_returns_error_instead_of_spinning() {
         let bad = Pipe(std::ptr::null_mut());
         assert!(bad.accept().is_err());
+        assert_eq!(bad.client_pid(), None);
+    }
+
+    #[test]
+    fn client_pid_identifies_the_connected_process() {
+        let pipe_name = test_pipe_name("client-pid");
+        let server = Pipe::listen_at(&pipe_name, true).unwrap();
+        let client_name = pipe_name.clone();
+        let client = thread::spawn(move || {
+            let handle = unsafe { CreateFileW(client_name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+            assert_ne!(handle, INVALID_HANDLE_VALUE);
+            let pipe = Pipe(handle);
+            pipe.send(b"ping").unwrap();
+            let _ = pipe.receive();
+        });
+        server.accept().unwrap();
+        assert_eq!(server.receive().unwrap(), b"ping");
+        assert_eq!(server.client_pid(), Some(unsafe { GetCurrentProcessId() }));
+        server.send(b"pong").unwrap();
+        server.finish();
+        client.join().unwrap();
     }
 }

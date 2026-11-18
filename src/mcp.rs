@@ -83,10 +83,17 @@ fn words(tool: &str, a: &Value) -> Result<Vec<String>, String> {
     let s = |key: &str| a.get(key).and_then(Value::as_str).map(str::to_string);
     let on = |key: &str| a.get(key).and_then(Value::as_bool).unwrap_or(false);
     let need = |key: &str| s(key).filter(|v| !v.is_empty()).ok_or(format!("`{key}` is required"));
+    let reject_agent = |value: &str| {
+        if value == "--agent" {
+            Err("the agent name is set by the MCP client, not --agent".to_string())
+        } else {
+            Ok(value.to_string())
+        }
+    };
     let mut out: Vec<String> = Vec::new();
     match tool {
         "see" => {
-            out.extend(["see".into(), need("window")?]);
+            out.push("see".into());
             if on("full") {
                 out.push("-f".into());
             }
@@ -94,25 +101,24 @@ fn words(tool: &str, a: &Value) -> Result<Vec<String>, String> {
                 out.push("-a".into());
             }
             if let Some(word) = s("find") {
-                out.extend(["--find".into(), word]);
+                out.extend(["--find".into(), reject_agent(&word)?]);
             }
+            out.push(need("window")?);
         }
         "do" => {
-            out.extend(["do".into(), need("steps")?, "-w".into(), need("window")?]);
+            out.extend(["do".into(), "-w".into(), reject_agent(&need("window")?)?]);
             if on("dry") {
                 out.push("--dry".into());
             }
+            out.push(need("steps")?);
         }
         "shot" => {
             out.push("shot".into());
-            if let Some(w) = s("window") {
-                out.push(w);
-            }
             if on("screen") {
                 out.push("--screen".into());
             }
             if let Some(r) = s("region") {
-                out.extend(["--region".into(), r]);
+                out.extend(["--region".into(), reject_agent(&r)?]);
             }
             if on("marks") {
                 out.push("--marks".into());
@@ -120,10 +126,17 @@ fn words(tool: &str, a: &Value) -> Result<Vec<String>, String> {
             if on("rulers") {
                 out.push("--rulers".into());
             }
+            if let Some(w) = s("window") {
+                out.push(w);
+            }
         }
         "deskcrew" => {
             let list = a.get("args").and_then(Value::as_array).ok_or("`args` is required: the command's words")?;
             out = list.iter().map(|w| w.as_str().map(str::to_string).unwrap_or_else(|| w.to_string())).collect();
+            let flag_limit = out.iter().position(|w| w == "--").unwrap_or(out.len());
+            if out[..flag_limit].iter().any(|w| w == "--agent") {
+                return Err("the agent name is set by the MCP client, not --agent".into());
+            }
             match out.first().map(String::as_str) {
                 None => return Err("`args` is empty: [\"help\"] lists the commands".into()),
                 Some("mcp" | "service") => return Err("that command does not run as a tool".into()),
@@ -142,7 +155,7 @@ fn run(agent: &str, args: &[String]) -> (bool, String) {
         Err(e) => return (false, e.to_string()),
     };
     let mut command = Command::new(exe);
-    command.args(args).arg("--agent").arg(agent).stdin(Stdio::null());
+    command.env("DESKCREW_AGENT", agent).args(args).stdin(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -272,10 +285,16 @@ mod tests {
 
     #[test]
     fn tools_become_command_words() {
-        assert_eq!(words("do", &json!({ "steps": "click OK", "window": "Calc" })).unwrap(), ["do", "click OK", "-w", "Calc"]);
-        assert_eq!(words("see", &json!({ "window": "Calc", "full": true })).unwrap(), ["see", "Calc", "-f"]);
+        assert_eq!(words("do", &json!({ "steps": "click OK", "window": "Calc" })).unwrap(), ["do", "-w", "Calc", "click OK"]);
+        assert_eq!(words("see", &json!({ "window": "Calc", "full": true })).unwrap(), ["see", "-f", "Calc"]);
+        assert_eq!(words("see", &json!({ "window": "--agent", "full": true })).unwrap(), ["see", "-f", "--agent"]);
+        assert_eq!(words("do", &json!({ "steps": "--agent", "window": "Calc" })).unwrap(), ["do", "-w", "Calc", "--agent"]);
+        assert!(words("see", &json!({ "window": "Calc", "find": "--agent" })).is_err());
+        assert!(words("do", &json!({ "steps": "click OK", "window": "--agent" })).is_err());
         assert_eq!(words("shot", &json!({ "screen": true })).unwrap(), ["shot", "--screen"]);
         assert!(words("deskcrew", &json!({ "args": ["service"] })).is_err());
+        assert!(words("deskcrew", &json!({ "args": ["do", "click 1,1 --mouse", "--agent", "Claude Code"] })).is_err());
+        assert_eq!(words("deskcrew", &json!({ "args": ["type", "e3", "--", "--agent"] })).unwrap(), ["type", "e3", "--", "--agent"]);
         assert!(words("do", &json!({ "steps": "click OK" })).is_err());
     }
 
