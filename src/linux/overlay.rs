@@ -421,7 +421,7 @@ fn run(inbox: Receiver<Command>) {
                     if instant {
                         entry.glide = None;
                         entry.at = to;
-                        entry.layer.place(&conn, x - entry.tip.0, y - entry.tip.1);
+                        entry.layer.place(&conn, x.saturating_sub(entry.tip.0), y.saturating_sub(entry.tip.1));
                         if let Some(done) = done {
                             let _ = done.send(());
                         }
@@ -463,7 +463,7 @@ fn run(inbox: Receiver<Command>) {
                         entry.at = (x as f32, y as f32);
                         entry.caret = Some((x, y, h));
                         if let Some((picture, cx, cy)) = draw::caret(entry.colour, &entry.label, scale, h, 1.0) {
-                            entry.layer.show(&conn, &look, &picture, x - cx, y - cy, !aside);
+                            entry.layer.show(&conn, &look, &picture, x.saturating_sub(cx), y.saturating_sub(cy), !aside);
                             if !aside {
                                 entry.layer.stack(&conn, entry.above);
                             }

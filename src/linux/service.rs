@@ -18,7 +18,7 @@ use std::{
     collections::{BTreeMap, HashMap},
     sync::{
         Arc, Condvar, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     thread,
     time::{Duration, Instant},
@@ -51,6 +51,7 @@ On Wayland, AT-SPI commands (windows, see, get, set, check, select, pressing con
 /// What a picture of a window the agent has not read yet says: reading is far cheaper.
 const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
+const HUNG_EXIT: Duration = Duration::from_secs(60 * 60);
 const SETTLE_FIRST: Duration = Duration::from_millis(60);
 const SETTLE_STEP: Duration = Duration::from_millis(80);
 const SETTLE_LEAST: Duration = Duration::from_millis(200);
@@ -346,11 +347,35 @@ struct Service {
     windows: Mutex<(u32, HashMap<WindowKey, Arc<Tracked>>)>,
     agents: Mutex<HashMap<String, AgentState>>,
     last_used: Mutex<Instant>,
+    active: AtomicUsize,
     quit: AtomicBool,
     unlinked: AtomicBool,
     wake_lock: Mutex<()>,
     wake: Condvar,
     overlay: Overlay,
+}
+
+struct ActiveGuard<'a> {
+    active: &'a AtomicUsize,
+    last_used: &'a Mutex<Instant>,
+    wake: &'a Condvar,
+}
+
+impl<'a> ActiveGuard<'a> {
+    fn enter(active: &'a AtomicUsize, last_used: &'a Mutex<Instant>, wake: &'a Condvar) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        *last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        Self { active, last_used, wake }
+    }
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        *self.last_used.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        if self.active.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.wake.notify_all();
+        }
+    }
 }
 
 impl Service {
@@ -792,8 +817,7 @@ impl Service {
         self.cursor_on(who, tracked, rect, true);
         if let Some(wanted) = wanted {
             let role = &view.nodes[&id].parts.role;
-            let current = atspi::toggle_state(&element, role);
-            if current.is_some_and(|s| s == wanted) || (current.is_none() && view.nodes[&id].parts.states.contains(&wanted)) {
+            if atspi::toggle_state(&element, role)? == Some(wanted) {
                 return Ok(format!("already {wanted}"));
             }
         }
@@ -805,8 +829,7 @@ impl Service {
         self.cursor_on(who, tracked, rect, true);
         let wanted = if open { "open" } else { "closed" };
         let role = &view.nodes[&id].parts.role;
-        let current = atspi::expand_state(&element, role);
-        if current.is_some_and(|s| s == wanted) || (current.is_none() && view.nodes[&id].parts.states.contains(&wanted)) {
+        if atspi::expand_state(&element, role)? == Some(wanted) {
             return Ok(format!("already {wanted}"));
         }
         atspi::perform(&element, &["expand or contract", if open { "expand" } else { "collapse" }, "press", "click", "activate"])
@@ -994,7 +1017,7 @@ impl Service {
     fn scroll(&self, who: &str, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let direction = |word: &String| matches!(word.as_str(), "up" | "down" | "left" | "right");
         let at = words.iter().position(direction).ok_or("scroll [control] up|down|left|right [n]")?;
-        let times: i32 = words.get(at + 1).and_then(|n| n.parse().ok()).unwrap_or(3);
+        let times: i32 = words.get(at + 1).and_then(|n| n.parse::<i32>().ok()).unwrap_or(3).clamp(1, 200);
         let (px, py) = match words[..at].first() {
             Some(word) => self.point_of(word, who, tracked, view)?,
             None => centre(self.window_of(tracked)?.rect),
@@ -1340,8 +1363,9 @@ impl Service {
     fn windows_list(&self, who: &str, filter: Option<&String>) -> Reply {
         let wanted = filter.map(|f| f.to_lowercase());
         let current = self.agents.lock().unwrap().get(who).and_then(|a| a.current.clone());
+        let known_before: std::collections::HashSet<WindowKey> = self.windows.lock().unwrap().1.keys().cloned().collect();
         let listed = self.list_windows()?;
-        self.windows.lock().unwrap().1.retain(|key, _| listed.iter().any(|w| &w.key == key));
+        self.windows.lock().unwrap().1.retain(|key, _| !known_before.contains(key) || listed.iter().any(|w| &w.key == key));
         let shown: Vec<String> = listed
             .iter()
             .filter(|w| wanted.as_ref().is_none_or(|f| w.title.to_lowercase().contains(f) || w.app.to_lowercase().contains(f)))
@@ -1759,10 +1783,10 @@ impl Service {
             }
             "quit" => {
                 self.release(true);
-                self.quit.store(true, Ordering::Release);
                 if !self.unlinked.swap(true, Ordering::AcqRel) {
                     pipe::remove();
                 }
+                self.quit.store(true, Ordering::Release);
                 self.wake.notify_all();
                 Ok("bye".into())
             }
@@ -1796,9 +1820,8 @@ impl Service {
         }
     }
 
-    fn serve(&self, pipe: Pipe) {
+    fn serve(&self, pipe: Pipe, _active: ActiveGuard<'_>) {
         let Ok(message) = pipe.receive() else { return };
-        *self.last_used.lock().unwrap() = Instant::now();
         let text = String::from_utf8_lossy(&message).into_owned();
         let mut words: Vec<String> = text.split('\0').map(str::to_string).collect();
         let who = if words.is_empty() { "your agent".to_string() } else { words.remove(0) };
@@ -1822,6 +1845,7 @@ pub fn run() {
         windows: Mutex::new((0, HashMap::new())),
         agents: Mutex::new(HashMap::new()),
         last_used: Mutex::new(Instant::now()),
+        active: AtomicUsize::new(0),
         quit: AtomicBool::new(false),
         unlinked: AtomicBool::new(false),
         wake_lock: Mutex::new(()),
@@ -1833,7 +1857,10 @@ pub fn run() {
     thread::spawn(move || {
         for stream in listener.incoming().flatten() {
             let worker = server.clone();
-            thread::spawn(move || worker.serve(Pipe::from_stream(stream)));
+            thread::spawn(move || {
+                let active = ActiveGuard::enter(&worker.active, &worker.last_used, &worker.wake);
+                worker.serve(Pipe::from_stream(stream), active);
+            });
         }
     });
     // Ctrl+Alt+Esc, read from the key state: nothing is grabbed, so the person's keys are untouched.
@@ -1852,13 +1879,21 @@ pub fn run() {
         let (guard, _) = service.wake.wait_timeout(guard, Duration::from_millis(250)).unwrap();
         drop(guard);
         service.release(false);
-        if service.quit.load(Ordering::Acquire) || service.last_used.lock().unwrap().elapsed() > IDLE_EXIT {
+        let active = service.active.load(Ordering::SeqCst);
+        let idle = service.last_used.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
+        if service.quit.load(Ordering::Acquire) || (active == 0 && idle > IDLE_EXIT) || idle > HUNG_EXIT {
             break;
         }
     }
-    service.release(true);
-    thread::sleep(Duration::from_millis(100));
     if !service.unlinked.swap(true, Ordering::AcqRel) {
         pipe::remove();
+        // Give the accept thread a moment to take any connection already queued on the socket.
+        thread::sleep(Duration::from_millis(20));
     }
+    let drain_start = Instant::now();
+    while service.active.load(Ordering::SeqCst) > 0 && drain_start.elapsed() < Duration::from_secs(2) {
+        let guard = service.wake_lock.lock().unwrap();
+        let _ = service.wake.wait_timeout(guard, Duration::from_millis(25)).unwrap();
+    }
+    service.release(true);
 }

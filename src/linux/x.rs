@@ -347,7 +347,7 @@ pub fn capture(rect: Bounds) -> Result<Frame, String> {
     if sw < 1 || sh < 1 {
         return Err("the screen has no size".into());
     }
-    let (left, top) = (rect.0.clamp(0, sw - 1), rect.1.clamp(0, sh - 1));
+    let (left, top) = (rect.0.max(0), rect.1.max(0));
     let right = (rect.0 as i64 + rect.2 as i64).min(sw as i64);
     let bottom = (rect.1 as i64 + rect.3 as i64).min(sh as i64);
     let (w, h) = ((right - left as i64).min(i32::MAX as i64) as i32, (bottom - top as i64).min(i32::MAX as i64) as i32);

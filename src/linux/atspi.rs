@@ -142,9 +142,16 @@ fn interfaces(obj: &Obj) -> Vec<String> {
     call(obj, ACCESSIBLE, "GetInterfaces", &()).unwrap_or_default()
 }
 
+fn try_states(obj: &Obj) -> Result<u64, String> {
+    let words: Vec<u32> = call(obj, ACCESSIBLE, "GetState", &())?;
+    if words.is_empty() {
+        return Err("that control did not report its state".into());
+    }
+    Ok(words.first().copied().unwrap_or(0) as u64 | (words.get(1).copied().unwrap_or(0) as u64) << 32)
+}
+
 fn states(obj: &Obj) -> u64 {
-    let words: Vec<u32> = call(obj, ACCESSIBLE, "GetState", &()).unwrap_or_default();
-    words.first().copied().unwrap_or(0) as u64 | (words.get(1).copied().unwrap_or(0) as u64) << 32
+    try_states(obj).unwrap_or(0)
 }
 
 fn has(states: u64, bit: u32) -> bool {
@@ -156,12 +163,12 @@ pub fn rect(obj: &Obj) -> Option<Bounds> {
     let valid = |r: &Bounds| r.0 != i32::MIN && r.1 != i32::MIN && r.2 > 0 && r.3 > 0;
     let screen = call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(SCREEN,)).ok();
     if screen.as_ref().is_some_and(valid) || (super::x::has_display() && !super::x::is_xwayland()) {
-        return screen;
+        return screen.filter(|r| r.0 != i32::MIN && r.1 != i32::MIN);
     }
     call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(WINDOW,))
         .ok()
         .filter(valid)
-        .or(screen)
+        .or_else(|| screen.filter(|r| r.0 != i32::MIN && r.1 != i32::MIN))
 }
 
 /// The process behind a bus name on the accessibility bus.
@@ -730,27 +737,27 @@ pub fn table(obj: &Obj, skip: usize, rows: usize, columns: usize) -> Result<Tabl
 }
 
 /// Live checked state (`"on"`, `"mixed"`, `"off"`) of a checkbox, radio or toggle button.
-pub fn toggle_state(obj: &Obj, role: &str) -> Option<&'static str> {
-    let state = states(obj);
-    match role {
+pub fn toggle_state(obj: &Obj, role: &str) -> Result<Option<&'static str>, String> {
+    let state = try_states(obj)?;
+    Ok(match role {
         "checkbox" | "radio" => Some(if has(state, CHECKED) { "on" } else if has(state, INDETERMINATE) { "mixed" } else { "off" }),
         "button" if has(state, CHECKABLE) || role_name(obj) == "toggle button" => Some(if has(state, CHECKED) { "on" } else { "off" }),
         _ => None,
-    }
+    })
 }
 
 /// Live expanded state (`"open"` or `"closed"`) of an expandable control or combo box.
-pub fn expand_state(obj: &Obj, role: &str) -> Option<&'static str> {
-    let state = states(obj);
+pub fn expand_state(obj: &Obj, role: &str) -> Result<Option<&'static str>, String> {
+    let state = try_states(obj)?;
     if role == "combobox" || has(state, EXPANDABLE) {
         if has(state, EXPANDED) {
-            return Some("open");
+            return Ok(Some("open"));
         }
         if has(state, COLLAPSED) || role == "combobox" {
-            return Some("closed");
+            return Ok(Some("closed"));
         }
     }
-    None
+    Ok(None)
 }
 
 /// Where a field's caret is on the screen, as its top left and height, after the last character
@@ -759,8 +766,13 @@ pub fn caret(obj: &Obj) -> Option<(i32, i32, i32)> {
     const TEXT: &str = "org.a11y.atspi.Text";
     let offset: i32 = property(obj, TEXT, "CaretOffset").ok()?;
     let count: i32 = property(obj, TEXT, "CharacterCount").unwrap_or(0);
-    let extents = |at: i32| call::<_, (i32, i32, i32, i32)>(obj, TEXT, "GetCharacterExtents", &(at, SCREEN)).ok().filter(|e| e.3 > 0);
-    if offset < count
+    let extents = |at: i32| {
+        call::<_, (i32, i32, i32, i32)>(obj, TEXT, "GetCharacterExtents", &(at, SCREEN))
+            .ok()
+            .filter(|e| e.0 != i32::MIN && e.1 != i32::MIN && e.3 > 0)
+    };
+    if offset >= 0
+        && offset < count
         && let Some((x, y, _, h)) = extents(offset)
     {
         return Some((x, y, h));
@@ -769,8 +781,8 @@ pub fn caret(obj: &Obj) -> Option<(i32, i32, i32)> {
         return Some((x.saturating_add(w), y, h));
     }
     // An empty field: the start of its box, a little in.
-    let (x, y, _, h) = rect(obj)?;
-    (h > 4).then_some((x + 3, y + 3, h - 6))
+    let (x, y, _, h) = rect(obj).filter(|r| r.0 != i32::MIN && r.1 != i32::MIN)?;
+    (h > 4).then_some((x.saturating_add(3), y.saturating_add(3), h - 6))
 }
 
 /// Whether this is the button a dialog presses when its Enter is pressed, as Open or Save is.
