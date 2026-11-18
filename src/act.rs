@@ -838,12 +838,19 @@ pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
         return Err(MINIMIZED_WPF.into());
     }
     let window = win::key_window(root);
+    let front = win::foreground();
+    if front == root || front == window {
+        return if node.element.set_focus().is_ok() {
+            Ok("focus".into())
+        } else {
+            Err(NEEDS_REAL.into())
+        };
+    }
     unsafe {
         let theirs = GetWindowThreadProcessId(window as HWND, std::ptr::null_mut());
         if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
             return Err(NEEDS_REAL.into());
         }
-        let front = win::foreground();
         let _lock = win::ForegroundLock::take();
         let mine = GetCurrentThreadId();
         if AttachThreadInput(mine, theirs, 1) == 0 {
@@ -889,18 +896,44 @@ fn shell_dispatch<I: windows::core::Interface>(work: impl FnOnce(&I) -> windows:
     })
 }
 
+fn windows_dir_path(windows_root: bool) -> Result<String, String> {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+    let query = |buf: &mut [u16]| unsafe {
+        if windows_root {
+            GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32)
+        } else {
+            GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32)
+        }
+    };
+    let mut buf = vec![0u16; 260];
+    let mut len = query(&mut buf);
+    if len as usize >= buf.len() {
+        buf.resize(len as usize + 1, 0);
+        len = query(&mut buf);
+    }
+    if len == 0 || len as usize >= buf.len() {
+        return Err("Windows would not report its system folder".into());
+    }
+    Ok(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+fn system_file(windows_root: bool, name: &str) -> Result<String, String> {
+    Ok(format!("{}\\{name}", windows_dir_path(windows_root)?.trim_end_matches('\\')))
+}
+
 fn shell_launch(file: &str) -> Result<(), String> {
     let file = file.to_string();
+    let dir = windows_dir_path(false)?;
     run_sta(move || {
         let wide = |t: &str| t.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
-        let (verb, target) = (wide("open"), wide(&file));
+        let (verb, target, work_dir) = (wide("open"), wide(&file), wide(&dir));
         let code = unsafe {
             windows_sys::Win32::UI::Shell::ShellExecuteW(
                 std::ptr::null_mut(),
                 verb.as_ptr(),
                 target.as_ptr(),
                 std::ptr::null(),
-                std::ptr::null(),
+                work_dir.as_ptr(),
                 windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
             )
         };
@@ -996,42 +1029,34 @@ pub fn win_shortcut(chord: &Chord, target: Option<Hwnd>) -> Option<Result<String
     let action = WinShortcut::from_chord(chord)?;
     if action.needs_window() {
         let hwnd = target?;
+        if SHELL_WINDOWS.contains(&win::class(hwnd).as_str()) {
+            return Some(Err("refused: that window is the Windows desktop or taskbar".into()));
+        }
         return Some(match action {
-            WinShortcut::MaximizeWindow => {
+            WinShortcut::MaximizeWindow => (|| {
                 if win::foreground() == hwnd {
-                    win::show(hwnd, SW_MAXIMIZE);
+                    win::commit_shown(hwnd);
+                    win::clear_filled(hwnd);
+                    win::show(hwnd, SW_MAXIMIZE)?;
                 } else {
-                    win::fill_screen_behind(hwnd);
+                    win::fill_screen_behind(hwnd)?;
                 }
                 Ok("direct (maximize)".into())
-            }
-            WinShortcut::MinimizeOrRestoreWindow => {
-                win::minimize_or_restore(hwnd);
-                Ok("direct (restore or minimize)".into())
-            }
-            WinShortcut::SnapLeft => {
-                win::snap_half(hwnd, false);
-                Ok("direct (snap left)".into())
-            }
-            WinShortcut::SnapRight => {
-                win::snap_half(hwnd, true);
-                Ok("direct (snap right)".into())
-            }
-            WinShortcut::PrevMonitor => Ok(if win::move_monitor(hwnd, false) {
-                "direct (previous monitor)".into()
-            } else {
-                "direct (only one monitor)".into()
+            })(),
+            WinShortcut::MinimizeOrRestoreWindow => win::minimize_or_restore(hwnd).map(|_| "direct (restore or minimize)".into()),
+            WinShortcut::SnapLeft => win::snap_half(hwnd, false).map(|_| "direct (snap left)".into()),
+            WinShortcut::SnapRight => win::snap_half(hwnd, true).map(|_| "direct (snap right)".into()),
+            WinShortcut::PrevMonitor => win::move_monitor(hwnd, false).map(|moved| {
+                if moved { "direct (previous monitor)" } else { "direct (only one monitor)" }.into()
             }),
-            WinShortcut::NextMonitor => Ok(if win::move_monitor(hwnd, true) {
-                "direct (next monitor)".into()
-            } else {
-                "direct (only one monitor)".into()
+            WinShortcut::NextMonitor => win::move_monitor(hwnd, true).map(|moved| {
+                if moved { "direct (next monitor)" } else { "direct (only one monitor)" }.into()
             }),
             _ => unreachable!(),
         });
     }
     Some(match action {
-        WinShortcut::Explorer => shell_launch("explorer.exe").map(|_| "direct (explorer)".into()),
+        WinShortcut::Explorer => system_file(true, "explorer.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (explorer)".into()),
         WinShortcut::ToggleDesktop => shell_dispatch::<IShellDispatch4>(|s| unsafe { s.ToggleDesktop() }).map(|_| "direct (toggle desktop)".into()),
         WinShortcut::MinimizeAll => shell_dispatch::<IShellDispatch>(|s| unsafe { s.MinimizeAll() }).map(|_| "direct (minimize all)".into()),
         WinShortcut::UndoMinimizeAll => shell_dispatch::<IShellDispatch>(|s| unsafe { s.UndoMinimizeALL() }).map(|_| "direct (restore minimized)".into()),
@@ -1044,12 +1069,12 @@ pub fn win_shortcut(chord: &Chord, target: Option<Hwnd>) -> Option<Result<String
         WinShortcut::Accessibility => shell_launch("ms-settings:easeofaccess").map(|_| "direct (accessibility)".into()),
         WinShortcut::About => shell_launch("ms-settings:about").map(|_| "direct (about)".into()),
         WinShortcut::ActionCenter => shell_launch("ms-actioncenter:").map(|_| "direct (action center)".into()),
-        WinShortcut::Project => shell_launch("DisplaySwitch.exe").map(|_| "direct (project)".into()),
+        WinShortcut::Project => system_file(false, "DisplaySwitch.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (project)".into()),
         WinShortcut::Cast => shell_launch("ms-settings-connectabledevices:devicediscovery").map(|_| "direct (cast)".into()),
         WinShortcut::ScreenSnip => shell_launch("ms-screenclip:").map(|_| "direct (screen snip)".into()),
         WinShortcut::GameBar => shell_launch("ms-gamebar:").map(|_| "direct (game bar)".into()),
-        WinShortcut::OnScreenKeyboard => shell_launch("osk.exe").map(|_| "direct (on-screen keyboard)".into()),
-        WinShortcut::Magnifier => shell_launch("Magnify.exe").map(|_| "direct (magnifier)".into()),
+        WinShortcut::OnScreenKeyboard => system_file(false, "osk.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (on-screen keyboard)".into()),
+        WinShortcut::Magnifier => system_file(false, "Magnify.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (magnifier)".into()),
         WinShortcut::Lock => {
             if unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() } != 0 {
                 Ok("direct (lock)".into())

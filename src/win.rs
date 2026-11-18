@@ -8,7 +8,7 @@ use std::{
 };
 use windows_sys::{
     Win32::{
-        Foundation::{CloseHandle, HWND, LPARAM, POINT, RECT},
+        Foundation::{CloseHandle, ERROR_ACCESS_DENIED, GetLastError, HWND, LPARAM, POINT, RECT, SetLastError},
         Graphics::{
             Dwm::{DWMWA_CLOAKED, DWMWA_EXTENDED_FRAME_BOUNDS, DwmGetWindowAttribute},
             Gdi::{EnumDisplayMonitors, GetMonitorInfoW, HDC, HMONITOR, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow, ScreenToClient},
@@ -398,23 +398,20 @@ struct OffScreen {
 static OFF_SCREEN: std::sync::Mutex<std::collections::BTreeMap<Hwnd, (usize, OffScreen)>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
 
 /// Join the agents working in a window shown off screen, showing it there if it is minimized.
-/// False if it is neither.
-fn share_off_screen(hwnd: Hwnd) -> bool {
+/// `Some(true)` if this call just showed it off screen, `Some(false)` if already shown, `None`
+/// if it could not be shown.
+fn share_off_screen(hwnd: Hwnd) -> Option<bool> {
     let mut shown = OFF_SCREEN.lock().unwrap();
     if let Some((count, _)) = shown.get_mut(&hwnd) {
         *count += 1;
-        return true;
+        return Some(false);
     }
     if !minimized(hwnd) {
-        return false;
+        return None;
     }
-    match show_off_screen(hwnd) {
-        Some(off) => {
-            shown.insert(hwnd, (1, off));
-            true
-        }
-        None => false,
-    }
+    let off = show_off_screen(hwnd)?;
+    shown.insert(hwnd, (1, off));
+    Some(true)
 }
 
 fn leave_off_screen(hwnd: Hwnd) {
@@ -442,31 +439,51 @@ fn animations(hwnd: Hwnd, on: bool) {
     unsafe { DwmSetWindowAttribute(raw(hwnd), DWMWA_TRANSITIONS_FORCEDISABLED as u32, &off as *const i32 as *const _, size_of::<i32>() as u32) };
 }
 
+fn settle_behind(hwnd: Hwnd, front: Hwnd) {
+    if !front_thread(hwnd) && front != 0 && foreground() != front && pid(foreground()) == pid(hwnd) && !bring_forward(front) {
+        stop_flashing(front);
+    }
+    stop_flashing(hwnd);
+}
+
+pub fn clear_filled(hwnd: Hwnd) {
+    FILLED.lock().unwrap().remove(&hwnd);
+}
+
 /// Make a window in the back fill its screen, short of the taskbar, without activating it:
 /// Windows' own maximize always activates the window. True if it was already maximized.
-pub fn fill_screen_behind(hwnd: Hwnd) -> bool {
+pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
+    let front = foreground();
+    let _lock = (!front_thread(hwnd)).then(ForegroundLock::take);
     commit_shown(hwnd);
+    if unsafe { IsZoomed(raw(hwnd)) } != 0 {
+        return Ok(true);
+    }
+    if unsafe { IsIconic(raw(hwnd)) } != 0 {
+        FILLED.lock().unwrap().remove(&hwnd);
+        show(hwnd, SW_SHOWNOACTIVATE)?;
+        if unsafe { IsZoomed(raw(hwnd)) } != 0 {
+            settle_behind(hwnd, front);
+            return Ok(false);
+        }
+    }
     unsafe {
-        if IsZoomed(raw(hwnd)) != 0 {
-            return true;
-        }
-        if IsIconic(raw(hwnd)) != 0 {
-            ShowWindow(raw(hwnd), SW_SHOWNOACTIVATE);
-        }
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST), &mut info) != 0 {
             let work = info.rcWork;
             let mut before: RECT = zeroed();
-            if GetWindowRect(raw(hwnd), &mut before) != 0 {
+            let has_before = GetWindowRect(raw(hwnd), &mut before) != 0;
+            place(hwnd, work.left, work.top, work.right - work.left, work.bottom - work.top)?;
+            if has_before {
                 FILLED.lock().unwrap().entry(hwnd).or_insert(before);
             }
-            place(hwnd, work.left, work.top, work.right - work.left, work.bottom - work.top);
         }
-        false
     }
+    settle_behind(hwnd, front);
+    Ok(false)
 }
 
 /// Windows made to fill their screen in the back, and where each was before.
@@ -474,28 +491,35 @@ static FILLED: std::sync::Mutex<std::collections::BTreeMap<Hwnd, RECT>> = std::s
 
 /// Restore a window in the back without activating it: from minimized, maximized, or filling its
 /// screen, back to where it was.
-pub fn restore_behind(hwnd: Hwnd) {
+pub fn restore_behind(hwnd: Hwnd) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
+    let was_iconic = unsafe { IsIconic(raw(hwnd)) != 0 } && !OFF_SCREEN.lock().unwrap().contains_key(&hwnd);
     commit_shown(hwnd);
-    unsafe {
-        if IsIconic(raw(hwnd)) != 0 || IsZoomed(raw(hwnd)) != 0 {
-            ShowWindow(raw(hwnd), SW_SHOWNOACTIVATE);
-        }
+    if unsafe { IsIconic(raw(hwnd)) } != 0 {
+        show(hwnd, SW_SHOWNOACTIVATE)?;
+    }
+    if unsafe { IsZoomed(raw(hwnd)) } != 0 {
+        show(hwnd, SW_SHOWNOACTIVATE)?;
     }
     let before = FILLED.lock().unwrap().remove(&hwnd);
-    if let Some(before) = before
+    if !was_iconic
+        && let Some(before) = before
         && unsafe { IsIconic(raw(hwnd)) } == 0
+        && unsafe { IsZoomed(raw(hwnd)) } == 0
     {
-        place(hwnd, before.left, before.top, before.right - before.left, before.bottom - before.top);
+        place(hwnd, before.left, before.top, before.right - before.left, before.bottom - before.top)?;
     }
+    Ok(())
 }
 
 /// If `hwnd` was only shown off-screen temporarily, put it back at its real normal position so
 /// `KeptDrawn::drop` won't re-minimize it after an explicit restore/snap/maximize.
 pub fn commit_shown(hwnd: Hwnd) {
-    if let Some((_, mut off)) = OFF_SCREEN.lock().unwrap().remove(&hwnd) {
+    let removed = OFF_SCREEN.lock().unwrap().remove(&hwnd);
+    if let Some((_, mut off)) = removed {
         use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWNOACTIVATE, SetWindowPlacement};
         off.restore_minimized = false;
+        let _lock = off._lock.take();
         off.placement.flags = 0;
         off.placement.showCmd = SW_SHOWNOACTIVATE as u32;
         unsafe { SetWindowPlacement(raw(hwnd), &off.placement) };
@@ -509,6 +533,9 @@ pub fn was_minimized(hwnd: Hwnd) -> bool {
 
 pub fn is_zoomed_or_filled(hwnd: Hwnd) -> bool {
     use windows_sys::Win32::UI::WindowsAndMessaging::IsZoomed;
+    if was_minimized(hwnd) {
+        return false;
+    }
     FILLED.lock().unwrap().contains_key(&hwnd) || unsafe { IsZoomed(raw(hwnd)) != 0 }
 }
 
@@ -524,32 +551,42 @@ fn move_monitor_rect(win: (i32, i32, i32, i32), src: RECT, dst: RECT) -> (i32, i
     let dst_h = (dst.bottom - dst.top).max(1);
     let nw = w.max(1).min(dst_w);
     let nh = h.max(1).min(dst_h);
-    let nx = (dst.left + (x - src.left)).clamp(dst.left, dst.right - nw);
-    let ny = (dst.top + (y - src.top)).clamp(dst.top, dst.bottom - nh);
+    let nx = (dst.left + (x - src.left)).clamp(dst.left, dst.left + dst_w - nw);
+    let ny = (dst.top + (y - src.top)).clamp(dst.top, dst.top + dst_h - nh);
     (nx, ny, nw, nh)
 }
 
 /// Snap `hwnd` to the left or right half of its monitor's work area without taking focus.
-pub fn snap_half(hwnd: Hwnd, right: bool) {
+pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
+    let front = foreground();
     let _lock = (!front_thread(hwnd)).then(ForegroundLock::take);
-    restore_behind(hwnd);
+    commit_shown(hwnd);
+    FILLED.lock().unwrap().remove(&hwnd);
+    if unsafe { IsIconic(raw(hwnd)) } != 0 {
+        show(hwnd, SW_SHOWNOACTIVATE)?;
+    }
+    if unsafe { IsZoomed(raw(hwnd)) } != 0 {
+        show(hwnd, SW_SHOWNOACTIVATE)?;
+    }
     unsafe {
         let mut info: MONITORINFO = zeroed();
         info.cbSize = size_of::<MONITORINFO>() as u32;
         if GetMonitorInfoW(MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST), &mut info) != 0 {
             let (x, y, w, h) = snap_rect(info.rcWork, right);
-            place(hwnd, x, y, w, h);
+            place(hwnd, x, y, w, h)?;
         }
     }
-    stop_flashing(hwnd);
+    settle_behind(hwnd, front);
+    Ok(())
 }
 
 /// Move `hwnd` to the next or previous monitor's work area without taking focus.
-/// Returns `false` if there is only one monitor.
-pub fn move_monitor(hwnd: Hwnd, next: bool) -> bool {
+/// Returns `Ok(false)` if there is only one monitor.
+pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, IsZoomed, SW_SHOWNOACTIVATE, WINDOWPLACEMENT};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MAXIMIZE, SW_SHOWNOACTIVATE};
     unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> i32 {
         unsafe {
             let mut info: MONITORINFO = zeroed();
@@ -564,10 +601,19 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> bool {
     unsafe { EnumDisplayMonitors(null_mut(), std::ptr::null(), Some(each), &mut monitors as *mut _ as LPARAM) };
     monitors.sort_by_key(|(_, r)| (r.left, r.top));
     if monitors.len() < 2 {
-        return false;
+        return Ok(false);
     }
+    let front = foreground();
+    let theirs = front == hwnd;
     let _lock = (!front_thread(hwnd)).then(ForegroundLock::take);
+    let was_iconic_on_screen = unsafe { IsIconic(raw(hwnd)) != 0 } && !OFF_SCREEN.lock().unwrap().contains_key(&hwnd);
     commit_shown(hwnd);
+    if was_iconic_on_screen {
+        FILLED.lock().unwrap().remove(&hwnd);
+    }
+    if unsafe { IsIconic(raw(hwnd)) } != 0 {
+        show(hwnd, SW_SHOWNOACTIVATE)?;
+    }
     let current = unsafe { MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST) } as isize;
     let idx = monitors.iter().position(|(m, _)| *m == current).unwrap_or(0);
     let target = if next { (idx + 1) % monitors.len() } else { (idx + monitors.len() - 1) % monitors.len() };
@@ -575,43 +621,59 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> bool {
     let zoomed = unsafe { IsZoomed(raw(hwnd)) } != 0;
     let filled = FILLED.lock().unwrap().remove(&hwnd);
     if zoomed || filled.is_some() {
-        let mut normal = filled.unwrap_or(src_work);
         if zoomed {
-            let mut wp: WINDOWPLACEMENT = unsafe { zeroed() };
-            wp.length = size_of::<WINDOWPLACEMENT>() as u32;
-            if unsafe { GetWindowPlacement(raw(hwnd), &mut wp) } != 0 {
-                normal = wp.rcNormalPosition;
-            }
-            unsafe { ShowWindow(raw(hwnd), SW_SHOWNOACTIVATE) };
+            show(hwnd, SW_SHOWNOACTIVATE)?;
         }
-        let (nx, ny, nw, nh) = move_monitor_rect((normal.left, normal.top, normal.right - normal.left, normal.bottom - normal.top), src_work, dst_work);
-        FILLED.lock().unwrap().insert(hwnd, RECT { left: nx, top: ny, right: nx + nw, bottom: ny + nh });
-        place(hwnd, dst_work.left, dst_work.top, dst_work.right - dst_work.left, dst_work.bottom - dst_work.top);
+        let normal = match filled {
+            Some(r) => (r.left, r.top, r.right - r.left, r.bottom - r.top),
+            None => outer_rect(hwnd),
+        };
+        let (nx, ny, nw, nh) = move_monitor_rect(normal, src_work, dst_work);
+        if theirs && zoomed {
+            place(hwnd, nx, ny, nw, nh)?;
+            show(hwnd, SW_MAXIMIZE)?;
+        } else {
+            place(hwnd, dst_work.left, dst_work.top, dst_work.right - dst_work.left, dst_work.bottom - dst_work.top)?;
+            FILLED.lock().unwrap().insert(hwnd, RECT { left: nx, top: ny, right: nx + nw, bottom: ny + nh });
+        }
     } else {
-        restore_behind(hwnd);
         let (nx, ny, nw, nh) = move_monitor_rect(outer_rect(hwnd), src_work, dst_work);
-        place(hwnd, nx, ny, nw, nh);
+        place(hwnd, nx, ny, nw, nh)?;
     }
-    stop_flashing(hwnd);
-    true
+    settle_behind(hwnd, front);
+    Ok(true)
 }
 
 /// Minimize or restore `hwnd` (the Win+Down action), staying in the background unless `hwnd` is
 /// already the person's foreground window.
-pub fn minimize_or_restore(hwnd: Hwnd) {
+pub fn minimize_or_restore(hwnd: Hwnd) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MINIMIZE, SW_SHOWMINNOACTIVE};
-    let theirs = foreground() == hwnd;
+    let front = foreground();
+    let theirs = front == hwnd;
     let _lock = (!theirs).then(ForegroundLock::take);
-    if is_zoomed_or_filled(hwnd) {
-        if theirs && unsafe { IsZoomed(raw(hwnd)) } != 0 {
-            show(hwnd, SW_RESTORE);
-        } else {
-            restore_behind(hwnd);
+    if was_minimized(hwnd) {
+        if minimized(hwnd) {
+            FILLED.lock().unwrap().remove(&hwnd);
         }
-    } else if !was_minimized(hwnd) {
-        show(hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE });
+        return Ok(());
     }
-    stop_flashing(hwnd);
+    if is_zoomed_or_filled(hwnd) {
+        if theirs && unsafe { IsZoomed(raw(hwnd)) != 0 } {
+            FILLED.lock().unwrap().remove(&hwnd);
+            show(hwnd, SW_RESTORE)?;
+        } else {
+            restore_behind(hwnd)?;
+        }
+    } else {
+        FILLED.lock().unwrap().remove(&hwnd);
+        show(hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE })?;
+    }
+    if !theirs {
+        settle_behind(hwnd, front);
+    } else {
+        stop_flashing(hwnd);
+    }
+    Ok(())
 }
 
 /// A place for a window off every screen where Windows still counts it as on the screen it was on,
@@ -664,11 +726,11 @@ pub fn uncovered<T>(hwnd: Hwnd, work: impl FnOnce() -> T) -> T {
     result
 }
 
-/// Show a minimized window, far off every screen and without activating it, while no app can take
-/// the foreground. A restored window comes forward on its own when its app still counts it as its
-/// active window, as Chromium does, and Windows lets it whenever deskcrew could not stop it: so
-/// this is only done while Windows gives deskcrew the foreground lock. It does while the agent's
-/// own terminal or app is in front, or the person has left the computer long enough.
+/// Show a minimized window, far off every screen and without activating it. For Chromium we
+/// require `ForegroundLock::try_take()` because Chromium can self-activate on un-minimize; WPF does
+/// not activate from `SW_SHOWNOACTIVATE`, so it still proceeds when Windows withheld the lock (for
+/// instance in a non-foreground sandbox desktop or right after user input), and any unexpected
+/// activation is reversed immediately by `show_off_screen` and `keep_drawn`.
 fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         GetWindowPlacement, HWND_BOTTOM, SW_SHOWNOACTIVATE, SetWindowPlacement, WINDOWPLACEMENT, WS_EX_TOPMOST,
@@ -751,15 +813,26 @@ impl Drop for KeptDrawn {
 /// let it come forward over the person's window just then, it stays minimized.
 pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
     let chromium = is_chromium(hwnd);
+    let front = foreground();
     let off_screen = if minimized(hwnd) || OFF_SCREEN.lock().unwrap().contains_key(&hwnd) {
         if !(chromium || is_wpf(hwnd) || pixels) {
             return KeptDrawn(None, None);
         }
-        if !share_off_screen(hwnd) {
+        let Some(newly_shown) = share_off_screen(hwnd) else {
             return KeptDrawn(None, None);
-        }
+        };
         if !chromium {
             thread::sleep(SHOWN_WAIT);
+            if newly_shown {
+                let now = foreground();
+                if now != front && (now == hwnd || pid(now) == pid(hwnd)) {
+                    leave_off_screen(hwnd);
+                    if front != 0 && !bring_forward(front) {
+                        stop_flashing(front);
+                    }
+                    return KeptDrawn(None, None);
+                }
+            }
             return KeptDrawn(None, Some(hwnd));
         }
         Some(hwnd)
@@ -955,12 +1028,34 @@ pub fn outer_rect(hwnd: Hwnd) -> (i32, i32, i32, i32) {
     }
 }
 
-pub fn place(hwnd: Hwnd, x: i32, y: i32, w: i32, h: i32) {
-    unsafe { SetWindowPos(raw(hwnd), null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) };
+pub fn place(hwnd: Hwnd, x: i32, y: i32, w: i32, h: i32) -> Result<(), String> {
+    unsafe {
+        if IsWindow(raw(hwnd)) == 0 {
+            return Err("that window is gone".into());
+        }
+        SetLastError(0);
+        if SetWindowPos(raw(hwnd), null_mut(), x, y, w, h, SWP_NOZORDER | SWP_NOACTIVATE) != 0 {
+            return Ok(());
+        }
+        Err(if GetLastError() == ERROR_ACCESS_DENIED {
+            "blocked: the window runs as administrator".into()
+        } else {
+            "Windows could not move or resize that window".into()
+        })
+    }
 }
 
-pub fn show(hwnd: Hwnd, how: i32) {
-    unsafe { ShowWindow(raw(hwnd), how) };
+pub fn show(hwnd: Hwnd, how: i32) -> Result<(), String> {
+    unsafe {
+        if IsWindow(raw(hwnd)) == 0 {
+            return Err("that window is gone".into());
+        }
+        SetLastError(0);
+        if ShowWindow(raw(hwnd), how) == 0 && GetLastError() == ERROR_ACCESS_DENIED {
+            return Err("blocked: the window runs as administrator".into());
+        }
+        Ok(())
+    }
 }
 
 pub fn foreground() -> Hwnd {
@@ -1561,5 +1656,7 @@ mod tests {
         let dst = RECT { left: 0, top: 0, right: 1280, bottom: 720 };
         assert_eq!(move_monitor_rect((-1820, 100, 600, 400), src, dst), (100, 100, 600, 400));
         assert_eq!(move_monitor_rect((-320, 400, 1600, 900), src, dst), (0, 0, 1280, 720));
+        let empty = RECT { left: 100, top: 200, right: 100, bottom: 150 };
+        assert_eq!(move_monitor_rect((-1820, 100, 600, 400), src, empty), (100, 200, 1, 1));
     }
 }

@@ -24,7 +24,7 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINNOACTIVE};
+use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MAXIMIZE, SW_MINIMIZE, SW_RESTORE, SW_SHOWMINNOACTIVE};
 
 /// What a picture of a window the agent has not read yet says: reading is far cheaper.
 const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
@@ -297,7 +297,7 @@ struct Flags {
     region: Option<String>,
     with: Option<String>,
     button: Option<MouseButton>,
-    button_error: Option<String>,
+    flag_error: Option<String>,
     expect: Option<String>,
     risk: Option<String>,
 }
@@ -328,6 +328,23 @@ impl Flags {
     fn modifiers(&self) -> Result<Modifiers, String> {
         self.with.as_deref().map(Modifiers::parse).unwrap_or(Ok(Modifiers::NONE))
     }
+}
+
+fn take_text(dst: &mut Option<String>, next: Option<String>, flag: &str, err: &mut Option<String>) {
+    match next {
+        Some(value) => *dst = Some(value),
+        None => {
+            err.get_or_insert_with(|| format!("{flag} needs a value"));
+        }
+    }
+}
+
+fn take_num<T: std::str::FromStr>(next: Option<String>, flag: &str, hint: &str, err: &mut Option<String>) -> Option<T> {
+    let parsed = next.and_then(|n| n.parse::<T>().ok());
+    if parsed.is_none() {
+        err.get_or_insert_with(|| format!("{flag} needs {hint}"));
+    }
+    parsed
 }
 
 fn parse(words: &[String]) -> (Flags, Vec<String>) {
@@ -361,22 +378,24 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                 "--marks" => flags.marks = true,
                 "--rulers" => flags.rulers = true,
                 "--with" => {
-                    flags.with = next;
+                    take_text(&mut flags.with, next, word, &mut flags.flag_error);
                     took_next = true;
                 }
                 "--button" => {
                     match next.as_deref().and_then(MouseButton::named) {
                         Some(button @ (MouseButton::Left | MouseButton::Right | MouseButton::Middle)) => flags.button = Some(button),
-                        _ => flags.button_error = Some("--button takes left, right or middle".into()),
+                        _ => {
+                            flags.flag_error.get_or_insert_with(|| "--button takes left, right or middle".into());
+                        }
                     }
                     took_next = true;
                 }
                 "--expect" => {
-                    flags.expect = next;
+                    take_text(&mut flags.expect, next, word, &mut flags.flag_error);
                     took_next = true;
                 }
                 "--risk" => {
-                    flags.risk = next;
+                    take_text(&mut flags.risk, next, word, &mut flags.flag_error);
                     took_next = true;
                 }
                 "--gone" => flags.gone = true,
@@ -387,31 +406,31 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                 "--fill" => flags.fill = true,
                 "--close" => flags.close = true,
                 "-w" | "--window" => {
-                    flags.window = next;
+                    take_text(&mut flags.window, next, word, &mut flags.flag_error);
                     took_next = true;
                 }
                 "--find" => {
-                    flags.find = next;
+                    take_text(&mut flags.find, next, word, &mut flags.flag_error);
                     took_next = true;
                 }
                 "--from" => {
-                    flags.from = next.and_then(|n| n.parse().ok()).unwrap_or(0);
+                    flags.from = take_num(next, word, "a number", &mut flags.flag_error).unwrap_or(0);
                     took_next = true;
                 }
                 "--ms" => {
-                    flags.ms = next.and_then(|n| n.parse().ok());
+                    flags.ms = take_num(next, word, "milliseconds", &mut flags.flag_error);
                     took_next = true;
                 }
                 "--hold" => {
-                    flags.hold = next.and_then(|n| n.parse().ok());
+                    flags.hold = take_num(next, word, "milliseconds", &mut flags.flag_error);
                     took_next = true;
                 }
                 "--region" => {
-                    flags.region = next;
+                    take_text(&mut flags.region, next, word, &mut flags.flag_error);
                     took_next = true;
                 }
                 "--edge" => {
-                    flags.edge = next.and_then(|n| n.parse().ok());
+                    flags.edge = take_num(next, word, "pixels", &mut flags.flag_error);
                     took_next = true;
                 }
                 _ => rest.push(word.to_string()),
@@ -1434,7 +1453,17 @@ impl Service {
                     None => match field.as_ref().filter(|node| win::is_wpf(tracked.hwnd) && !node.can.value && matches!(node.parts.role.as_str(), "edit" | "document" | "combobox")) {
                         Some(node) => {
                             act::focus_wpf_field(tracked.hwnd, node)?;
-                            act::post_text_focused(tracked.hwnd, text, &self.stop)
+                            match act::post_text_focused(tracked.hwnd, text, &self.stop) {
+                                Err(why) if why.contains(act::IN_FRONT) && win::front_is(tracked.hwnd, &view.surfaces) => {
+                                    self.with_front(tracked, view, &[], || {
+                                        if !real::type_text(text, tracked.hwnd, &view.surfaces, &self.stop)? {
+                                            return Err(STOPPED.to_string());
+                                        }
+                                        Ok("keyboard".to_string())
+                                    })?
+                                }
+                                other => other,
+                            }
                         }
                         None => Err(NEEDS_REAL.into()),
                     },
@@ -1834,7 +1863,7 @@ impl Service {
     fn run_step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         self.overlay.over(who, tracked.hwnd);
         let (own, words) = parse(words);
-        if let Some(error) = own.button_error {
+        if let Some(error) = own.flag_error {
             return Err(error);
         }
         if own.mouse && !flags.mouse {
@@ -1864,10 +1893,14 @@ impl Service {
         };
         let verb = words.first().map_or("", String::as_str);
         let rest = words.get(1..).unwrap_or(&[]);
+        let direct_win = verb == "key"
+            && rest.len() == 1
+            && real::chord(&rest[0]).is_ok_and(|c| act::WinShortcut::from_chord(&c).is_some());
         // A minimized browser or Electron window drops or holds its input until it is shown again,
         // even one started to take input while covered. It is shown off screen while an agent works
-        // in it, so this only happens when that could not be done.
-        if !flags.real && !flags.mouse && ACTIONS.contains(&verb) && win::is_chromium(tracked.hwnd) && win::minimized(tracked.hwnd) {
+        // in it, so this only happens when that could not be done. Direct Win shortcuts resize the
+        // window or launch system shells without sending keystrokes to Chromium.
+        if !flags.real && !flags.mouse && !direct_win && ACTIONS.contains(&verb) && win::is_chromium(tracked.hwnd) && win::minimized(tracked.hwnd) {
             return Err(COVERED.into());
         }
         match (verb, rest) {
@@ -2356,28 +2389,37 @@ impl Service {
         let mut said = "ok";
         match word.as_str() {
             "min" => {
-                win::commit_shown(tracked.hwnd);
-                win::show(tracked.hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE });
+                if !win::was_minimized(tracked.hwnd) {
+                    win::clear_filled(tracked.hwnd);
+                    win::show(tracked.hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE })?;
+                }
             }
             "max" if theirs => {
                 win::commit_shown(tracked.hwnd);
-                win::show(tracked.hwnd, SW_MAXIMIZE);
+                win::clear_filled(tracked.hwnd);
+                win::show(tracked.hwnd, SW_MAXIMIZE)?;
             }
             "max" => {
-                if !win::fill_screen_behind(tracked.hwnd) {
+                if !win::fill_screen_behind(tracked.hwnd)? {
                     said = "ok: it fills the screen in the back; Windows' own maximize would have brought it forward";
                 }
             }
             "restore" if theirs => {
-                win::commit_shown(tracked.hwnd);
-                win::show(tracked.hwnd, SW_RESTORE);
+                if win::was_minimized(tracked.hwnd) || unsafe { IsZoomed(tracked.hwnd as _) != 0 } {
+                    win::commit_shown(tracked.hwnd);
+                    win::clear_filled(tracked.hwnd);
+                    win::show(tracked.hwnd, SW_RESTORE)?;
+                } else {
+                    win::restore_behind(tracked.hwnd)?;
+                }
             }
-            "restore" | "show" => win::restore_behind(tracked.hwnd),
+            "restore" | "show" => win::restore_behind(tracked.hwnd)?,
             box_text => {
                 let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
                 win::commit_shown(tracked.hwnd);
-                win::place(tracked.hwnd, x, y, w, h);
+                win::clear_filled(tracked.hwnd);
+                win::place(tracked.hwnd, x, y, w, h)?;
             }
         }
         // Should the app have come forward all the same, the person gets their window back.
@@ -2401,7 +2443,7 @@ impl Service {
 
     fn handle(&self, who: &str, words: &[String]) -> Reply {
         let (flags, rest) = parse(words);
-        if let Some(err) = &flags.button_error {
+        if let Some(err) = &flags.flag_error {
             return Err(err.clone());
         }
         flags.modifiers()?;
@@ -2723,5 +2765,18 @@ mod tests {
         assert_eq!(clamp_caret((50, 20, 16), Some((10, 0, 4, 20))), (10, 20, 16));
         assert_eq!(clamp_caret((50, 20, 16), Some((10, 0, 100, 20))), (50, 20, 16));
         assert_eq!(clamp_caret((200, 20, 16), Some((10, 0, 100, 20))), (106, 20, 16));
+    }
+
+    #[test]
+    fn parse_rejects_malformed_or_missing_flag_values() {
+        let bad_hold = parse(&["key".into(), "win+e".into(), "--hold".into(), "abc".into(), "--force".into()]);
+        assert!(bad_hold.0.flag_error.as_deref().is_some_and(|e| e.contains("--hold")));
+        let hold_flag_eat = parse(&["key".into(), "win+e".into(), "--hold".into(), "--force".into()]);
+        assert!(hold_flag_eat.0.flag_error.as_deref().is_some_and(|e| e.contains("--hold")));
+        let missing_win = parse(&["key".into(), "win+e".into(), "-w".into()]);
+        assert!(missing_win.0.flag_error.as_deref().is_some_and(|e| e.contains("-w")));
+        let ok = parse(&["key".into(), "a".into(), "--hold".into(), "250".into()]);
+        assert!(ok.0.flag_error.is_none());
+        assert_eq!(ok.0.hold, Some(250));
     }
 }

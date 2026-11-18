@@ -47,7 +47,7 @@ const QUIET_TIMEOUT: Duration = Duration::from_secs(3);
 /// Marks our own mouse events, so the shield against hidden ones lets them through.
 pub const OURS: usize = 0x6465_736B;
 
-const RISKY: [&str; 8] = ["alt+f4", "win+l", "win+r", "win+d", "win+x", "alt+tab", "ctrl+shift+esc", "win+e"];
+const RISKY: [&str; 9] = ["alt+f4", "win+l", "win+r", "win+d", "win+x", "alt+tab", "ctrl+shift+esc", "win+e", "win+m"];
 
 fn send(inputs: &[INPUT]) {
     unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
@@ -328,7 +328,8 @@ fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
                 }
             let mut chars = lower.chars();
             let (c, None) = (chars.next()?, chars.next()) else { return None };
-            let scan = unsafe { VkKeyScanW(c as u16) };
+            let Ok(unit) = u16::try_from(u32::from(c)) else { return None };
+            let scan = unsafe { VkKeyScanW(unit) };
             if scan == -1 {
                 return None;
             }
@@ -392,12 +393,15 @@ impl Chord {
 }
 
 pub fn chord(spec: &str) -> Result<Chord, String> {
-    let mut keys = Vec::new();
-    for part in spec.split('+').filter(|p| !p.is_empty()) {
-        keys.push(named_key(part).ok_or_else(|| format!("unknown key '{part}'"))?);
-    }
-    if keys.is_empty() {
+    if spec.is_empty() {
         return Err("no key given".into());
+    }
+    let mut keys = Vec::new();
+    for part in spec.split('+') {
+        if part.is_empty() {
+            return Err(format!("empty key in '{spec}': use 'plus' for '+'"));
+        }
+        keys.push(named_key(part).ok_or_else(|| format!("unknown key '{part}'"))?);
     }
     Ok(Chord { modified: keys.len() > 1, keys })
 }
@@ -558,6 +562,8 @@ mod tests {
         assert!(!is_risky("alt+f5"));
         assert!(is_risky("alt+f04"));
         assert!(is_risky("super+r"));
+        assert!(is_risky("win+m"));
+        assert!(is_risky("win+shift+m"));
     }
 
     #[test]
@@ -587,5 +593,9 @@ mod tests {
         assert_eq!(chord("shift+super+left").unwrap().win_pattern(), Some((false, true, false, VK_LEFT)));
         assert_eq!(chord("ctrl+win+o").unwrap().win_pattern(), Some((true, false, false, b'O' as u16)));
         assert_eq!(chord("win+a+b").unwrap().win_pattern(), None);
+        assert!(chord("win++").is_err());
+        assert!(chord("ctrl++").is_err());
+        assert!(chord("win+").is_err());
+        assert!(chord("\u{10061}").is_err());
     }
 }
