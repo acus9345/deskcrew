@@ -3,7 +3,7 @@
 use std::{
     fs::{self, OpenOptions},
     io::Write,
-    path::PathBuf,
+    path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -25,24 +25,62 @@ pub fn record(who: &str, words: &[String], ok: bool, reply: &str) {
         reply.lines().next().unwrap_or("").trim().chars().take(REPLY_CHARS).collect()
     };
     let line = format!("{} {} {} {}  ->  {}\n", now(), quoted(who), if ok { "ok" } else { "failed" }, hidden(words), first);
-    let file = path();
+    append_and_trim(&path(), &line, KEEP_BYTES);
+}
+
+fn append_line(file: &Path, line: &str) {
+    if let Ok(mut out) = OpenOptions::new().create(true).append(true).open(file) {
+        let _ = out.write_all(line.as_bytes());
+    }
+}
+
+fn trim_and_append(file: &Path, text: &str, line: &str) -> std::io::Result<()> {
+    // The middle, moved on to a character's start: a byte inside one cannot be cut at.
+    let mut half = text.len() / 2;
+    while !text.is_char_boundary(half) {
+        half += 1;
+    }
+    let cut = text[half..].find('\n').map(|at| half + at + 1).unwrap_or(half);
+    let kept = &text[cut..];
+    let mut temp_name = file.as_os_str().to_os_string();
+    temp_name.push(".tmp");
+    let temp = PathBuf::from(temp_name);
+    {
+        let mut out = OpenOptions::new().write(true).create(true).truncate(true).open(&temp)?;
+        if let Err(error) = out.write_all(kept.as_bytes()).and_then(|()| out.write_all(line.as_bytes())) {
+            drop(out);
+            let _ = fs::remove_file(&temp);
+            return Err(error);
+        }
+    }
+    if fs::rename(&temp, file).is_ok() {
+        return Ok(());
+    }
+    let _ = fs::remove_file(&temp);
+    // On Windows a reader such as `deskcrew log` opens the file without delete sharing, so replace
+    // it in place while holding the lock instead.
+    let mut out = OpenOptions::new().write(true).create(true).truncate(true).open(file)?;
+    out.write_all(kept.as_bytes())?;
+    out.write_all(line.as_bytes())
+}
+
+fn append_and_trim(file: &Path, line: &str, keep_bytes: u64) {
     if let Some(folder) = file.parent() {
         let _ = fs::create_dir_all(folder);
     }
-    if fs::metadata(&file).is_ok_and(|m| m.len() > KEEP_BYTES)
-        && let Ok(text) = fs::read_to_string(&file)
+    let mut lock_name = file.as_os_str().to_os_string();
+    lock_name.push(".lock");
+    let lock_path = PathBuf::from(lock_name);
+    let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(&lock_path).ok();
+    let locked = lock.as_ref().is_some_and(|l| l.lock().is_ok());
+    if locked
+        && fs::metadata(file).is_ok_and(|m| m.len() > keep_bytes)
+        && let Ok(text) = fs::read_to_string(file)
+        && trim_and_append(file, &text, line).is_ok()
     {
-        // The middle, moved on to a character's start: a byte inside one cannot be cut at.
-        let mut half = text.len() / 2;
-        while !text.is_char_boundary(half) {
-            half += 1;
-        }
-        let cut = text[half..].find('\n').map(|at| half + at + 1).unwrap_or(half);
-        let _ = fs::write(&file, &text[cut..]);
+        return;
     }
-    if let Ok(mut out) = OpenOptions::new().create(true).append(true).open(&file) {
-        let _ = out.write_all(line.as_bytes());
-    }
+    append_line(file, line);
 }
 
 /// `deskcrew log [n]`: the last n commands, oldest first.
@@ -203,5 +241,39 @@ mod tests {
         let line = now();
         assert_eq!(line.len(), 20);
         assert!(line.starts_with("20"));
+    }
+
+    #[test]
+    fn concurrent_trimming_keeps_newly_written_lines() {
+        let dir = std::env::temp_dir().join(format!("deskcrew-log-test-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("log.txt");
+
+        let seed: String = (0..80).map(|i| format!("old entry {i:04} padding text\n")).collect();
+        fs::write(&file, &seed).unwrap();
+        let keep_bytes = (seed.len() - 100) as u64;
+
+        std::thread::scope(|scope| {
+            for worker in 0..8 {
+                let file = &file;
+                scope.spawn(move || {
+                    for seq in 0..4 {
+                        append_and_trim(file, &format!("marker-{worker}-{seq}\n"), keep_bytes);
+                    }
+                });
+            }
+        });
+
+        let final_text = fs::read_to_string(&file).unwrap();
+        for worker in 0..8 {
+            for seq in 0..4 {
+                let marker = format!("marker-{worker}-{seq}");
+                assert!(final_text.lines().any(|line| line == marker), "missing {marker}");
+            }
+        }
+        assert!(final_text.len() < seed.len());
+        assert!(!dir.join("log.txt.tmp").exists());
+        let _ = fs::remove_dir_all(&dir);
     }
 }
