@@ -143,7 +143,7 @@ pub fn text_mask(text: &str, px: f32) -> Mask {
     let mut glyphs = Vec::new();
     let mut pen = 0.0;
     let mut last = None;
-    for c in text.chars() {
+    for c in text.chars().take(64) {
         let id = scaled.glyph_id(c);
         if let Some(before) = last {
             pen += scaled.kern(before, id);
@@ -208,7 +208,11 @@ impl Layer {
 
     /// Show a picture with its top left at x,y.
     fn show(&mut self, conn: &RustConnection, look: &Look, picture: &tiny_skia::Pixmap, x: i32, y: i32, visible: bool) {
-        let (w, h) = (picture.width() as u16, picture.height() as u16);
+        let Ok(w) = u16::try_from(picture.width()) else { return };
+        let Ok(h) = u16::try_from(picture.height()) else { return };
+        if w == 0 || h == 0 {
+            return;
+        }
         if (w, h) != (self.w, self.h) || (x, y) != self.at {
             let aux = ConfigureWindowAux::new().x(x).y(y).width(w as u32).height(h as u32);
             let _ = conn.configure_window(self.window, &aux);
@@ -378,9 +382,10 @@ fn run(inbox: Receiver<Command>) {
     let scale = 1.0;
     let mut agents: HashMap<String, Agent> = HashMap::new();
     let mut presses: Vec<Press> = Vec::new();
-    let mut aside = false;
+    let mut aside_depth: usize = 0;
     let mut restacked = Instant::now();
     loop {
+        let aside = aside_depth > 0;
         let Ok(first) = inbox.recv_timeout(FRAME) else {
             if matches!(inbox.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
                 return;
@@ -389,6 +394,7 @@ fn run(inbox: Receiver<Command>) {
             continue;
         };
         for command in std::iter::once(first).chain(inbox.try_iter()) {
+            let aside = aside_depth > 0;
             match command {
                 Command::Move { agent, x, y, instant, done } => {
                     let taken: Vec<Rgb> = agents.values().map(|a| a.colour).collect();
@@ -438,6 +444,7 @@ fn run(inbox: Receiver<Command>) {
                     }
                 }
                 Command::Press { agent, target } => {
+                    let target = (target.0, target.1, target.2.clamp(1, 8192), target.3.clamp(1, 8192));
                     if let Some(entry) = agents.get(&agent)
                         && let Some(layer) = Layer::new(&conn, &look)
                     {
@@ -450,6 +457,7 @@ fn run(inbox: Receiver<Command>) {
                     }
                 }
                 Command::Caret { agent, x, y, h } => {
+                    let h = h.clamp(1, 8192);
                     if let Some(entry) = agents.get_mut(&agent) {
                         entry.glide = None;
                         entry.at = (x as f32, y as f32);
@@ -463,23 +471,31 @@ fn run(inbox: Receiver<Command>) {
                     }
                 }
                 Command::Aside { on, done } => {
-                    aside = on;
-                    for agent in agents.values_mut() {
-                        if on { agent.layer.hide(&conn) } else { agent.layer.unhide(&conn) }
+                    let was = aside_depth > 0;
+                    if on {
+                        aside_depth += 1;
+                    } else {
+                        aside_depth = aside_depth.saturating_sub(1);
                     }
-                    for press in &mut presses {
-                        if on { press.layer.hide(&conn) } else { press.layer.unhide(&conn) }
-                    }
-                    // Once a round trip returns, the server has done everything asked before it.
-                    let _ = conn.get_input_focus().ok().and_then(|c| c.reply().ok());
-                    if on && !look.cut {
-                        thread::sleep(COMPOSITOR_SETTLE);
+                    let now_aside = aside_depth > 0;
+                    if now_aside != was {
+                        for agent in agents.values_mut() {
+                            if now_aside { agent.layer.hide(&conn) } else { agent.layer.unhide(&conn) }
+                        }
+                        for press in &mut presses {
+                            if now_aside { press.layer.hide(&conn) } else { press.layer.unhide(&conn) }
+                        }
+                        // Once a round trip returns, the server has done everything asked before it.
+                        let _ = conn.get_input_focus().ok().and_then(|c| c.reply().ok());
+                        if now_aside && !look.cut {
+                            thread::sleep(COMPOSITOR_SETTLE);
+                        }
                     }
                     let _ = done.send(());
                 }
             }
         }
-        tick(&conn, &look, scale, &mut agents, &mut presses, aside, &mut restacked);
+        tick(&conn, &look, scale, &mut agents, &mut presses, aside_depth > 0, &mut restacked);
     }
 }
 

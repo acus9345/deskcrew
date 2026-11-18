@@ -17,12 +17,16 @@ if args and args[0] == '--caret':
     args = args[1:]
 want = tuple(int(n) for n in args[:3])
 data = sys.stdin.buffer.read()
+if len(data) < 100:
+    sys.exit('incomplete XWD header')
 fields = struct.unpack('>25I', data[:100])
 header_size, depth, width, height = fields[0], fields[3], fields[4], fields[5]
 byte_order, bits_per_pixel, bytes_per_line = fields[7], fields[11], fields[12]
 red_mask, green_mask, blue_mask, colours = fields[14], fields[15], fields[16], fields[19]
 if bits_per_pixel not in (24, 32):
     sys.exit(f'only 24 or 32 bits a pixel are read here, not {bits_per_pixel}')
+if not (red_mask and green_mask and blue_mask):
+    sys.exit('XWD colour masks are zero')
 size = bits_per_pixel // 8
 pixels = data[header_size + colours * 12:]
 order = '<' if byte_order == 0 else '>'
@@ -54,6 +58,10 @@ if not tag_rows:
     sys.exit(0)
 
 tag_bottom = max(tag_rows)
+# Include rounded bottom rows of the tag itself (e.g. when no font is installed and the tag is 13px wide).
+while tag_bottom + 1 in rows and len(rows[tag_bottom + 1]) >= 5:
+    tag_bottom += 1
+    tag_rows.append(tag_bottom)
 tag_left = min(min(rows[y]) for y in tag_rows)
 tag_right = max(max(rows[y]) for y in tag_rows)
 below = [(y, xs) for y, xs in sorted(rows.items()) if y > tag_bottom]

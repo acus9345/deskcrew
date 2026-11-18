@@ -153,13 +153,14 @@ fn has(states: u64, bit: u32) -> bool {
 
 /// Where the object is on screen (or relative to its surface on Wayland).
 pub fn rect(obj: &Obj) -> Option<Bounds> {
+    let valid = |r: &Bounds| r.0 != i32::MIN && r.1 != i32::MIN && r.2 > 0 && r.3 > 0;
     let screen = call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(SCREEN,)).ok();
-    if screen.is_some_and(|r| r.2 > 0 && r.3 > 0) || (super::x::has_display() && !super::x::is_xwayland()) {
+    if screen.as_ref().is_some_and(valid) || (super::x::has_display() && !super::x::is_xwayland()) {
         return screen;
     }
     call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(WINDOW,))
         .ok()
-        .filter(|r| r.2 > 0 && r.3 > 0)
+        .filter(valid)
         .or(screen)
 }
 
@@ -275,7 +276,7 @@ pub fn frame_for(pid: u32, title: &str, at: Bounds) -> Option<Obj> {
     if let Some(same) = showing.iter().find(|f| !title.is_empty() && name(f) == title) {
         return Some((*same).clone());
     }
-    let near = |f: &&&Obj| rect(f).is_some_and(|r| (r.0 - at.0).abs() < 60 && (r.1 - at.1).abs() < 60 && (r.2 - at.2).abs() < 60);
+    let near = |f: &&&Obj| rect(f).is_some_and(|r| r.0.abs_diff(at.0) < 60 && r.1.abs_diff(at.1) < 60 && r.2.abs_diff(at.2) < 60);
     if let Some(placed) = showing.iter().find(near) {
         return Some((*placed).clone());
     }
@@ -322,8 +323,8 @@ fn outside(rect: Bounds, window: Bounds) -> bool {
     if window.2 <= 0 || window.3 <= 0 {
         return false;
     }
-    let (x, y, w, h) = rect;
-    let (wx, wy, ww, wh) = window;
+    let (x, y, w, h) = (rect.0 as i64, rect.1 as i64, rect.2 as i64, rect.3 as i64);
+    let (wx, wy, ww, wh) = (window.0 as i64, window.1 as i64, window.2 as i64, window.3 as i64);
     w <= 0 || h <= 0 || x + w <= wx || y + h <= wy || x >= wx + ww || y >= wy + wh
 }
 
@@ -717,7 +718,7 @@ pub fn table(obj: &Obj, skip: usize, rows: usize, columns: usize) -> Result<Tabl
         headers.clear();
     }
     let mut cells = Vec::new();
-    for row in skip.min(total_rows)..total_rows.min(skip + rows) {
+    for row in skip.min(total_rows)..total_rows.min(skip.saturating_add(rows)) {
         let mut line = Vec::new();
         for column in 0..total_columns.min(columns) {
             let cell = call::<_, (String, OwnedObjectPath)>(&owner, TABLE, "GetAccessibleAt", &(row as i32, column as i32)).ok().and_then(object);
@@ -726,6 +727,30 @@ pub fn table(obj: &Obj, skip: usize, rows: usize, columns: usize) -> Result<Tabl
         cells.push(line);
     }
     Ok(Table { headers, rows: cells, total_rows, total_columns })
+}
+
+/// Live checked state (`"on"`, `"mixed"`, `"off"`) of a checkbox, radio or toggle button.
+pub fn toggle_state(obj: &Obj, role: &str) -> Option<&'static str> {
+    let state = states(obj);
+    match role {
+        "checkbox" | "radio" => Some(if has(state, CHECKED) { "on" } else if has(state, INDETERMINATE) { "mixed" } else { "off" }),
+        "button" if has(state, CHECKABLE) || role_name(obj) == "toggle button" => Some(if has(state, CHECKED) { "on" } else { "off" }),
+        _ => None,
+    }
+}
+
+/// Live expanded state (`"open"` or `"closed"`) of an expandable control or combo box.
+pub fn expand_state(obj: &Obj, role: &str) -> Option<&'static str> {
+    let state = states(obj);
+    if role == "combobox" || has(state, EXPANDABLE) {
+        if has(state, EXPANDED) {
+            return Some("open");
+        }
+        if has(state, COLLAPSED) || role == "combobox" {
+            return Some("closed");
+        }
+    }
+    None
 }
 
 /// Where a field's caret is on the screen, as its top left and height, after the last character
@@ -740,8 +765,8 @@ pub fn caret(obj: &Obj) -> Option<(i32, i32, i32)> {
     {
         return Some((x, y, h));
     }
-    if let Some((x, y, w, h)) = extents((offset - 1).max(0)).filter(|_| count > 0) {
-        return Some((x + w, y, h));
+    if let Some((x, y, w, h)) = extents(offset.saturating_sub(1).max(0)).filter(|_| count > 0) {
+        return Some((x.saturating_add(w), y, h));
     }
     // An empty field: the start of its box, a little in.
     let (x, y, _, h) = rect(obj)?;

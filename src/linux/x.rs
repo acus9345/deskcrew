@@ -337,16 +337,25 @@ pub fn screens() -> Vec<(Bounds, bool)> {
     vec![((0, 0, screen.width_in_pixels as i32, screen.height_in_pixels as i32), true)]
 }
 
+static CAPTURE: Mutex<()> = Mutex::new(());
+
 /// A picture of part of the screen, as it is shown: windows covering it are in it too.
 pub fn capture(rect: Bounds) -> Result<Frame, String> {
     let x = x()?;
     let screen = &x.conn.setup().roots[0];
     let (sw, sh) = (screen.width_in_pixels as i32, screen.height_in_pixels as i32);
+    if sw < 1 || sh < 1 {
+        return Err("the screen has no size".into());
+    }
     let (left, top) = (rect.0.clamp(0, sw - 1), rect.1.clamp(0, sh - 1));
-    let (w, h) = ((rect.0 + rect.2).min(sw) - left, (rect.1 + rect.3).min(sh) - top);
+    let right = (rect.0 as i64 + rect.2 as i64).min(sw as i64);
+    let bottom = (rect.1 as i64 + rect.3 as i64).min(sh as i64);
+    let (w, h) = ((right - left as i64).min(i32::MAX as i64) as i32, (bottom - top as i64).min(i32::MAX as i64) as i32);
     if w < 1 || h < 1 {
         return Err("that part is off the screen".into());
     }
+    let byte_len = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)).ok_or("that region is too big")?;
+    let _capture = CAPTURE.lock().unwrap();
     // The agents' drawn cursors stay out of the picture.
     let overlay = super::overlay::Overlay::running();
     if let Some(overlay) = &overlay {
@@ -357,12 +366,12 @@ pub fn capture(rect: Bounds) -> Result<Frame, String> {
         overlay.aside(false);
     }
     let image = image?;
-    if image.depth < 24 || image.data.len() < (w * h * 4) as usize {
+    if image.depth < 24 || image.data.len() < byte_len {
         return Err(format!("the screen's colour depth ({}) is not supported", image.depth));
     }
     // 24 and 32 bit visuals keep pixels as blue, green, red, padding: the order Frame uses.
     let mut pixels = image.data;
-    pixels.truncate((w * h * 4) as usize);
+    pixels.truncate(byte_len);
     for pixel in pixels.as_chunks_mut::<4>().0 {
         pixel[3] = 255;
     }
@@ -864,7 +873,11 @@ pub fn spawn(app: &str, args: &[String]) -> Result<u32, String> {
     Ok(pid)
 }
 
-fn wayland_clipboard() -> Option<Result<Option<String>, String>> {
+fn use_wayland_clipboard() -> bool {
+    (!has_display() && has_wayland()) || is_xwayland()
+}
+
+fn wayland_clipboard_types() -> Option<Result<Vec<String>, String>> {
     let types = match Command::new("wl-paste").arg("--list-types").stderr(Stdio::piped()).output() {
         Ok(out) => out,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
@@ -873,20 +886,34 @@ fn wayland_clipboard() -> Option<Result<Option<String>, String>> {
     if !types.status.success() {
         let err = String::from_utf8_lossy(&types.stderr);
         if err.contains("Nothing is copied") || err.trim().is_empty() {
-            return Some(Ok(None));
+            return Some(Ok(Vec::new()));
         }
         return Some(Err(format!("could not read the Wayland clipboard: {}", err.trim())));
     }
-    let types_text = String::from_utf8_lossy(&types.stdout);
-    let list: Vec<&str> = types_text.lines().map(str::trim).collect();
+    let list = String::from_utf8_lossy(&types.stdout)
+        .lines()
+        .map(|l| l.trim().to_string())
+        .filter(|l| !l.is_empty())
+        .collect();
+    Some(Ok(list))
+}
+
+fn wayland_clipboard() -> Option<Result<Option<String>, String>> {
+    let list = match wayland_clipboard_types()? {
+        Ok(list) => list,
+        Err(e) => return Some(Err(e)),
+    };
+    if list.is_empty() {
+        return Some(Ok(None));
+    }
     let kind = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"]
         .into_iter()
-        .find(|wanted| list.iter().any(|item| item.eq_ignore_ascii_case(wanted)))
-        .or_else(|| list.iter().copied().find(|k| k.starts_with("text/")));
+        .find_map(|wanted| list.iter().find(|item| item.eq_ignore_ascii_case(wanted)).cloned())
+        .or_else(|| list.iter().find(|k| k.starts_with("text/")).cloned());
     let Some(kind) = kind else {
         return Some(Ok(None));
     };
-    let out = match Command::new("wl-paste").args(["--no-newline", "--type", kind]).stderr(Stdio::null()).output() {
+    let out = match Command::new("wl-paste").args(["--no-newline", "--type", &kind]).stderr(Stdio::null()).output() {
         Ok(out) => out,
         Err(e) => return Some(Err(format!("could not run wl-paste: {e}"))),
     };
@@ -907,7 +934,7 @@ fn wayland_set_clipboard(text: Option<&str>) -> Option<Result<(), String>> {
 
 /// The clipboard through xclip or xsel on X11, or wl-clipboard on Wayland.
 pub fn clipboard() -> Result<Option<String>, String> {
-    if has_wayland() {
+    if use_wayland_clipboard() {
         if let Some(res) = wayland_clipboard() {
             return res;
         }
@@ -924,7 +951,7 @@ pub fn clipboard() -> Result<Option<String>, String> {
 }
 
 pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
-    if has_wayland() {
+    if use_wayland_clipboard() {
         if let Some(res) = wayland_set_clipboard(text) {
             return res;
         }
@@ -947,30 +974,48 @@ fn own_clipboard(program: &str, args: &[&str], bytes: &[u8], text: Option<&str>)
     if let Some(mut input) = child.stdin.take()
         && let Err(e) = input.write_all(bytes)
     {
+        let _ = child.wait();
         return Some(Err(e.to_string()));
     }
     // The program leaves a copy of itself behind to own the clipboard: wait until it does,
     // so the next read sees the new contents.
     let started = Instant::now();
+    let mut exited = false;
     while started.elapsed() < Duration::from_secs(1) {
-        if let Ok(Some(status)) = child.try_wait() {
+        if !exited
+            && let Ok(Some(status)) = child.try_wait()
+        {
+            exited = true;
             if !status.success() {
                 return Some(Err(format!("{program} exited with {status}")));
             }
-            if text.is_none_or(|text| clipboard().ok().flatten().unwrap_or_default() == text) {
-                return Some(Ok(()));
-            }
+        }
+        if exited && text.is_none_or(|text| clipboard().ok().flatten().unwrap_or_default() == text) {
+            return Some(Ok(()));
         }
         thread::sleep(Duration::from_millis(20));
+    }
+    if exited {
+        return Some(Err(format!("{program} did not update the clipboard")));
     }
     thread::spawn(move || child.wait());
     Some(Ok(()))
 }
 
 /// The kinds of data on the clipboard, as X apps name them.
-fn clipboard_kinds() -> Option<Vec<String>> {
+fn clipboard_kinds() -> Option<(bool, Vec<String>)> {
+    if use_wayland_clipboard()
+        && let Some(Ok(kinds)) = wayland_clipboard_types()
+    {
+        return Some((true, kinds));
+    }
     let out = Command::new("xclip").args(["-selection", "clipboard", "-t", "TARGETS", "-o"]).stderr(Stdio::null()).output().ok()?;
-    out.status.success().then(|| String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect())
+    out.status.success().then(|| {
+        (
+            false,
+            String::from_utf8_lossy(&out.stdout).lines().map(|l| l.trim().to_string()).filter(|l| !l.is_empty()).collect(),
+        )
+    })
 }
 
 /// The kind of clipboard data worth keeping most: a picture, then copied files, then text.
@@ -997,8 +1042,16 @@ pub struct SavedClipboard {
 impl SavedClipboard {
     pub fn take() -> SavedClipboard {
         let kept = match clipboard_kinds() {
-            Some(kinds) => main_kind(&kinds).and_then(|kind| {
-                let out = Command::new("xclip").args(["-selection", "clipboard", "-t", kind, "-o"]).stderr(Stdio::null()).output().ok()?;
+            Some((wayland, kinds)) => main_kind(&kinds).and_then(|kind| {
+                let out = if wayland {
+                    let mut cmd = Command::new("wl-paste");
+                    if kind == "UTF8_STRING" || kind.starts_with("text/plain") {
+                        cmd.arg("--no-newline");
+                    }
+                    cmd.args(["--type", kind]).stderr(Stdio::null()).output().ok()?
+                } else {
+                    Command::new("xclip").args(["-selection", "clipboard", "-t", kind, "-o"]).stderr(Stdio::null()).output().ok()?
+                };
                 out.status.success().then(|| (kind.clone(), out.stdout))
             }),
             None => clipboard().ok().flatten().map(|text| ("UTF8_STRING".to_string(), text.into_bytes())),
@@ -1022,6 +1075,11 @@ impl SavedClipboard {
         let Some((kind, bytes)) = self.kept else { return set_clipboard(None) };
         if kind == "UTF8_STRING" || kind.starts_with("text/plain") {
             return set_clipboard(Some(&String::from_utf8_lossy(&bytes)));
+        }
+        if use_wayland_clipboard()
+            && let Some(done) = own_clipboard("wl-copy", &["--type", &kind], &bytes, None)
+        {
+            return done;
         }
         own_clipboard("xclip", &["-selection", "clipboard", "-t", &kind, "-i"], &bytes, None)
             .unwrap_or_else(|| Err("the clipboard needs xclip to put a picture or files back".into()))

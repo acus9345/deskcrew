@@ -36,11 +36,12 @@ echo "$out"; echo "(exit $code)"
 if [ $code -eq 0 ] || ! grep -qF "no X display" <<<"$out"; then echo "FAILED: expected a no-display refusal"; failed=1; fi
 
 # A Wayland session with no X display refuses X11-only commands such as shot with a clear error.
-echo "\$ WAYLAND_DISPLAY=wayland-0 deskcrew shot --screen (no DISPLAY)"
-out=$(env -u DISPLAY WAYLAND_DISPLAY=wayland-0 "$exe" shot --screen 2>&1); code=$?
+wayland_test="deskcrew-live-$$"
+echo "\$ WAYLAND_DISPLAY=$wayland_test deskcrew shot --screen (no DISPLAY)"
+out=$(env -u DISPLAY WAYLAND_DISPLAY="$wayland_test" "$exe" shot --screen 2>&1); code=$?
 echo "$out"; echo "(exit $code)"
 if [ $code -eq 0 ] || ! grep -qF "Wayland" <<<"$out"; then echo "FAILED: expected a Wayland refusal on shot"; failed=1; fi
-env -u DISPLAY WAYLAND_DISPLAY=wayland-0 "$exe" quit >/dev/null 2>&1 || true
+env -u DISPLAY WAYLAND_DISPLAY="$wayland_test" "$exe" quit >/dev/null 2>&1 || true
 plain="${DESKCREW_FORM:-}"
 if [ -z "$plain" ] && ! python3 -c "import gi; gi.require_version('Gtk', '3.0')" 2>/dev/null; then
     plain="$(dirname "$exe")/examples/linux_form"
@@ -178,7 +179,7 @@ fi
 expect "bye" quit
 
 # Pure Wayland mode (no DISPLAY): AT-SPI reading and control actions work, while X11-only commands refuse clearly.
-wrun() { echo "\$ WAYLAND_DISPLAY=wayland-0 deskcrew $*"; out=$(env -u DISPLAY WAYLAND_DISPLAY=wayland-0 "$exe" "$@" 2>&1); code=$?; echo "$out" | head -30; echo "(exit $code)"; }
+wrun() { echo "\$ WAYLAND_DISPLAY=$wayland_test deskcrew $*"; out=$(env -u DISPLAY WAYLAND_DISPLAY="$wayland_test" "$exe" "$@" 2>&1); code=$?; echo "$out" | head -30; echo "(exit $code)"; }
 wexpect() { want="$1"; shift; wrun "$@"; if [ $code -ne 0 ] || ! grep -qF -- "$want" <<<"$out"; then echo "FAILED (Wayland): expected '$want'"; failed=1; fi; }
 wrefuse() { want="$1"; shift; wrun "$@"; if [ $code -eq 0 ] || ! grep -qF -- "$want" <<<"$out"; then echo "FAILED (Wayland): expected a refusal with '$want'"; failed=1; fi; }
 

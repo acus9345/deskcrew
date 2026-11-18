@@ -17,7 +17,7 @@ use crate::{
 use std::{
     collections::{BTreeMap, HashMap},
     sync::{
-        Arc, Mutex,
+        Arc, Condvar, Mutex,
         atomic::{AtomicBool, Ordering},
     },
     thread,
@@ -277,8 +277,8 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
             "--with" => flags.with = next.clone(),
             "--button" => flags.button = Some(next.as_deref().and_then(x::Button::named).filter(|b| matches!(b, x::Button::Left | x::Button::Right | x::Button::Middle)).ok_or(()) ),
             "--risk" => flags.risk = next.clone(),
-            "--from" => flags.from = number(&next).unwrap_or(0) as usize,
-            "--edge" => flags.edge = number(&next).map(|n| n as u32),
+            "--from" => flags.from = number(&next).unwrap_or(0).min(usize::MAX as u64) as usize,
+            "--edge" => flags.edge = number(&next).map(|n| n.min(u32::MAX as u64) as u32),
             "--ms" | "--timeout" => flags.ms = number(&next),
             "--hold" => flags.hold = number(&next),
             _ => took = false,
@@ -347,6 +347,9 @@ struct Service {
     agents: Mutex<HashMap<String, AgentState>>,
     last_used: Mutex<Instant>,
     quit: AtomicBool,
+    unlinked: AtomicBool,
+    wake_lock: Mutex<()>,
+    wake: Condvar,
     overlay: Overlay,
 }
 
@@ -397,7 +400,12 @@ impl Service {
         if let Ok(frames) = atspi::windows() {
             let mut matched = vec![false; frames.len()];
             for xw in &mut out {
-                let mut candidates: Vec<usize> = frames.iter().enumerate().filter(|(i, f)| !matched[*i] && f.pid == xw.pid).map(|(i, _)| i).collect();
+                let mut candidates: Vec<usize> = frames
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, f)| !matched[*i] && ((xw.pid > 0 && f.pid == xw.pid) || xw.pid == 0))
+                    .map(|(i, _)| i)
+                    .collect();
                 if candidates.is_empty() {
                     continue;
                 }
@@ -408,10 +416,10 @@ impl Service {
                     .or_else(|| {
                         candidates.iter().copied().find(|&i| {
                             let r = frames[i].rect;
-                            r.2 > 0 && (r.0 - xw.rect.0).abs() < 60 && (r.1 - xw.rect.1).abs() < 60 && (r.2 - xw.rect.2).abs() < 60
+                            r.2 > 0 && r.0.abs_diff(xw.rect.0) < 60 && r.1.abs_diff(xw.rect.1) < 60 && r.2.abs_diff(xw.rect.2) < 60
                         })
                     })
-                    .or_else(|| (candidates.len() == 1).then(|| candidates.remove(0)));
+                    .or_else(|| (xw.pid > 0 && candidates.len() == 1).then(|| candidates.remove(0)));
                 if let Some(idx) = pick {
                     matched[idx] = true;
                     xw.element = Some(frames[idx].element.clone());
@@ -782,10 +790,12 @@ impl Service {
     fn ensure(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, wanted: Option<&'static str>) -> Reply {
         let (id, rect, element) = self.control(word, who, tracked, view)?;
         self.cursor_on(who, tracked, rect, true);
-        if let Some(wanted) = wanted
-            && view.nodes[&id].parts.states.contains(&wanted)
-        {
-            return Ok(format!("already {wanted}"));
+        if let Some(wanted) = wanted {
+            let role = &view.nodes[&id].parts.role;
+            let current = atspi::toggle_state(&element, role);
+            if current.is_some_and(|s| s == wanted) || (current.is_none() && view.nodes[&id].parts.states.contains(&wanted)) {
+                return Ok(format!("already {wanted}"));
+            }
         }
         atspi::perform(&element, &["toggle", "click", "press", "activate", "*"])
     }
@@ -794,7 +804,9 @@ impl Service {
         let (id, rect, element) = self.control(word, who, tracked, view)?;
         self.cursor_on(who, tracked, rect, true);
         let wanted = if open { "open" } else { "closed" };
-        if view.nodes[&id].parts.states.contains(&wanted) {
+        let role = &view.nodes[&id].parts.role;
+        let current = atspi::expand_state(&element, role);
+        if current.is_some_and(|s| s == wanted) || (current.is_none() && view.nodes[&id].parts.states.contains(&wanted)) {
             return Ok(format!("already {wanted}"));
         }
         atspi::perform(&element, &["expand or contract", if open { "expand" } else { "collapse" }, "press", "click", "activate"])
@@ -1512,7 +1524,7 @@ impl Service {
             }
             let node = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?;
             let rect = atspi::rect(&node.element).unwrap_or(node.rect);
-            frame = frame.crop((rect.0 - left).max(0) as u32, (rect.1 - top).max(0) as u32, rect.2.max(1) as u32, rect.3.max(1) as u32);
+            frame = frame.crop(rect.0.saturating_sub(left).max(0) as u32, rect.1.saturating_sub(top).max(0) as u32, rect.2.max(1) as u32, rect.3.max(1) as u32);
             origin = (rect.0.max(left), rect.1.max(top));
         }
         let hash = frame.hash();
@@ -1570,13 +1582,17 @@ impl Service {
         let app = words.first().ok_or("launch needs an app")?;
         let before: Vec<WindowKey> = self.list_windows()?.into_iter().map(|w| w.key).collect();
         let pid = x::spawn(app, &words[1..])?;
+        let xwayland = x::is_xwayland();
         let started = Instant::now();
         let mut found = None;
+        let mut atspi_seen_at = None;
         while started.elapsed() < LAUNCH_WAIT {
             thread::sleep(LAUNCH_STEP);
             let now = self.list_windows()?;
-            if let Some(own) = now.iter().find(|w| w.pid == pid) {
-                found = Some(WindowInfo {
+            let picked = now
+                .iter()
+                .find(|w| w.pid == pid)
+                .map(|own| WindowInfo {
                     key: own.key.clone(),
                     x11: own.x11,
                     element: own.element.clone(),
@@ -1584,11 +1600,14 @@ impl Service {
                     app: own.app.clone(),
                     title: own.title.clone(),
                     rect: own.rect,
-                });
-                break;
-            }
-            if let Some(new) = now.into_iter().find(|w| !before.contains(&w.key)) {
-                found = Some(new);
+                })
+                .or_else(|| now.into_iter().find(|w| !before.contains(&w.key)));
+            if let Some(window) = picked {
+                let wait_x11 = xwayland && window.x11.is_none();
+                found = Some(window);
+                if wait_x11 && atspi_seen_at.get_or_insert_with(Instant::now).elapsed() < Duration::from_millis(600) {
+                    continue;
+                }
                 break;
             }
         }
@@ -1740,7 +1759,11 @@ impl Service {
             }
             "quit" => {
                 self.release(true);
-                self.quit.store(true, Ordering::Relaxed);
+                self.quit.store(true, Ordering::Release);
+                if !self.unlinked.swap(true, Ordering::AcqRel) {
+                    pipe::remove();
+                }
+                self.wake.notify_all();
                 Ok("bye".into())
             }
             "do" => {
@@ -1800,6 +1823,9 @@ pub fn run() {
         agents: Mutex::new(HashMap::new()),
         last_used: Mutex::new(Instant::now()),
         quit: AtomicBool::new(false),
+        unlinked: AtomicBool::new(false),
+        wake_lock: Mutex::new(()),
+        wake: Condvar::new(),
         overlay: Overlay::start(),
     });
     super::notifications::watch();
@@ -1822,13 +1848,17 @@ pub fn run() {
         });
     }
     loop {
-        thread::sleep(Duration::from_millis(250));
+        let guard = service.wake_lock.lock().unwrap();
+        let (guard, _) = service.wake.wait_timeout(guard, Duration::from_millis(250)).unwrap();
+        drop(guard);
         service.release(false);
-        if service.quit.load(Ordering::Relaxed) || service.last_used.lock().unwrap().elapsed() > IDLE_EXIT {
+        if service.quit.load(Ordering::Acquire) || service.last_used.lock().unwrap().elapsed() > IDLE_EXIT {
             break;
         }
     }
     service.release(true);
     thread::sleep(Duration::from_millis(100));
-    pipe::remove();
+    if !service.unlinked.swap(true, Ordering::AcqRel) {
+        pipe::remove();
+    }
 }

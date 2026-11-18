@@ -97,6 +97,10 @@ fn main() {
         _ => {
             // Processes, files, the shell and the like need no window, so they skip the service.
             let mut words: Vec<String> = args.iter().enumerate().filter(|(at, _)| !(args.get(at.wrapping_sub(1)).is_some_and(|w| w == "--agent") || args[*at] == "--agent")).map(|(_, w)| w.clone()).collect();
+            if words.is_empty() {
+                println!("{}\n{}\n{}", service::HELP, system::HELP, trace::HELP);
+                return;
+            }
             let who = client::agent(&mut args.clone());
             let session = system::COMMANDS.contains(&words[0].as_str()).then(|| trace::session_of(&who, &mut words)).flatten();
             let started = std::time::Instant::now();
