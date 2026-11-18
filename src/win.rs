@@ -124,7 +124,7 @@ pub fn content_pid(hwnd: Hwnd) -> u32 {
     if class(hwnd) != "ApplicationFrameWindow" {
         return own;
     }
-    children(hwnd).into_iter().map(pid).find(|p| *p != own).unwrap_or(own)
+    children(hwnd).into_iter().map(pid).find(|p| *p != 0 && *p != own).unwrap_or(own)
 }
 
 fn is_frame_host(process_id: u32) -> bool {
@@ -205,11 +205,11 @@ fn enabled(hwnd: Hwnd) -> bool {
 /// takes all its input, and one shown at startup has no owner.
 fn own_windows(root: Hwnd) -> impl Iterator<Item = Hwnd> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetTopWindow};
-    let owner = content_pid(root);
+    let owners = app_pids(root);
     let blocked = !enabled(root);
     let top = unsafe { GetTopWindow(null_mut()) } as Hwnd;
     std::iter::successors((top != 0).then_some(top), |&at| Some(unsafe { GetWindow(raw(at), GW_HWNDNEXT) } as Hwnd).filter(|&next| next != 0))
-        .filter(move |&hwnd| unsafe { IsWindowVisible(raw(hwnd)) } != 0 && (pid(hwnd) == owner || content_pid(hwnd) == owner) && class(hwnd) != "SysShadow")
+        .filter(move |&hwnd| unsafe { IsWindowVisible(raw(hwnd)) } != 0 && (hwnd == root || owners.contains(&pid(hwnd)) || owners.contains(&content_pid(hwnd))) && class(hwnd) != "SysShadow")
         .filter(move |&hwnd| hwnd == root || blocked || belongs(hwnd, &[root]))
 }
 
@@ -589,7 +589,8 @@ fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
         let shown = OffScreen { hwnd, placement, _lock: lock };
         // Should it come forward all the same, the person gets their window back at once.
         let now = foreground();
-        if now != front && (now == hwnd || pid(now) == pid(hwnd)) {
+        let pids = app_pids(hwnd);
+        if now != front && (now == hwnd || pids.contains(&pid(now)) || pids.contains(&content_pid(now))) {
             drop(shown);
             if front != 0 && !bring_forward(front) {
                 stop_flashing(front);
@@ -713,9 +714,22 @@ pub fn owns_point(family: &[Hwnd], x: i32, y: i32) -> bool {
 
 /// A popup, menu or dialog of this window rather than an unrelated window of the same app.
 pub fn belongs(hwnd: Hwnd, family: &[Hwnd]) -> bool {
-    let owner = unsafe { GetWindow(raw(hwnd), GW_OWNER) } as Hwnd;
+    let mut owner = unsafe { GetWindow(raw(hwnd), GW_OWNER) } as Hwnd;
+    if owner != 0 {
+        for _ in 0..8 {
+            if family.contains(&owner) {
+                return true;
+            }
+            let next = unsafe { GetWindow(raw(owner), GW_OWNER) } as Hwnd;
+            if next == 0 || next == owner {
+                break;
+            }
+            owner = next;
+        }
+        return false;
+    }
     let name = class(hwnd);
-    family.contains(&owner) || name == "#32768" || name == "#32770" || name.contains("Popup") || name.contains("DropDown")
+    name == "#32768" || name == "#32770" || name.contains("Popup") || name.contains("DropDown")
 }
 
 /// Put an overlay window directly above this window, or above the highest of its menus and popups,
@@ -1092,8 +1106,10 @@ pub struct ForegroundLock;
 impl ForegroundLock {
     pub fn take() -> ForegroundLock {
         let mut held = LOCKS.lock().unwrap();
-        // Always refresh the OS lock: Windows drops it automatically if the user switches windows.
-        held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
+        // Always refresh the OS lock: Windows drops it automatically if the user switches windows,
+        // while keeping `held.1` true if an outer guard already holds the OS lock.
+        let locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
+        held.1 = if held.0 == 0 { locked } else { held.1 || locked };
         held.0 += 1;
         ForegroundLock
     }
@@ -1103,7 +1119,9 @@ impl ForegroundLock {
         let mut held = LOCKS.lock().unwrap();
         let locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
         if !locked {
-            held.1 = false;
+            if held.0 == 0 {
+                held.1 = false;
+            }
             return None;
         }
         held.1 = true;

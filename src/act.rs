@@ -878,7 +878,11 @@ pub fn select_item(node: &Node, item: &str, uia: &Uia, root: Hwnd, surfaces: &[H
         return result;
     }
     behind(root, || {
-        let already_open = node.parts.states.contains(&"open") || (node.can.expand && node.element.is_expanded());
+        let already_open = if node.can.expand {
+            node.element.is_expanded().unwrap_or_else(|| node.parts.states.contains(&"open"))
+        } else {
+            node.parts.states.contains(&"open")
+        };
         let mut opened = false;
         let mut opening = false;
         if node.can.expand && !already_open {
@@ -894,16 +898,16 @@ pub fn select_item(node: &Node, item: &str, uia: &Uia, root: Hwnd, surfaces: &[H
         }
         let find_once = || {
             node.element.find_named(item, uia).or_else(|| {
-                (opened || already_open || node.parts.role == "combobox")
+                (opened || already_open || !node.can.expand)
                     .then(|| uia.find_popup_item(root, surfaces, item))
                     .flatten()
             })
         };
         let mut found = find_once();
-        if found.is_none() && opening {
+        if found.is_none() && (opening || (opened && node.element.is_expanded() == Some(false))) {
             let deadline = std::time::Instant::now() + std::time::Duration::from_millis(900);
             while std::time::Instant::now() < deadline {
-                let expanded = node.element.is_expanded();
+                let expanded = node.element.is_expanded().unwrap_or(false);
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 found = find_once();
                 if found.is_some() || expanded {
