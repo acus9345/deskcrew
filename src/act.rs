@@ -1,7 +1,7 @@
 // Acting on a control without touching the real mouse or keyboard: the app's own accessibility
 // actions first, then Windows messages for classic controls. Each result names the route taken.
 use crate::real::{self, Button, Chord, Modifiers};
-use crate::uia::{Done, Element, Node, Uia};
+use crate::uia::{Done, Node, Uia};
 use crate::win::{self, Hwnd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::{
@@ -88,23 +88,38 @@ pub fn wake_page(root: Hwnd) {
     }
 }
 
-/// How long a Store app takes to bring its window forward after one of its buttons is pressed
-/// through accessibility, which it does every time.
+/// How long a Store or WinUI app takes to bring its window forward after an accessibility action
+/// runs, which it does on Invoke, Toggle, SelectionItem and ExpandCollapse.
 const STORE_ACTIVATION: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Press a control of `root`, keeping its app behind. A Store app such as Calculator comes forward
-/// a moment after accessibility presses one of its buttons, and WPF can for an instant: Windows'
-/// foreground lock, held through that moment, stops both.
-pub fn press_behind(node: &Node, root: Hwnd) -> Option<Result<String, String>> {
-    if !win::draws_itself(root) {
-        return press(node);
+/// Run an accessibility action on `root`, keeping its app behind. A Store or WinUI app such as
+/// Calculator, Settings, Photos or the new Notepad comes forward a moment after accessibility acts
+/// on one of its controls, and WPF can for an instant: Windows' foreground lock, held through that
+/// moment, stops both.
+pub fn behind<T>(root: Hwnd, work: impl FnOnce() -> T) -> T {
+    let store = win::is_store(root);
+    if !store && !win::draws_itself(root) {
+        return work();
     }
     let lock = win::ForegroundLock::try_take();
-    let pressed = press(node);
-    if lock.is_some() && win::class(root) == "ApplicationFrameWindow" {
+    let result = work();
+    if lock.is_some() && store {
         std::thread::sleep(STORE_ACTIVATION);
     }
-    pressed
+    result
+}
+
+/// Press a control of `root`, keeping its app behind.
+pub fn press_behind(node: &Node, root: Hwnd) -> Option<Result<String, String>> {
+    if !node.can.toggle && !node.can.invoke && !node.can.select && !node.can.expand && !node.can.legacy {
+        return None;
+    }
+    behind(root, || press(node))
+}
+
+/// Expand or collapse a control of `root` to `open`, keeping its app behind.
+pub fn expand_behind(node: &Node, root: Hwnd, open: bool) -> Result<String, String> {
+    behind(root, || node.element.expand(open)).map(|d| route("expand", d))
 }
 
 /// A check box or radio button WinForms draws itself: its own default action flips it in place.
@@ -847,27 +862,66 @@ fn select_in_classic_combo(node: &Node, item: &str) -> Option<Result<String, Str
         return Some(Err(format!("no entry named '{item}'")));
     }
     let (parent, id) = win::parent_and_id(node.native);
-    let result = post(node.native, CB_SETCURSEL, index, 0)
-        .and_then(|_| post(parent, WM_COMMAND, (CBN_SELCHANGE << 16) | (id as usize & 0xFFFF), node.native));
+    let result = post(node.native, CB_SETCURSEL, index, 0).and_then(|_| {
+        if parent != 0 {
+            post(parent, WM_COMMAND, (CBN_SELCHANGE << 16) | (id as usize & 0xFFFF), node.native)
+        } else {
+            Ok(())
+        }
+    });
     Some(result.map(|_| "message".to_string()))
 }
 
 /// Open a dropdown or list, pick the named entry, and close it again.
-pub fn select_item(node: &Node, item: &str, uia: &Uia, root: Hwnd) -> Result<String, String> {
-    if !win::draws_itself(root) && let Some(result) = select_in_classic_combo(node, item) {
+pub fn select_item(node: &Node, item: &str, uia: &Uia, root: Hwnd, surfaces: &[Hwnd]) -> Result<String, String> {
+    if !win::draws_itself(root) && !win::draws_itself(node.native) && let Some(result) = select_in_classic_combo(node, item) {
         return result;
     }
-    let opened = node.can.expand && node.element.open().is_ok();
-    if opened {
-        std::thread::sleep(std::time::Duration::from_millis(120));
-    }
-    let found: Option<Element> = node.element.find_named(item, uia);
-    let result = match found {
-        Some(entry) => entry.select().map(|_| "select".to_string()),
-        None => Err(format!("no entry named '{item}'")),
-    };
-    if opened {
-        let _ = node.element.close();
-    }
-    result
+    behind(root, || {
+        let already_open = if node.can.expand {
+            node.element.is_expanded().unwrap_or_else(|| node.parts.states.contains(&"open"))
+        } else {
+            node.parts.states.contains(&"open")
+        };
+        let mut opened = false;
+        let mut opening = false;
+        if node.can.expand && !already_open {
+            match node.element.open() {
+                Ok(done) => {
+                    opened = true;
+                    opening = matches!(done, Done::StillRunning);
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+                Err(error) if error.contains("administrator") || error.contains("gone") => return Err(error),
+                Err(_) => {}
+            }
+        }
+        let find_once = || {
+            node.element.find_named(item, uia).or_else(|| {
+                (opened || already_open || !node.can.expand)
+                    .then(|| uia.find_popup_item(root, surfaces, item))
+                    .flatten()
+            })
+        };
+        let mut found = find_once();
+        if found.is_none() && (opening || (opened && node.element.is_expanded() == Some(false))) {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(900);
+            while std::time::Instant::now() < deadline {
+                let expanded = node.element.is_expanded().unwrap_or(false);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                found = find_once();
+                if found.is_some() || expanded {
+                    break;
+                }
+            }
+        }
+        let done = match found {
+            Some(entry) => entry.select(),
+            None => Err(format!("no entry named '{item}'")),
+        };
+        if opened && !matches!(done, Ok(Done::StillRunning)) {
+            let _ = node.element.close();
+        }
+        done.map(|d| route("select", d))
+    })
 }

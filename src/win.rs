@@ -124,7 +124,24 @@ pub fn content_pid(hwnd: Hwnd) -> u32 {
     if class(hwnd) != "ApplicationFrameWindow" {
         return own;
     }
-    children(hwnd).into_iter().map(pid).find(|p| *p != own).unwrap_or(own)
+    children(hwnd).into_iter().map(pid).find(|p| *p != 0 && *p != own).unwrap_or(own)
+}
+
+fn is_frame_host(process_id: u32) -> bool {
+    image_name(process_id).eq_ignore_ascii_case("applicationframehost")
+}
+
+/// Process ids belonging to this window's own app, excluding Windows' shared
+/// `ApplicationFrameHost` frame process so Store apps do not collide with each other.
+pub fn app_pids(hwnd: Hwnd) -> Vec<u32> {
+    let own = pid(hwnd);
+    if class(hwnd) != "ApplicationFrameWindow" {
+        return (own != 0).then_some(own).into_iter().collect();
+    }
+    let mut out: Vec<u32> = children(hwnd).into_iter().map(pid).filter(|p| *p != 0 && *p != own).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
 }
 
 fn shown(hwnd: Hwnd) -> bool {
@@ -157,7 +174,13 @@ pub fn list() -> Vec<Win> {
 
 /// Every visible window of these processes, popups included.
 pub fn of_processes(pids: &[u32]) -> Vec<Hwnd> {
-    top_level().into_iter().filter(|&hwnd| shown(hwnd) && pids.contains(&pid(hwnd)) && class(hwnd) != "deskcrew").collect()
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    top_level()
+        .into_iter()
+        .filter(|&hwnd| shown(hwnd) && (pids.contains(&pid(hwnd)) || pids.contains(&content_pid(hwnd))) && class(hwnd) != "deskcrew")
+        .collect()
 }
 
 /// A screen point in a window's own client coordinates.
@@ -182,11 +205,11 @@ fn enabled(hwnd: Hwnd) -> bool {
 /// takes all its input, and one shown at startup has no owner.
 fn own_windows(root: Hwnd) -> impl Iterator<Item = Hwnd> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetTopWindow};
-    let owner = pid(root);
+    let owners = app_pids(root);
     let blocked = !enabled(root);
     let top = unsafe { GetTopWindow(null_mut()) } as Hwnd;
     std::iter::successors((top != 0).then_some(top), |&at| Some(unsafe { GetWindow(raw(at), GW_HWNDNEXT) } as Hwnd).filter(|&next| next != 0))
-        .filter(move |&hwnd| unsafe { IsWindowVisible(raw(hwnd)) } != 0 && pid(hwnd) == owner && class(hwnd) != "SysShadow")
+        .filter(move |&hwnd| unsafe { IsWindowVisible(raw(hwnd)) } != 0 && (hwnd == root || owners.contains(&pid(hwnd)) || owners.contains(&content_pid(hwnd))) && class(hwnd) != "SysShadow")
         .filter(move |&hwnd| hwnd == root || blocked || belongs(hwnd, &[root]))
 }
 
@@ -566,7 +589,8 @@ fn show_off_screen(hwnd: Hwnd) -> Option<OffScreen> {
         let shown = OffScreen { hwnd, placement, _lock: lock };
         // Should it come forward all the same, the person gets their window back at once.
         let now = foreground();
-        if now != front && (now == hwnd || pid(now) == pid(hwnd)) {
+        let pids = app_pids(hwnd);
+        if now != front && (now == hwnd || pids.contains(&pid(now)) || pids.contains(&content_pid(now))) {
             drop(shown);
             if front != 0 && !bring_forward(front) {
                 stop_flashing(front);
@@ -690,9 +714,22 @@ pub fn owns_point(family: &[Hwnd], x: i32, y: i32) -> bool {
 
 /// A popup, menu or dialog of this window rather than an unrelated window of the same app.
 pub fn belongs(hwnd: Hwnd, family: &[Hwnd]) -> bool {
-    let owner = unsafe { GetWindow(raw(hwnd), GW_OWNER) } as Hwnd;
+    let mut owner = unsafe { GetWindow(raw(hwnd), GW_OWNER) } as Hwnd;
+    if owner != 0 {
+        for _ in 0..8 {
+            if family.contains(&owner) {
+                return true;
+            }
+            let next = unsafe { GetWindow(raw(owner), GW_OWNER) } as Hwnd;
+            if next == 0 || next == owner {
+                break;
+            }
+            owner = next;
+        }
+        return false;
+    }
     let name = class(hwnd);
-    family.contains(&owner) || name == "#32768" || name == "#32770" || name.contains("Popup") || name.contains("DropDown")
+    name == "#32768" || name == "#32770" || name.contains("Popup") || name.contains("DropDown")
 }
 
 /// Put an overlay window directly above this window, or above the highest of its menus and popups,
@@ -962,13 +999,52 @@ pub fn on_screen(x: i32, y: i32) -> bool {
     screens().iter().any(|&(left, top, w, h, _)| x >= left && y >= top && x < left + w && y < top + h)
 }
 
+/// Windows of Store and WinUI apps, and the XAML bridge windows hosted inside desktop apps such as
+/// the new Notepad.
+fn is_xaml_class(name: &str) -> bool {
+    [
+        "Xaml",
+        "CoreWindow",
+        "DesktopChildSiteBridge",
+        "DesktopWindowContentBridge",
+        "InputSite",
+        "ApplicationFrame",
+        "WinUIDesktop",
+    ]
+    .iter()
+    .any(|part| name.contains(part))
+}
+
+fn is_xaml(hwnd: Hwnd) -> bool {
+    is_xaml_class(&class(hwnd))
+}
+
+/// True if this window is a Store or WinUI app, or hosts WinUI / XAML Islands inside itself.
+/// Store and WinUI apps can pull themselves forward a moment after an accessibility action runs.
+pub fn is_store(hwnd: Hwnd) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    if is_xaml(hwnd) {
+        return true;
+    }
+    unsafe extern "system" fn find_xaml(child: HWND, found: LPARAM) -> BOOL {
+        if is_xaml(child as Hwnd) {
+            unsafe { *(found as *mut bool) = true };
+            return 0;
+        }
+        1
+    }
+    let mut found = false;
+    unsafe { EnumChildWindows(raw(hwnd), Some(find_xaml), &mut found as *mut bool as LPARAM) };
+    found
+}
+
 /// Windows drawn by their own engine: their controls are not separate windows, and posted
 /// messages do not reach them, Qt's pointer input aside.
 pub fn draws_itself(hwnd: Hwnd) -> bool {
     let name = class(hwnd);
-    ["Xaml", "CoreWindow", "DesktopChildSiteBridge", "InputSite", "ApplicationFrame", "Mozilla", "HwndWrapper", "Qt"]
-        .iter()
-        .any(|part| name.contains(part))
+    is_xaml_class(&name) || ["Mozilla", "HwndWrapper", "Qt"].iter().any(|part| name.contains(part))
 }
 
 fn holds_front(hwnd: Hwnd, ms: u64) -> bool {
@@ -1030,9 +1106,10 @@ pub struct ForegroundLock;
 impl ForegroundLock {
     pub fn take() -> ForegroundLock {
         let mut held = LOCKS.lock().unwrap();
-        if !held.1 {
-            held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
-        }
+        // Always refresh the OS lock: Windows drops it automatically if the user switches windows,
+        // while keeping `held.1` true if an outer guard already holds the OS lock.
+        let locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
+        held.1 = if held.0 == 0 { locked } else { held.1 || locked };
         held.0 += 1;
         ForegroundLock
     }
@@ -1040,12 +1117,14 @@ impl ForegroundLock {
     /// The lock, if Windows gave it: it only does to a process that could take the foreground.
     pub fn try_take() -> Option<ForegroundLock> {
         let mut held = LOCKS.lock().unwrap();
-        if !held.1 {
-            held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
-        }
-        if !held.1 {
+        let locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
+        if !locked {
+            if held.0 == 0 {
+                held.1 = false;
+            }
             return None;
         }
+        held.1 = true;
         held.0 += 1;
         Some(ForegroundLock)
     }
@@ -1145,8 +1224,10 @@ impl FocusGuard {
             return false;
         }
         let mut pulled = PULLED.lock().unwrap();
-        for owner in [pid(now), content_pid(now)] {
-            if !pulled.contains(&owner) {
+        let owners = app_pids(now);
+        let owners = if owners.is_empty() { vec![pid(now)] } else { owners };
+        for owner in owners {
+            if !is_frame_host(owner) && !pulled.contains(&owner) {
                 pulled.push(owner);
             }
         }
@@ -1346,7 +1427,7 @@ pub fn note_worked_in(hwnd: Hwnd) {
 
 /// Note that agents are working in these processes.
 pub fn note_worked(pids: &[u32]) {
-    let pids: Vec<u32> = pids.iter().copied().filter(|p| !image_name(*p).to_lowercase().ends_with("applicationframehost.exe")).collect();
+    let pids: Vec<u32> = pids.iter().copied().filter(|p| !is_frame_host(*p)).collect();
     let pids = &pids[..];
     let mut worked = WORKED.lock().unwrap();
     worked.retain(|(pid, at)| !pids.contains(pid) && at.elapsed() < FLASHES_WATCHED_FOR);
@@ -1407,4 +1488,28 @@ pub fn watch_flashes() {
             DispatchMessageW(&message);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xaml_classes_include_store_winui_and_xaml_islands_bridges() {
+        for name in [
+            "ApplicationFrameWindow",
+            "Windows.UI.Core.CoreWindow",
+            "Windows.UI.Composition.DesktopWindowContentBridge",
+            "Microsoft.UI.Content.DesktopChildSiteBridge",
+            "Windows.UI.Input.InputSite.WindowClass",
+            "InputSiteWindowClass",
+            "WinUIDesktopWin32WindowClass",
+            "DesktopWindowXamlSource",
+        ] {
+            assert!(is_xaml_class(name), "{name} should be recognized as XAML/WinUI");
+        }
+        for name in ["Notepad", "Edit", "RichEditD2DPT", "Chrome_WidgetWin_1", "WindowsForms10.Window.8.app.0.1", "HwndWrapper[App;;123]"] {
+            assert!(!is_xaml_class(name), "{name} should not match is_xaml_class directly");
+        }
+    }
 }

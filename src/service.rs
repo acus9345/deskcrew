@@ -481,6 +481,42 @@ struct Home {
     person: Option<Hwnd>,
 }
 
+fn click_flags(flags: &Flags) -> bool {
+    flags.right || flags.double || flags.triple || flags.middle || flags.back || flags.forward || flags.hold.is_some() || flags.with.is_some() || flags.button.is_some()
+}
+
+fn reject_step_flags(verb: &str, flags: &Flags, extra: Option<&Flags>) -> Result<(), String> {
+    let any = |check: fn(&Flags) -> bool| check(flags) || extra.is_some_and(check);
+    if verb == "select" && any(|f| f.real || f.mouse) {
+        return Err("select does not take --real or --mouse: click the dropdown and item instead".into());
+    }
+    if matches!(verb, "check" | "uncheck" | "expand" | "collapse") && any(click_flags) {
+        return Err("click flags (--right, --double, --hold, --with, etc.) belong on click".into());
+    }
+    Ok(())
+}
+
+fn node_disabled(node: &Node) -> bool {
+    node.element.is_enabled().map(|enabled| !enabled).unwrap_or_else(|| node.parts.states.contains(&"disabled"))
+}
+
+fn store_control(root: Hwnd, node: &Node, surfaces: &[Hwnd], (x, y): (i32, i32)) -> bool {
+    if !win::is_store(root) {
+        return false;
+    }
+    if node.native != 0 {
+        return win::draws_itself(node.native);
+    }
+    if win::draws_itself(root) {
+        return true;
+    }
+    let child = win::child_at(root, x, y).0;
+    if child != 0 && child != root {
+        return win::draws_itself(child);
+    }
+    surfaces.iter().any(|&surface| win::inside(surface, x, y) && win::draws_itself(surface))
+}
+
 impl Service {
     fn track(&self, hwnd: Hwnd) -> Arc<Tracked> {
         win::note_worked_in(hwnd);
@@ -565,9 +601,7 @@ impl Service {
             return Err("window closed".into());
         }
         if view.pids.is_empty() {
-            let mut pids = vec![win::pid(tracked.hwnd), win::content_pid(tracked.hwnd)];
-            pids.dedup();
-            view.pids = pids;
+            view.pids = win::app_pids(tracked.hwnd);
         }
         let mut notes = Vec::new();
         let open = win::of_processes(&view.pids);
@@ -875,6 +909,9 @@ impl Service {
             }
             Target::Control(id) => {
                 let (node, rect) = self.locate(id, tracked, view)?;
+                if node_disabled(&node) {
+                    return Err("that control is disabled".into());
+                }
                 self.cursor_on(who, flags, rect);
                 (Some(node), act::centre(rect))
             }
@@ -930,9 +967,6 @@ impl Service {
             return self.with_front(tracked, view, &[(x, y)], || press_at(tracked.hwnd, x, y, flags))?;
         }
         if let Some(node) = &node {
-            if node.parts.states.contains(&"disabled") {
-                return Err("that control is disabled".into());
-            }
             if plain && let Some(result) = act::post_button(node, tracked.hwnd) {
                 return result;
             }
@@ -962,18 +996,27 @@ impl Service {
         {
             return act::post_click(window, x, y, flags.right, flags.double);
         }
+        let store_control = node.as_ref().is_some_and(|n| store_control(tracked.hwnd, n, &view.surfaces, (x, y)));
         let by_message = win::is_chromium(tracked.hwnd)
-            || (win::pulls_forward(&view.pids) && !win::draws_itself(tracked.hwnd) && view.surfaces.is_empty() && node.as_ref().is_some_and(|node| node.parts.role != "menuitem"));
+            || (win::pulls_forward(&view.pids)
+                && !win::draws_itself(tracked.hwnd)
+                && !store_control
+                && view.surfaces.is_empty()
+                && node.as_ref().is_some_and(|node| node.parts.role != "menuitem"));
         let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !by_message);
         if let (Some(node), true) = (&node, plain) {
-            let classic = !act::needs_pen_at(tracked.hwnd, x, y);
-            let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press_behind(node, tracked.hwnd), false) };
+            let classic = !act::needs_pen_at(tracked.hwnd, x, y) && !store_control;
+            let (pressed, tried_mouse) = if classic {
+                self.overlay.shielded(|| act::press_behind(node, tracked.hwnd))
+            } else {
+                (act::press_behind(node, tracked.hwnd), false)
+            };
             if tried_mouse {
                 return Err(act::NEEDS_MOUSE.into());
             }
             match pressed {
                 Some(Ok(route)) => return Ok(route),
-                Some(Err(error)) if error.contains("administrator") => return Err(error),
+                Some(Err(error)) if error.contains("administrator") || store_control => return Err(error),
                 _ => {}
             }
         }
@@ -999,7 +1042,14 @@ impl Service {
 
     /// Check, uncheck, expand or collapse, leaving a control that is already that way alone.
     fn ensure(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, (wanted, opposite): (&str, &str)) -> Reply {
-        let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.toggle || n.can.select || n.can.expand)? else { return Err("that needs a control".into()) };
+        if click_flags(flags) {
+            return Err("click flags (--right, --double, --hold, --with, etc.) belong on click".into());
+        }
+        let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| {
+            if matches!(wanted, "open" | "closed") { n.can.expand } else { n.can.toggle }
+        })? else {
+            return Err("that needs a control".into());
+        };
         self.read(tracked, view, false)?;
         let states = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?.parts.states.clone();
         if states.contains(&wanted) {
@@ -1008,15 +1058,28 @@ impl Service {
         if !states.contains(&opposite) {
             return Err(format!("that control cannot be {wanted}"));
         }
+        if flags.real || flags.mouse {
+            return self.click(who, flags, tracked, view, &format!("e{id}"));
+        }
         if matches!(wanted, "open" | "closed") {
             let (node, rect) = self.locate(id, tracked, view)?;
+            if node_disabled(&node) {
+                return Err("that control is disabled".into());
+            }
             self.cursor_on(who, flags, rect);
             if wanted == "open"
                 && let Some(opened) = self.open_submenu(tracked, view, id)
             {
                 return opened;
             }
-            return node.element.open_or_close().map(|_| "expand".to_string());
+            let (x, y) = act::centre(rect);
+            let classic = !act::needs_pen_at(tracked.hwnd, x, y) && !store_control(tracked.hwnd, &node, &view.surfaces, (x, y));
+            let (expanded, tried_mouse) = if classic {
+                self.overlay.shielded(|| act::expand_behind(&node, tracked.hwnd, wanted == "open"))
+            } else {
+                (act::expand_behind(&node, tracked.hwnd, wanted == "open"), false)
+            };
+            return if tried_mouse { Err(act::NEEDS_MOUSE.into()) } else { expanded };
         }
         self.click(who, flags, tracked, view, &format!("e{id}"))
     }
@@ -1552,10 +1615,21 @@ impl Service {
     }
 
     fn select(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, item: &str) -> Reply {
+        if flags.real || flags.mouse {
+            return Err("select does not take --real or --mouse: click the dropdown and item instead".into());
+        }
         let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.expand || n.can.select || matches!(n.parts.role.as_str(), "combobox" | "list"))? else { return Err("select needs a control".into()) };
         let (node, rect) = self.locate(id, tracked, view)?;
+        if node_disabled(&node) {
+            return Err("that control is disabled".into());
+        }
         self.cursor_on(who, flags, rect);
-        let (result, tried_mouse) = self.overlay.shielded(|| act::select_item(&node, item, &self.uia, tracked.hwnd));
+        let classic = !win::draws_itself(tracked.hwnd) && !store_control(tracked.hwnd, &node, &view.surfaces, act::centre(rect));
+        let (result, tried_mouse) = if classic {
+            self.overlay.shielded(|| act::select_item(&node, item, &self.uia, tracked.hwnd, &view.surfaces))
+        } else {
+            (act::select_item(&node, item, &self.uia, tracked.hwnd, &view.surfaces), false)
+        };
         if tried_mouse { Err(act::NEEDS_MOUSE.into()) } else { result }
     }
 
@@ -1830,6 +1904,8 @@ impl Service {
         if let Some(error) = own.button_error {
             return Err(error);
         }
+        let verb = words.first().map_or("", String::as_str);
+        reject_step_flags(verb, flags, Some(&own))?;
         if own.mouse && !flags.mouse {
             self.borrow.allow(who)?;
         }
@@ -1855,7 +1931,6 @@ impl Service {
             ms: own.ms.or(flags.ms),
             ..Flags::default()
         };
-        let verb = words.first().map_or("", String::as_str);
         let rest = words.get(1..).unwrap_or(&[]);
         // A minimized browser or Electron window drops or holds its input until it is shown again,
         // even one started to take input while covered. It is shown off screen while an agent works
@@ -2364,7 +2439,9 @@ impl Service {
             }
         }
         // Should the app have come forward all the same, the person gets their window back.
-        if !theirs && front != 0 && win::foreground() != front && win::pid(win::foreground()) == win::pid(tracked.hwnd) {
+        let fg = win::foreground();
+        let pids = win::app_pids(tracked.hwnd);
+        if !theirs && front != 0 && fg != front && (fg == tracked.hwnd || pids.contains(&win::pid(fg)) || pids.contains(&win::content_pid(fg))) {
             thread::sleep(Duration::from_millis(30));
             if !win::bring_forward(front) {
                 win::stop_flashing(front);
@@ -2388,10 +2465,11 @@ impl Service {
             return Err(err.clone());
         }
         flags.modifiers()?;
+        let verb = rest.first().map_or("", String::as_str);
+        reject_step_flags(verb, &flags, None)?;
         if flags.mouse {
             self.borrow.allow(who)?;
         }
-        let verb = rest.first().map_or("", String::as_str);
         let args = rest.get(1..).unwrap_or(&[]);
         if changes_things(verb, args) && self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
@@ -2672,5 +2750,26 @@ mod tests {
 
         let held = format_status(false, &[], Some(windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED));
         assert!(held.contains("running") && held.contains("Ctrl+Alt+Esc") && held.contains("another process holds them"));
+    }
+
+    #[test]
+    fn step_flags_reject_invalid_combinations() {
+        let (right, _) = parse(&["--right".into(), "--mouse".into()]);
+        let (button, _) = parse(&["--button".into(), "right".into()]);
+        let (real, _) = parse(&["--real".into()]);
+        let (plain, _) = parse(&[]);
+
+        assert!(click_flags(&right));
+        assert!(click_flags(&button));
+        assert!(!click_flags(&real));
+
+        for verb in ["check", "uncheck", "expand", "collapse"] {
+            assert!(reject_step_flags(verb, &right, None).is_err());
+            assert!(reject_step_flags(verb, &plain, Some(&button)).is_err());
+            assert!(reject_step_flags(verb, &real, None).is_ok());
+        }
+        assert!(reject_step_flags("select", &real, None).is_err());
+        assert!(reject_step_flags("select", &plain, Some(&right)).is_err());
+        assert!(reject_step_flags("select", &plain, None).is_ok());
     }
 }

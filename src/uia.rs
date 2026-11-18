@@ -157,9 +157,9 @@ impl Uia {
     pub fn focused_in(&self, hwnd: Hwnd) -> Option<Element> {
         unsafe {
             let element = self.auto.GetFocusedElement().ok()?;
-            // A Store app's window belongs to ApplicationFrameHost, but its controls to the app itself.
+            // A Store app's window belongs to ApplicationFrameHost, so match only its own app processes.
             let pid = element.CurrentProcessId().ok()? as u32;
-            (pid == crate::win::pid(hwnd) || pid == crate::win::content_pid(hwnd)).then_some(Element(element))
+            crate::win::app_pids(hwnd).contains(&pid).then_some(Element(element))
         }
     }
 
@@ -630,12 +630,39 @@ impl Element {
         })
     }
 
-    pub fn open(&self) -> Result<(), String> {
-        unsafe { self.0.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId).and_then(|p| p.Expand()).map_err(say) }
+    pub fn expand(&self, open: bool) -> Result<Done, String> {
+        patiently(self, move |el| unsafe {
+            let pattern = el.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)?;
+            let state = pattern.CurrentExpandCollapseState()?;
+            if (open && state == ExpandCollapseState_Expanded)
+                || (!open && state == ExpandCollapseState_Collapsed)
+            {
+                return Ok(());
+            }
+            if open { pattern.Expand() } else { pattern.Collapse() }
+        })
     }
 
-    pub fn close(&self) -> Result<(), String> {
-        unsafe { self.0.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId).and_then(|p| p.Collapse()).map_err(say) }
+    pub fn is_enabled(&self) -> Option<bool> {
+        unsafe { self.0.CurrentIsEnabled().ok().map(|b| b.as_bool()) }
+    }
+
+    pub fn is_expanded(&self) -> Option<bool> {
+        unsafe {
+            self.0
+                .GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)
+                .and_then(|p| p.CurrentExpandCollapseState())
+                .ok()
+                .map(|state| state == ExpandCollapseState_Expanded)
+        }
+    }
+
+    pub fn open(&self) -> Result<Done, String> {
+        patiently(self, |el| unsafe { el.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)?.Expand() })
+    }
+
+    pub fn close(&self) -> Result<Done, String> {
+        patiently(self, |el| unsafe { el.GetCurrentPatternAs::<IUIAutomationExpandCollapsePattern>(UIA_ExpandCollapsePatternId)?.Collapse() })
     }
 
     pub fn set_value(&self, value: &str) -> Result<(), String> {
@@ -735,12 +762,69 @@ impl Element {
         }
     }
 
-    /// Find a named item below this control, such as a dropdown's entry.
+    /// Find a named selectable item below this control, such as a dropdown's entry.
     pub fn find_named(&self, name: &str, auto: &Uia) -> Option<Element> {
         unsafe {
             let wanted = VARIANT::from(BSTR::from(name));
-            let condition = auto.auto.CreatePropertyCondition(UIA_NamePropertyId, &wanted).ok()?;
+            let by_name = auto.auto.CreatePropertyCondition(UIA_NamePropertyId, &wanted).ok()?;
+            let selectable = auto.auto.CreatePropertyCondition(UIA_IsSelectionItemPatternAvailablePropertyId, &VARIANT::from(true)).ok()?;
+            let condition = auto.auto.CreateAndCondition(&by_name, &selectable).ok()?;
             self.0.FindFirst(TreeScope_Descendants, &condition).ok().map(Element)
+        }
+    }
+}
+
+impl Uia {
+    /// Find an item with `name` in an open popup when a dropdown hosts its list outside its own
+    /// UIA subtree (WinUI 3, Chromium, Qt), without matching unrelated controls in `root`.
+    pub fn find_popup_item(&self, root: Hwnd, surfaces: &[Hwnd], name: &str) -> Option<Element> {
+        unsafe {
+            let wanted = VARIANT::from(BSTR::from(name));
+            let by_name = self.auto.CreatePropertyCondition(UIA_NamePropertyId, &wanted).ok()?;
+            let selectable = self.auto.CreatePropertyCondition(UIA_IsSelectionItemPatternAvailablePropertyId, &VARIANT::from(true)).ok()?;
+            let list_item = self.auto.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_ListItemControlTypeId.0)).ok()?;
+            let menu_item = self.auto.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_MenuItemControlTypeId.0)).ok()?;
+            let tree_item = self.auto.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_TreeItemControlTypeId.0)).ok()?;
+            let list_or_menu = self.auto.CreateOrCondition(&list_item, &menu_item).ok()?;
+            let any_item = self.auto.CreateOrCondition(&list_or_menu, &tree_item).ok()?;
+            let name_and_sel = self.auto.CreateAndCondition(&by_name, &selectable).ok()?;
+            let condition = self.auto.CreateAndCondition(&name_and_sel, &any_item).ok()?;
+
+            let mut family = surfaces.to_vec();
+            family.push(root);
+            let mut candidates: Vec<Hwnd> = surfaces.to_vec();
+            let pids = crate::win::app_pids(root);
+            for hwnd in crate::win::of_processes(&pids) {
+                if hwnd != root && !candidates.contains(&hwnd) && crate::win::belongs(hwnd, &family) {
+                    candidates.push(hwnd);
+                }
+            }
+            for hwnd in candidates {
+                if hwnd == 0 || hwnd == root {
+                    continue;
+                }
+                if let Ok(el) = self.auto.ElementFromHandle(HWND(hwnd as _))
+                    && let Ok(found) = el.FindFirst(TreeScope_Descendants, &condition)
+                {
+                    return Some(Element(found));
+                }
+            }
+            if root != 0
+                && let Ok(root_el) = self.auto.ElementFromHandle(HWND(root as _))
+                && let Ok(popup_cls) = self.auto.CreatePropertyCondition(UIA_ClassNamePropertyId, &VARIANT::from(BSTR::from("Popup")))
+                && let Ok(popup_win) = self.auto.CreatePropertyCondition(UIA_ControlTypePropertyId, &VARIANT::from(UIA_WindowControlTypeId.0))
+                && let Ok(popup_cond) = self.auto.CreateOrCondition(&popup_cls, &popup_win)
+                && let Ok(popups) = root_el.FindAll(TreeScope_Descendants, &popup_cond)
+            {
+                for at in 0..popups.Length().unwrap_or(0) {
+                    if let Ok(popup) = popups.GetElement(at)
+                        && let Ok(found) = popup.FindFirst(TreeScope_Descendants, &condition)
+                    {
+                        return Some(Element(found));
+                    }
+                }
+            }
+            None
         }
     }
 }
