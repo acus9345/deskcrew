@@ -6,6 +6,8 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.28] - 2026-11-18
+
 - A review of the whole codebase, fixed:
   - **Safety:** the cursor prompt answers only to the person's own click; commands go only to a service running as the same account; risky shortcuts are judged on the keys actually pressed, held keys included (`alt+f04` and `down ctrl` then `key q` are caught), and on `down` and `--with` too; focus, close, place, clip and notifications stop with Ctrl+Alt+Esc like every action.
   - **Privacy:** the log and traces keep content replies (clipboard, `get`, `fetch`, `reg`, file reads, table cells) as their length; the bench keeps its sign-in copy out of the shared Public folder.

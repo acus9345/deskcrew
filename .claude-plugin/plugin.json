@@ -1,6 +1,6 @@
 {
   "name": "deskcrew",
-  "version": "0.1.27",
+  "version": "0.1.28",
   "description": "Every coding agent gets its own cursor on your desktop (Windows, macOS, Linux X11), for very few tokens.",
   "author": { "name": "acus9345" },
   "repository": "https://github.com/acus9345/deskcrew",
