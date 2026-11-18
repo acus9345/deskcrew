@@ -127,6 +127,23 @@ pub fn content_pid(hwnd: Hwnd) -> u32 {
     children(hwnd).into_iter().map(pid).find(|p| *p != own).unwrap_or(own)
 }
 
+fn is_frame_host(process_id: u32) -> bool {
+    image_name(process_id).eq_ignore_ascii_case("applicationframehost")
+}
+
+/// Process ids belonging to this window's own app, excluding Windows' shared
+/// `ApplicationFrameHost` frame process so Store apps do not collide with each other.
+pub fn app_pids(hwnd: Hwnd) -> Vec<u32> {
+    let own = pid(hwnd);
+    if class(hwnd) != "ApplicationFrameWindow" {
+        return (own != 0).then_some(own).into_iter().collect();
+    }
+    let mut out: Vec<u32> = children(hwnd).into_iter().map(pid).filter(|p| *p != 0 && *p != own).collect();
+    out.sort_unstable();
+    out.dedup();
+    out
+}
+
 fn shown(hwnd: Hwnd) -> bool {
     unsafe {
         if IsWindowVisible(raw(hwnd)) == 0 {
@@ -157,7 +174,13 @@ pub fn list() -> Vec<Win> {
 
 /// Every visible window of these processes, popups included.
 pub fn of_processes(pids: &[u32]) -> Vec<Hwnd> {
-    top_level().into_iter().filter(|&hwnd| shown(hwnd) && pids.contains(&pid(hwnd)) && class(hwnd) != "deskcrew").collect()
+    if pids.is_empty() {
+        return Vec::new();
+    }
+    top_level()
+        .into_iter()
+        .filter(|&hwnd| shown(hwnd) && (pids.contains(&pid(hwnd)) || pids.contains(&content_pid(hwnd))) && class(hwnd) != "deskcrew")
+        .collect()
 }
 
 /// A screen point in a window's own client coordinates.
@@ -182,11 +205,11 @@ fn enabled(hwnd: Hwnd) -> bool {
 /// takes all its input, and one shown at startup has no owner.
 fn own_windows(root: Hwnd) -> impl Iterator<Item = Hwnd> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{GW_HWNDNEXT, GetTopWindow};
-    let owner = pid(root);
+    let owner = content_pid(root);
     let blocked = !enabled(root);
     let top = unsafe { GetTopWindow(null_mut()) } as Hwnd;
     std::iter::successors((top != 0).then_some(top), |&at| Some(unsafe { GetWindow(raw(at), GW_HWNDNEXT) } as Hwnd).filter(|&next| next != 0))
-        .filter(move |&hwnd| unsafe { IsWindowVisible(raw(hwnd)) } != 0 && pid(hwnd) == owner && class(hwnd) != "SysShadow")
+        .filter(move |&hwnd| unsafe { IsWindowVisible(raw(hwnd)) } != 0 && (pid(hwnd) == owner || content_pid(hwnd) == owner) && class(hwnd) != "SysShadow")
         .filter(move |&hwnd| hwnd == root || blocked || belongs(hwnd, &[root]))
 }
 
@@ -1069,9 +1092,8 @@ pub struct ForegroundLock;
 impl ForegroundLock {
     pub fn take() -> ForegroundLock {
         let mut held = LOCKS.lock().unwrap();
-        if !held.1 {
-            held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
-        }
+        // Always refresh the OS lock: Windows drops it automatically if the user switches windows.
+        held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
         held.0 += 1;
         ForegroundLock
     }
@@ -1079,12 +1101,12 @@ impl ForegroundLock {
     /// The lock, if Windows gave it: it only does to a process that could take the foreground.
     pub fn try_take() -> Option<ForegroundLock> {
         let mut held = LOCKS.lock().unwrap();
-        if !held.1 {
-            held.1 = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
-        }
-        if !held.1 {
+        let locked = unsafe { LockSetForegroundWindow(LSFW_LOCK) } != 0;
+        if !locked {
+            held.1 = false;
             return None;
         }
+        held.1 = true;
         held.0 += 1;
         Some(ForegroundLock)
     }
@@ -1184,8 +1206,10 @@ impl FocusGuard {
             return false;
         }
         let mut pulled = PULLED.lock().unwrap();
-        for owner in [pid(now), content_pid(now)] {
-            if !pulled.contains(&owner) {
+        let owners = app_pids(now);
+        let owners = if owners.is_empty() { vec![pid(now)] } else { owners };
+        for owner in owners {
+            if !is_frame_host(owner) && !pulled.contains(&owner) {
                 pulled.push(owner);
             }
         }
@@ -1385,7 +1409,7 @@ pub fn note_worked_in(hwnd: Hwnd) {
 
 /// Note that agents are working in these processes.
 pub fn note_worked(pids: &[u32]) {
-    let pids: Vec<u32> = pids.iter().copied().filter(|p| !image_name(*p).to_lowercase().ends_with("applicationframehost.exe")).collect();
+    let pids: Vec<u32> = pids.iter().copied().filter(|p| !is_frame_host(*p)).collect();
     let pids = &pids[..];
     let mut worked = WORKED.lock().unwrap();
     worked.retain(|(pid, at)| !pids.contains(pid) && at.elapsed() < FLASHES_WATCHED_FOR);

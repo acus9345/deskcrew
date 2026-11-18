@@ -166,13 +166,19 @@ impl Overlay {
 
     /// Run something that must not touch the real mouse. True if it tried to.
     pub fn shielded<T>(&self, work: impl FnOnce() -> T) -> (T, bool) {
+        struct ShieldGuard<'a>(&'a Overlay);
+        impl Drop for ShieldGuard<'_> {
+            fn drop(&mut self) {
+                self.0.shield_up(false);
+            }
+        }
         self.shield_up(true);
+        let _guard = ShieldGuard(self);
         let before = BLOCKED.load(Ordering::Relaxed);
         let out = work();
         // Hidden clicks can follow the call by a moment.
         thread::sleep(SHIELD_LINGER);
         let tried = BLOCKED.load(Ordering::Relaxed) != before;
-        self.shield_up(false);
         (out, tried)
     }
 

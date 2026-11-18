@@ -1,7 +1,7 @@
 // Acting on a control without touching the real mouse or keyboard: the app's own accessibility
 // actions first, then Windows messages for classic controls. Each result names the route taken.
 use crate::real::{self, Button, Chord, Modifiers};
-use crate::uia::{Done, Element, Node, Uia};
+use crate::uia::{Done, Node, Uia};
 use crate::win::{self, Hwnd};
 use std::sync::atomic::{AtomicBool, Ordering};
 use windows_sys::Win32::{
@@ -117,9 +117,9 @@ pub fn press_behind(node: &Node, root: Hwnd) -> Option<Result<String, String>> {
     behind(root, || press(node))
 }
 
-/// Expand or collapse a control of `root`, keeping its app behind.
-pub fn expand_behind(node: &Node, root: Hwnd) -> Result<String, String> {
-    behind(root, || node.element.open_or_close()).map(|d| route("expand", d))
+/// Expand or collapse a control of `root` to `open`, keeping its app behind.
+pub fn expand_behind(node: &Node, root: Hwnd, open: bool) -> Result<String, String> {
+    behind(root, || node.element.expand(open)).map(|d| route("expand", d))
 }
 
 /// A check box or radio button WinForms draws itself: its own default action flips it in place.
@@ -862,29 +862,62 @@ fn select_in_classic_combo(node: &Node, item: &str) -> Option<Result<String, Str
         return Some(Err(format!("no entry named '{item}'")));
     }
     let (parent, id) = win::parent_and_id(node.native);
-    let result = post(node.native, CB_SETCURSEL, index, 0)
-        .and_then(|_| post(parent, WM_COMMAND, (CBN_SELCHANGE << 16) | (id as usize & 0xFFFF), node.native));
+    let result = post(node.native, CB_SETCURSEL, index, 0).and_then(|_| {
+        if parent != 0 {
+            post(parent, WM_COMMAND, (CBN_SELCHANGE << 16) | (id as usize & 0xFFFF), node.native)
+        } else {
+            Ok(())
+        }
+    });
     Some(result.map(|_| "message".to_string()))
 }
 
 /// Open a dropdown or list, pick the named entry, and close it again.
-pub fn select_item(node: &Node, item: &str, uia: &Uia, root: Hwnd) -> Result<String, String> {
+pub fn select_item(node: &Node, item: &str, uia: &Uia, root: Hwnd, surfaces: &[Hwnd]) -> Result<String, String> {
     if !win::draws_itself(root) && !win::draws_itself(node.native) && let Some(result) = select_in_classic_combo(node, item) {
         return result;
     }
     behind(root, || {
-        let opened = node.can.expand && node.element.open().is_ok();
-        if opened {
-            std::thread::sleep(std::time::Duration::from_millis(120));
+        let already_open = node.parts.states.contains(&"open") || (node.can.expand && node.element.is_expanded());
+        let mut opened = false;
+        let mut opening = false;
+        if node.can.expand && !already_open {
+            match node.element.open() {
+                Ok(done) => {
+                    opened = true;
+                    opening = matches!(done, Done::StillRunning);
+                    std::thread::sleep(std::time::Duration::from_millis(120));
+                }
+                Err(error) if error.contains("administrator") || error.contains("gone") => return Err(error),
+                Err(_) => {}
+            }
         }
-        let found: Option<Element> = node.element.find_named(item, uia);
-        let result = match found {
-            Some(entry) => entry.select().map(|d| route("select", d)),
+        let find_once = || {
+            node.element.find_named(item, uia).or_else(|| {
+                (opened || already_open || node.parts.role == "combobox")
+                    .then(|| uia.find_popup_item(root, surfaces, item))
+                    .flatten()
+            })
+        };
+        let mut found = find_once();
+        if found.is_none() && opening {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_millis(900);
+            while std::time::Instant::now() < deadline {
+                let expanded = node.element.is_expanded();
+                std::thread::sleep(std::time::Duration::from_millis(100));
+                found = find_once();
+                if found.is_some() || expanded {
+                    break;
+                }
+            }
+        }
+        let done = match found {
+            Some(entry) => entry.select(),
             None => Err(format!("no entry named '{item}'")),
         };
-        if opened {
+        if opened && !matches!(done, Ok(Done::StillRunning)) {
             let _ = node.element.close();
         }
-        result
+        done.map(|d| route("select", d))
     })
 }
