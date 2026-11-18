@@ -20,8 +20,8 @@ use windows_sys::Win32::{
             KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LASTINPUTINFO, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
             MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
             MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-            VK_F1, VK_HOME, VK_INSERT, VK_LEFT, VK_LWIN, VK_MENU, VK_NEXT, VK_PRIOR, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_SPACE,
-            VK_TAB, VK_UP, VkKeyScanW,
+            VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_PLUS, VK_PAUSE,
+            VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VkKeyScanW,
         },
         WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN},
     },
@@ -318,6 +318,8 @@ fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
         "ctrl" | "control" => (VK_CONTROL, false),
         "shift" => (VK_SHIFT, false),
         "alt" => (VK_MENU, false),
+        "pause" | "break" => (VK_PAUSE, false),
+        "plus" => (VK_OEM_PLUS, false),
         "win" | "meta" | "cmd" | "windows" | "super" => (VK_LWIN, true),
         _ => {
             if let Some(number) = lower.strip_prefix('f').and_then(|n| n.parse::<u16>().ok())
@@ -357,6 +359,35 @@ impl Chord {
             VK_CONTROL => bits | MK_CONTROL,
             _ => bits,
         })
+    }
+
+    pub fn has_win(&self) -> bool {
+        self.keys.iter().any(|(vk, _)| matches!(*vk, VK_LWIN | VK_RWIN))
+    }
+
+    /// If this chord includes the Windows key, return `(ctrl, shift, alt, main_key)` when there is
+    /// at most one non-modifier key (`0` for the Windows key alone).
+    pub fn win_pattern(&self) -> Option<(bool, bool, bool, VIRTUAL_KEY)> {
+        if !self.has_win() {
+            return None;
+        }
+        let (mut ctrl, mut shift, mut alt) = (false, false, false);
+        let mut main = None;
+        for &(vk, _) in &self.keys {
+            match vk {
+                VK_LWIN | VK_RWIN => {}
+                VK_CONTROL | VK_LCONTROL | VK_RCONTROL => ctrl = true,
+                VK_SHIFT | VK_LSHIFT | VK_RSHIFT => shift = true,
+                VK_MENU | VK_LMENU | VK_RMENU => alt = true,
+                other => {
+                    if main.is_some() && main != Some(other) {
+                        return None;
+                    }
+                    main = Some(other);
+                }
+            }
+        }
+        Some((ctrl, shift, alt, main.unwrap_or(0)))
     }
 }
 
@@ -542,5 +573,19 @@ mod tests {
         let path = trace(&[(0, 0), (60, 60), (120, 0)], true);
         assert!(path.iter().any(|p| (p.0 - 60.0).abs() < 0.01 && (p.1 - 60.0).abs() < 0.01));
         assert_eq!(*path.last().unwrap(), (120.0, 0.0));
+    }
+
+    #[test]
+    fn win_chords_parse_and_normalize() {
+        assert_eq!(chord("pause").unwrap().keys[0].0, VK_PAUSE);
+        assert_eq!(chord("break").unwrap().keys[0].0, VK_PAUSE);
+        assert_eq!(chord("win+plus").unwrap().keys[1].0, VK_OEM_PLUS);
+        assert!(chord("win").unwrap().has_win());
+        assert!(!chord("ctrl+c").unwrap().has_win());
+        assert_eq!(chord("win").unwrap().win_pattern(), Some((false, false, false, 0)));
+        assert_eq!(chord("cmd+shift+m").unwrap().win_pattern(), Some((false, true, false, b'M' as u16)));
+        assert_eq!(chord("shift+super+left").unwrap().win_pattern(), Some((false, true, false, VK_LEFT)));
+        assert_eq!(chord("ctrl+win+o").unwrap().win_pattern(), Some((true, false, false, b'O' as u16)));
+        assert_eq!(chord("win+a+b").unwrap().win_pattern(), None);
     }
 }

@@ -1431,7 +1431,13 @@ impl Service {
                 // its text is can be given its text with this added at the end.
                 (Some(_), None) => match field.as_ref().and_then(|node| append_value(node, tracked.hwnd, text)) {
                     Some(done) => done,
-                    None => Err(NEEDS_REAL.into()),
+                    None => match field.as_ref().filter(|node| win::is_wpf(tracked.hwnd) && !node.can.value && matches!(node.parts.role.as_str(), "edit" | "document" | "combobox")) {
+                        Some(node) => {
+                            act::focus_wpf_field(tracked.hwnd, node)?;
+                            act::post_text_focused(tracked.hwnd, text, &self.stop)
+                        }
+                        None => Err(NEEDS_REAL.into()),
+                    },
                 },
                 (Some(_), Some(hwnd)) => {
                     // A rich text box keeps its caret where it was, often at the start: typing adds to
@@ -1471,11 +1477,7 @@ impl Service {
                             // kept within its edges when the text runs past them.
                             let bounds = element.rect().ok();
                             let inside = |&(x, y, _): &(i32, i32, i32)| bounds.is_none_or(|(bx, by, bw, bh)| x >= bx && x <= bx + bw && y >= by - 2 && y <= by + bh);
-                            let clamp = |(x, y, h): (i32, i32, i32)| match bounds {
-                                Some((bx, _, bw, _)) => (x.clamp(bx, bx + bw - 4), y, h),
-                                None => (x, y, h),
-                            };
-                            element.caret().filter(inside).or_else(|| element.text_end()).map(clamp)
+                            element.caret().filter(inside).or_else(|| element.text_end()).map(|caret| clamp_caret(caret, bounds))
                         }
                         None => self.uia.focused_in(window).and_then(|element| element.caret()),
                     };
@@ -1531,6 +1533,11 @@ impl Service {
         };
         if flags.real {
             return keyboard();
+        }
+        if hold.is_none()
+            && let Some(direct) = act::win_shortcut(&chord, Some(tracked.hwnd))
+        {
+            return direct;
         }
         if hold.is_none()
             && let Some(pressed) = self.key_by_button(tracked, &chord)
@@ -2348,18 +2355,28 @@ impl Service {
         let _lock = (!theirs).then(win::ForegroundLock::take);
         let mut said = "ok";
         match word.as_str() {
-            "min" => win::show(tracked.hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE }),
-            "max" if theirs => win::show(tracked.hwnd, SW_MAXIMIZE),
+            "min" => {
+                win::commit_shown(tracked.hwnd);
+                win::show(tracked.hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE });
+            }
+            "max" if theirs => {
+                win::commit_shown(tracked.hwnd);
+                win::show(tracked.hwnd, SW_MAXIMIZE);
+            }
             "max" => {
                 if !win::fill_screen_behind(tracked.hwnd) {
                     said = "ok: it fills the screen in the back; Windows' own maximize would have brought it forward";
                 }
             }
-            "restore" if theirs => win::show(tracked.hwnd, SW_RESTORE),
+            "restore" if theirs => {
+                win::commit_shown(tracked.hwnd);
+                win::show(tracked.hwnd, SW_RESTORE);
+            }
             "restore" | "show" => win::restore_behind(tracked.hwnd),
             box_text => {
                 let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
                 let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
+                win::commit_shown(tracked.hwnd);
                 win::place(tracked.hwnd, x, y, w, h);
             }
         }
@@ -2466,6 +2483,24 @@ impl Service {
 {error}")),
                     None => Ok(drawn),
                 }
+            }
+            "key" if !flags.real && flags.hold.is_none() && flags.window.is_none() && flags.expect.is_none() && args.len() == 1 => {
+                let spec = &args[0];
+                let chord = real::chord(spec)?;
+                if act::is_shell_win_shortcut(&chord) {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return Err(STOPPED.into());
+                    }
+                    refuse_risky(&chord, spec, &flags)?;
+                    return act::win_shortcut(&chord, None).unwrap().map(|route| format!("ok {route}"));
+                }
+                if chord.has_win() && act::WinShortcut::from_chord(&chord).is_none() {
+                    refuse_risky(&chord, spec, &flags)?;
+                    return Err(format!("{spec} needs the real keyboard: add --real"));
+                }
+                let mut steps = vec![rest.clone()];
+                steps.extend(expected(&flags));
+                self.act(who, &flags, &steps)
             }
             "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" | "pick-file" => {
                 let mut steps = vec![rest.clone()];
@@ -2618,6 +2653,14 @@ fn refuse_risky(chord: &real::Chord, spec: &str, flags: &Flags) -> Result<(), St
     Ok(())
 }
 
+fn clamp_caret((x, y, h): (i32, i32, i32), bounds: Option<(i32, i32, i32, i32)>) -> (i32, i32, i32) {
+    match bounds {
+        Some((bx, _, bw, _)) if bw > 4 => (x.clamp(bx, bx + bw - 4), y, h),
+        Some((bx, _, _, _)) => (bx, y, h),
+        None => (x, y, h),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2672,5 +2715,13 @@ mod tests {
 
         let held = format_status(false, &[], Some(windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED));
         assert!(held.contains("running") && held.contains("Ctrl+Alt+Esc") && held.contains("another process holds them"));
+    }
+
+    #[test]
+    fn clamp_caret_handles_zero_and_tiny_bounds_without_panicking() {
+        assert_eq!(clamp_caret((50, 20, 16), Some((0, 0, 0, 0))), (0, 20, 16));
+        assert_eq!(clamp_caret((50, 20, 16), Some((10, 0, 4, 20))), (10, 20, 16));
+        assert_eq!(clamp_caret((50, 20, 16), Some((10, 0, 100, 20))), (50, 20, 16));
+        assert_eq!(clamp_caret((200, 20, 16), Some((10, 0, 100, 20))), (106, 20, 16));
     }
 }
