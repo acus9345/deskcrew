@@ -1,7 +1,7 @@
 // The local pipe between the short-lived command and the service that stays up.
 use std::{io, ptr::null};
 use windows_sys::Win32::{
-    Foundation::{CloseHandle, ERROR_PIPE_BUSY, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
+    Foundation::{CloseHandle, ERROR_NO_DATA, ERROR_PIPE_BUSY, ERROR_PIPE_CONNECTED, GENERIC_READ, GENERIC_WRITE, GetLastError, HANDLE, INVALID_HANDLE_VALUE},
     Storage::FileSystem::{
         CreateFileW, FILE_FLAG_FIRST_PIPE_INSTANCE, FlushFileBuffers, OPEN_EXISTING, PIPE_ACCESS_DUPLEX, ReadFile,
         WriteFile,
@@ -88,21 +88,38 @@ pub struct Pipe(HANDLE);
 unsafe impl Send for Pipe {}
 
 impl Pipe {
-    /// Listen for the next command. The first caller owns the name, so a second service cannot take it.
-    pub fn listen(first: bool) -> io::Result<Pipe> {
+    fn listen_at(pipe_name: &[u16], first: bool) -> io::Result<Pipe> {
         let open = PIPE_ACCESS_DUPLEX | if first { FILE_FLAG_FIRST_PIPE_INSTANCE } else { 0 };
         let mode = PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT | PIPE_REJECT_REMOTE_CLIENTS;
-        let handle = unsafe { CreateNamedPipeW(name().as_ptr(), open, mode, PIPE_UNLIMITED_INSTANCES, BUFFER, BUFFER, 0, null()) };
+        let handle = unsafe { CreateNamedPipeW(pipe_name.as_ptr(), open, mode, PIPE_UNLIMITED_INSTANCES, BUFFER, BUFFER, 0, null()) };
         if handle == INVALID_HANDLE_VALUE {
             return Err(io::Error::last_os_error());
         }
         Ok(Pipe(handle))
     }
 
-    /// Wait for a command to connect. A client already connected counts.
-    pub fn accept(&self) -> bool {
-        let ok = unsafe { ConnectNamedPipe(self.0, std::ptr::null_mut()) };
-        ok != 0 || unsafe { GetLastError() } == 535
+    /// Listen for the next command. The first caller owns the name, so a second service cannot take it.
+    pub fn listen(first: bool) -> io::Result<Pipe> {
+        Self::listen_at(&name(), first)
+    }
+
+    /// Wait for a command to connect. A client already connected counts; one that disconnected
+    /// before `ConnectNamedPipe` is cleared with `DisconnectNamedPipe` so the instance can be reused.
+    pub fn accept(&self) -> io::Result<()> {
+        loop {
+            if unsafe { ConnectNamedPipe(self.0, std::ptr::null_mut()) } != 0 {
+                return Ok(());
+            }
+            match unsafe { GetLastError() } {
+                ERROR_PIPE_CONNECTED => return Ok(()),
+                ERROR_NO_DATA => {
+                    if unsafe { DisconnectNamedPipe(self.0) } == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                code => return Err(io::Error::from_raw_os_error(code as i32)),
+            }
+        }
     }
 
     pub fn connect() -> io::Result<Pipe> {
@@ -183,5 +200,54 @@ impl Pipe {
 impl Drop for Pipe {
     fn drop(&mut self) {
         unsafe { CloseHandle(self.0) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::thread;
+    use std::time::Duration;
+
+    fn test_pipe_name(label: &str) -> Vec<u16> {
+        format!(r"\\.\pipe\deskcrew-test-{label}-{}", unsafe { GetCurrentProcessId() })
+            .encode_utf16()
+            .chain(Some(0))
+            .collect()
+    }
+
+    #[test]
+    fn early_client_disconnect_recovers_for_next_client() {
+        let pipe_name = test_pipe_name("no-data");
+        let server = Pipe::listen_at(&pipe_name, true).unwrap();
+        // A client opens and immediately closes before ConnectNamedPipe runs (ERROR_NO_DATA).
+        let early = unsafe { CreateFileW(pipe_name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+        assert_ne!(early, INVALID_HANDLE_VALUE);
+        drop(Pipe(early));
+
+        let client_name = pipe_name.clone();
+        let client = thread::spawn(move || {
+            for _ in 0..50 {
+                let handle = unsafe { CreateFileW(client_name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+                if handle != INVALID_HANDLE_VALUE {
+                    let pipe = Pipe(handle);
+                    pipe.send(b"hello").unwrap();
+                    return;
+                }
+                thread::sleep(Duration::from_millis(10));
+            }
+            panic!("second client could not connect");
+        });
+
+        server.accept().unwrap();
+        assert_eq!(server.receive().unwrap(), b"hello");
+        server.finish();
+        client.join().unwrap();
+    }
+
+    #[test]
+    fn invalid_pipe_returns_error_instead_of_spinning() {
+        let bad = Pipe(std::ptr::null_mut());
+        assert!(bad.accept().is_err());
     }
 }

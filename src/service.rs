@@ -29,6 +29,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MAXIMIZE, SW_MINIMIZE, SW_R
 /// What a picture of a window the agent has not read yet says: reading is far cheaper.
 const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";
 const IDLE_EXIT: Duration = Duration::from_secs(30 * 60);
+/// If a request hangs forever so `active` never returns to 0, still exit instead of holding the stop hotkey all day.
+const HUNG_EXIT: Duration = Duration::from_secs(60 * 60);
 const SETTLE_FIRST: Duration = Duration::from_millis(50);
 const SETTLE_STEP: Duration = Duration::from_millis(60);
 const SETTLE_LEAST: Duration = Duration::from_millis(150);
@@ -2377,8 +2379,7 @@ impl Service {
         let mut names: Vec<&String> = agents.keys().collect();
         names.sort();
         let names: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
-        let state = if self.stop.load(Ordering::Relaxed) { "stopped by the person" } else { "running" };
-        Ok(format!("deskcrew {} {state}; agents: {}", env!("CARGO_PKG_VERSION"), if names.is_empty() { "none".into() } else { names.join(", ") }))
+        Ok(format_status(self.stop.load(Ordering::Relaxed), &names, self.overlay.stop_keys_error()))
     }
 
     fn handle(&self, who: &str, words: &[String]) -> Reply {
@@ -2479,8 +2480,7 @@ impl Service {
     fn serve(&self, pipe: Pipe) {
         uia::enter_com();
         if let Ok(message) = pipe.receive() {
-            self.active.fetch_add(1, Ordering::SeqCst);
-            *self.last_request.lock().unwrap() = Instant::now();
+            let active = ActiveGuard::enter(&self.active, &self.last_request);
             let text = String::from_utf8_lossy(&message);
             let mut words = text.split('\0').map(str::to_string);
             let who = words.next().unwrap_or_default();
@@ -2495,14 +2495,53 @@ impl Service {
             framed.extend_from_slice(body.as_bytes());
             let _ = pipe.send(&framed);
             pipe.finish();
-            *self.last_request.lock().unwrap() = Instant::now();
-            self.active.fetch_sub(1, Ordering::SeqCst);
+            drop(active);
             if quitting {
                 real::release_all();
                 std::process::exit(0);
             }
         }
     }
+}
+
+struct ActiveGuard<'a> {
+    active: &'a AtomicUsize,
+    last_request: &'a Mutex<Instant>,
+}
+
+impl<'a> ActiveGuard<'a> {
+    fn enter(active: &'a AtomicUsize, last_request: &'a Mutex<Instant>) -> Self {
+        active.fetch_add(1, Ordering::SeqCst);
+        *last_request.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        Self { active, last_request }
+    }
+}
+
+impl Drop for ActiveGuard<'_> {
+    fn drop(&mut self) {
+        *self.last_request.lock().unwrap_or_else(|e| e.into_inner()) = Instant::now();
+        self.active.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+fn should_idle_exit(active: usize, idle: Duration) -> bool {
+    (active == 0 && idle > IDLE_EXIT) || idle > HUNG_EXIT
+}
+
+fn format_status(stopped: bool, names: &[&str], stop_keys_error: Option<u32>) -> String {
+    let state = if stopped { "stopped by the person" } else { "running" };
+    let stop_keys = match stop_keys_error {
+        None => String::new(),
+        Some(windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED) => {
+            "; Ctrl+Alt+Esc stop keys unavailable: another process holds them".into()
+        }
+        Some(code) => format!("; Ctrl+Alt+Esc stop keys unavailable (error {code})"),
+    };
+    format!(
+        "deskcrew {} {state}; agents: {}{stop_keys}",
+        env!("CARGO_PKG_VERSION"),
+        if names.is_empty() { "none".into() } else { names.join(", ") }
+    )
 }
 
 pub fn run() {
@@ -2533,7 +2572,8 @@ pub fn run() {
     thread::spawn(move || {
         loop {
             thread::sleep(Duration::from_secs(30));
-            if watcher.active.load(Ordering::SeqCst) == 0 && watcher.last_request.lock().unwrap().elapsed() > IDLE_EXIT {
+            let idle = watcher.last_request.lock().unwrap_or_else(|e| e.into_inner()).elapsed();
+            if should_idle_exit(watcher.active.load(Ordering::SeqCst), idle) {
                 real::release_all();
                 std::process::exit(0);
             }
@@ -2541,16 +2581,21 @@ pub fn run() {
     });
 
     loop {
-        if !listening.accept() {
-            continue;
+        if listening.accept().is_err() {
+            break;
         }
         // The next instance exists before this one is handed off, so the name never lapses and
         // a caller can never conclude the service is down and start a second one.
-        let Ok(next) = Pipe::listen(false) else { continue };
+        let Ok(next) = Pipe::listen(false) else {
+            break;
+        };
         let current = std::mem::replace(&mut listening, next);
         let worker = service.clone();
         thread::spawn(move || worker.serve(current));
     }
+    drop(listening);
+    real::release_all();
+    std::process::exit(0);
 }
 
 /// Verbs that change windows or the clipboard outside an action's own checks: refused after the
@@ -2584,5 +2629,48 @@ mod tests {
         assert!(flags.fill);
         assert!(flags.close);
         assert_eq!(rest, vec!["rect", "10,10", "50,50"]);
+    }
+
+    #[test]
+    fn active_guard_decrements_on_drop() {
+        let active = AtomicUsize::new(0);
+        let last_request = Mutex::new(Instant::now() - Duration::from_secs(10));
+        {
+            let _guard = ActiveGuard::enter(&active, &last_request);
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+            assert!(last_request.lock().unwrap().elapsed() < Duration::from_secs(1));
+        }
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[cfg(panic = "unwind")]
+    #[test]
+    fn active_guard_decrements_on_panic() {
+        let active = AtomicUsize::new(0);
+        let last_request = Mutex::new(Instant::now());
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = ActiveGuard::enter(&active, &last_request);
+            assert_eq!(active.load(Ordering::SeqCst), 1);
+            panic!("boom");
+        }));
+        assert!(outcome.is_err());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+    }
+
+    #[test]
+    fn idle_exit_waits_for_idle_and_bounds_hung_requests() {
+        assert!(!should_idle_exit(0, IDLE_EXIT));
+        assert!(should_idle_exit(0, IDLE_EXIT + Duration::from_secs(1)));
+        assert!(!should_idle_exit(1, IDLE_EXIT + Duration::from_secs(1)));
+        assert!(should_idle_exit(1, HUNG_EXIT + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn status_reports_when_stop_keys_are_held_elsewhere() {
+        let ok = format_status(false, &["Cursor"], None);
+        assert!(ok.contains("running") && ok.contains("Cursor") && !ok.contains("unavailable"));
+
+        let held = format_status(false, &[], Some(windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED));
+        assert!(held.contains("running") && held.contains("Ctrl+Alt+Esc") && held.contains("another process holds them"));
     }
 }

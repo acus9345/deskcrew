@@ -20,13 +20,13 @@ use std::{
     time::{Duration, Instant},
 };
 use windows_sys::Win32::{
-    Foundation::{LPARAM, LRESULT, WPARAM},
+    Foundation::{GetLastError, LPARAM, LRESULT, WPARAM},
     Graphics::Dwm::DwmFlush,
     System::LibraryLoader::GetModuleHandleW,
     System::Threading::{GetCurrentThreadId, INFINITE},
     UI::{
         HiDpi::{DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2, GetDpiForSystem, SetProcessDpiAwarenessContext},
-        Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, VK_ESCAPE},
+        Input::KeyboardAndMouse::{MOD_ALT, MOD_CONTROL, MOD_NOREPEAT, RegisterHotKey, UnregisterHotKey, VK_ESCAPE},
         WindowsAndMessaging::{
             CallNextHookEx, DispatchMessageW, GetSystemMetrics, HHOOK, MSG, MSLLHOOKSTRUCT, MsgWaitForMultipleObjects, SetWindowsHookExW,
             UnhookWindowsHookEx, PM_NOREMOVE, PM_REMOVE, PeekMessageW,
@@ -109,6 +109,7 @@ pub fn label_for_test(text: &str, px: i32) -> draw::Mask {
 pub struct Overlay {
     commands: Sender<Command>,
     thread: u32,
+    stop_keys_error: Option<u32>,
     worker: JoinHandle<Stats>,
 }
 
@@ -116,9 +117,15 @@ impl Overlay {
     /// `stop` goes up when the person presses Ctrl+Alt+Esc.
     pub fn start(stop: Arc<AtomicBool>) -> Overlay {
         let (commands, inbox) = mpsc::channel();
-        let (ready, thread) = mpsc::channel();
+        let (ready, started) = mpsc::channel();
         let worker = thread::spawn(move || run(inbox, ready, stop));
-        Overlay { commands, thread: thread.recv().unwrap_or(0), worker }
+        let (thread, stop_keys_error) = started.recv().unwrap_or((0, None));
+        Overlay { commands, thread, stop_keys_error, worker }
+    }
+
+    /// Win32 error code if registering the Ctrl+Alt+Esc stop hotkey failed.
+    pub fn stop_keys_error(&self) -> Option<u32> {
+        self.stop_keys_error
     }
 
     fn send(&self, command: Command) {
@@ -435,7 +442,7 @@ impl Flash {
     }
 }
 
-fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> Stats {
+fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<AtomicBool>) -> Stats {
     let mut stats = Stats::default();
     let mut agents: Vec<Agent> = Vec::new();
     let mut flashes: Vec<Flash> = Vec::new();
@@ -445,14 +452,19 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
     let mut hook: HHOOK = null_mut();
     let mut stacked = Instant::now();
     let mut waiting: Vec<(String, Hwnd)> = Vec::new();
-    unsafe {
+    let stop_keys_error = unsafe {
         make_aware();
         // Windows only gives a thread a message queue once it asks for a message.
         let mut message: MSG = zeroed();
         PeekMessageW(&mut message, null_mut(), 0, 0, PM_NOREMOVE);
-        let _ = ready.send(GetCurrentThreadId());
-        RegisterHotKey(null_mut(), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_ESCAPE as u32);
-    }
+        let error = if RegisterHotKey(null_mut(), 1, MOD_CONTROL | MOD_ALT | MOD_NOREPEAT, VK_ESCAPE as u32) != 0 {
+            None
+        } else {
+            Some(GetLastError())
+        };
+        let _ = ready.send((GetCurrentThreadId(), error));
+        error
+    };
     let scale = (unsafe { GetDpiForSystem() } as f32 / 96.0).max(1.0);
 
     loop {
@@ -468,7 +480,17 @@ fn run(inbox: Receiver<Command>, ready: Sender<u32>, stop: Arc<AtomicBool>) -> S
         }
         for command in inbox.try_iter() {
             match command {
-                Command::Quit => return stats,
+                Command::Quit => {
+                    unsafe {
+                        if stop_keys_error.is_none() {
+                            UnregisterHotKey(null_mut(), 1);
+                        }
+                        if !hook.is_null() {
+                            UnhookWindowsHookEx(hook);
+                        }
+                    }
+                    return stats;
+                }
                 Command::Over { agent, window } => {
                     match agents.iter_mut().find(|a| a.name == agent) {
                         Some(found) => {
