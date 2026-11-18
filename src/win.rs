@@ -962,13 +962,52 @@ pub fn on_screen(x: i32, y: i32) -> bool {
     screens().iter().any(|&(left, top, w, h, _)| x >= left && y >= top && x < left + w && y < top + h)
 }
 
+/// Windows of Store and WinUI apps, and the XAML bridge windows hosted inside desktop apps such as
+/// the new Notepad.
+fn is_xaml_class(name: &str) -> bool {
+    [
+        "Xaml",
+        "CoreWindow",
+        "DesktopChildSiteBridge",
+        "DesktopWindowContentBridge",
+        "InputSite",
+        "ApplicationFrame",
+        "WinUIDesktop",
+    ]
+    .iter()
+    .any(|part| name.contains(part))
+}
+
+fn is_xaml(hwnd: Hwnd) -> bool {
+    is_xaml_class(&class(hwnd))
+}
+
+/// True if this window is a Store or WinUI app, or hosts WinUI / XAML Islands inside itself.
+/// Store and WinUI apps can pull themselves forward a moment after an accessibility action runs.
+pub fn is_store(hwnd: Hwnd) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    if is_xaml(hwnd) {
+        return true;
+    }
+    unsafe extern "system" fn find_xaml(child: HWND, found: LPARAM) -> BOOL {
+        if is_xaml(child as Hwnd) {
+            unsafe { *(found as *mut bool) = true };
+            return 0;
+        }
+        1
+    }
+    let mut found = false;
+    unsafe { EnumChildWindows(raw(hwnd), Some(find_xaml), &mut found as *mut bool as LPARAM) };
+    found
+}
+
 /// Windows drawn by their own engine: their controls are not separate windows, and posted
 /// messages do not reach them, Qt's pointer input aside.
 pub fn draws_itself(hwnd: Hwnd) -> bool {
     let name = class(hwnd);
-    ["Xaml", "CoreWindow", "DesktopChildSiteBridge", "InputSite", "ApplicationFrame", "Mozilla", "HwndWrapper", "Qt"]
-        .iter()
-        .any(|part| name.contains(part))
+    is_xaml_class(&name) || ["Mozilla", "HwndWrapper", "Qt"].iter().any(|part| name.contains(part))
 }
 
 fn holds_front(hwnd: Hwnd, ms: u64) -> bool {
@@ -1407,4 +1446,28 @@ pub fn watch_flashes() {
             DispatchMessageW(&message);
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn xaml_classes_include_store_winui_and_xaml_islands_bridges() {
+        for name in [
+            "ApplicationFrameWindow",
+            "Windows.UI.Core.CoreWindow",
+            "Windows.UI.Composition.DesktopWindowContentBridge",
+            "Microsoft.UI.Content.DesktopChildSiteBridge",
+            "Windows.UI.Input.InputSite.WindowClass",
+            "InputSiteWindowClass",
+            "WinUIDesktopWin32WindowClass",
+            "DesktopWindowXamlSource",
+        ] {
+            assert!(is_xaml_class(name), "{name} should be recognized as XAML/WinUI");
+        }
+        for name in ["Notepad", "Edit", "RichEditD2DPT", "Chrome_WidgetWin_1", "WindowsForms10.Window.8.app.0.1", "HwndWrapper[App;;123]"] {
+            assert!(!is_xaml_class(name), "{name} should not match is_xaml_class directly");
+        }
+    }
 }

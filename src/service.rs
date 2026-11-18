@@ -963,11 +963,19 @@ impl Service {
             return act::post_click(window, x, y, flags.right, flags.double);
         }
         let by_message = win::is_chromium(tracked.hwnd)
-            || (win::pulls_forward(&view.pids) && !win::draws_itself(tracked.hwnd) && view.surfaces.is_empty() && node.as_ref().is_some_and(|node| node.parts.role != "menuitem"));
+            || (win::pulls_forward(&view.pids)
+                && !win::draws_itself(tracked.hwnd)
+                && !(win::is_store(tracked.hwnd) && node.as_ref().is_some_and(|n| n.native == 0 || win::draws_itself(n.native)))
+                && view.surfaces.is_empty()
+                && node.as_ref().is_some_and(|node| node.parts.role != "menuitem"));
         let node = node.filter(|node| !act::is_classic_row(node, tracked.hwnd) && !by_message);
         if let (Some(node), true) = (&node, plain) {
             let classic = !act::needs_pen_at(tracked.hwnd, x, y);
-            let (pressed, tried_mouse) = if classic { self.overlay.shielded(|| act::press(node)) } else { (act::press_behind(node, tracked.hwnd), false) };
+            let (pressed, tried_mouse) = if classic {
+                self.overlay.shielded(|| act::press_behind(node, tracked.hwnd))
+            } else {
+                (act::press_behind(node, tracked.hwnd), false)
+            };
             if tried_mouse {
                 return Err(act::NEEDS_MOUSE.into());
             }
@@ -999,7 +1007,11 @@ impl Service {
 
     /// Check, uncheck, expand or collapse, leaving a control that is already that way alone.
     fn ensure(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, (wanted, opposite): (&str, &str)) -> Reply {
-        let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.toggle || n.can.select || n.can.expand)? else { return Err("that needs a control".into()) };
+        let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| {
+            if matches!(wanted, "open" | "closed") { n.can.expand } else { n.can.toggle }
+        })? else {
+            return Err("that needs a control".into());
+        };
         self.read(tracked, view, false)?;
         let states = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?.parts.states.clone();
         if states.contains(&wanted) {
@@ -1010,13 +1022,23 @@ impl Service {
         }
         if matches!(wanted, "open" | "closed") {
             let (node, rect) = self.locate(id, tracked, view)?;
+            if node.parts.states.contains(&"disabled") {
+                return Err("that control is disabled".into());
+            }
             self.cursor_on(who, flags, rect);
             if wanted == "open"
                 && let Some(opened) = self.open_submenu(tracked, view, id)
             {
                 return opened;
             }
-            return node.element.open_or_close().map(|_| "expand".to_string());
+            let (x, y) = act::centre(rect);
+            let classic = !act::needs_pen_at(tracked.hwnd, x, y) && !win::is_store(tracked.hwnd);
+            let (expanded, tried_mouse) = if classic {
+                self.overlay.shielded(|| act::expand_behind(&node, tracked.hwnd))
+            } else {
+                (act::expand_behind(&node, tracked.hwnd), false)
+            };
+            return if tried_mouse { Err(act::NEEDS_MOUSE.into()) } else { expanded };
         }
         self.click(who, flags, tracked, view, &format!("e{id}"))
     }
@@ -1555,7 +1577,12 @@ impl Service {
         let Target::Control(id) = self.resolve_for(word, who, tracked, view, |n| n.can.expand || n.can.select || matches!(n.parts.role.as_str(), "combobox" | "list"))? else { return Err("select needs a control".into()) };
         let (node, rect) = self.locate(id, tracked, view)?;
         self.cursor_on(who, flags, rect);
-        let (result, tried_mouse) = self.overlay.shielded(|| act::select_item(&node, item, &self.uia, tracked.hwnd));
+        let classic = !win::draws_itself(tracked.hwnd) && !win::is_store(tracked.hwnd);
+        let (result, tried_mouse) = if classic {
+            self.overlay.shielded(|| act::select_item(&node, item, &self.uia, tracked.hwnd))
+        } else {
+            (act::select_item(&node, item, &self.uia, tracked.hwnd), false)
+        };
         if tried_mouse { Err(act::NEEDS_MOUSE.into()) } else { result }
     }
 
