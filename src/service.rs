@@ -1,6 +1,6 @@
 // The background service. It keeps the cursors on screen between commands, remembers each
 // window's refs, and runs agents side by side: one queue per window, one for the real mouse.
-use crate::borrow::Permission;
+use crate::borrow::{CallerLookup, Permission};
 use crate::real::{Button, Loan, Modifiers, MouseButton};
 use crate::{
     act::{self, NEEDS_REAL},
@@ -1808,7 +1808,7 @@ impl Service {
 
     /// One step of a do, with the flags it may carry itself: its own --expect is checked after it,
     /// and flags that would need another window or another go-ahead are refused, not dropped.
-    fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+    fn step(&self, who: &str, caller: &CallerLookup, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let (own, _) = parse(words);
         if own.window.is_some() {
             return Err("a step cannot pick another window: a do runs in one, so run another command for that window".into());
@@ -1816,7 +1816,7 @@ impl Service {
         if matches!(own.risk.as_deref(), Some("medium" | "high")) && !flags.force && !own.force {
             return Err("declared risky: ask the person, then add --force".into());
         }
-        let route = self.run_step(who, flags, tracked, view, words)?;
+        let route = self.run_step(who, caller, flags, tracked, view, words)?;
         if let Some(text) = &own.expect {
             let waiting = Flags { ms: own.ms.or(flags.ms), ..Flags::default() };
             self.wait_text(&waiting, tracked, view, text)?;
@@ -1824,14 +1824,14 @@ impl Service {
         Ok(route)
     }
 
-    fn run_step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+    fn run_step(&self, who: &str, caller: &CallerLookup, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         self.overlay.over(who, tracked.hwnd);
         let (own, words) = parse(words);
         if let Some(error) = own.button_error {
             return Err(error);
         }
         if own.mouse && !flags.mouse {
-            self.borrow.allow(who)?;
+            self.borrow.allow(who, caller.resolve())?;
         }
         let flags = Flags {
             real: flags.real || own.real,
@@ -1894,7 +1894,7 @@ impl Service {
     }
 
     /// Run steps against one window, then report the result as a single set of changes.
-    fn act(&self, who: &str, flags: &Flags, steps: &[Vec<String>]) -> Reply {
+    fn act(&self, who: &str, caller: &CallerLookup, flags: &Flags, steps: &[Vec<String>]) -> Reply {
         if self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
@@ -1917,7 +1917,7 @@ impl Service {
                 failure = Some(STOPPED.to_string());
                 break;
             }
-            match self.step(who, flags, &tracked, view, step) {
+            match self.step(who, caller, flags, &tracked, view, step) {
                 Ok(route) => routes.push(route),
                 Err(error) => {
                     failure = Some(error);
@@ -2382,14 +2382,15 @@ impl Service {
         Ok(format_status(self.stop.load(Ordering::Relaxed), &names, self.overlay.stop_keys_error()))
     }
 
-    fn handle(&self, who: &str, words: &[String]) -> Reply {
+    fn handle(&self, who: &str, client_pid: Option<u32>, words: &[String]) -> Reply {
+        let caller = CallerLookup::new(client_pid);
         let (flags, rest) = parse(words);
         if let Some(err) = &flags.button_error {
             return Err(err.clone());
         }
         flags.modifiers()?;
         if flags.mouse {
-            self.borrow.allow(who)?;
+            self.borrow.allow(who, caller.resolve())?;
         }
         let verb = rest.first().map_or("", String::as_str);
         let args = rest.get(1..).unwrap_or(&[]);
@@ -2449,19 +2450,22 @@ impl Service {
                 if matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
                     return Err("declared risky: ask the person, then add --force".into());
                 }
+                if steps.iter().any(|step| parse(step).0.mouse) {
+                    let _ = caller.resolve();
+                }
                 steps.extend(expected(&flags));
-                self.act(who, &flags, &steps)
+                self.act(who, &caller, &flags, &steps)
             }
             "click" if !args.is_empty() => {
                 let mut steps: Vec<Vec<String>> = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
                 steps.extend(expected(&flags));
-                self.act(who, &flags, &steps)
+                self.act(who, &caller, &flags, &steps)
             }
             "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => {
                 let drawn = self.draw_together(who, &flags, args)?;
                 // --expect is checked here too, as on every other action.
                 match expected(&flags) {
-                    Some(step) => self.act(who, &flags, &[step]).map(|found| format!("{drawn}
+                    Some(step) => self.act(who, &caller, &flags, &[step]).map(|found| format!("{drawn}
 {found}")).map_err(|error| format!("{drawn}
 {error}")),
                     None => Ok(drawn),
@@ -2470,7 +2474,7 @@ impl Service {
             "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" | "pick-file" => {
                 let mut steps = vec![rest.clone()];
                 steps.extend(expected(&flags));
-                self.act(who, &flags, &steps)
+                self.act(who, &caller, &flags, &steps)
             }
             "" | "help" => Ok(HELP.to_string()),
             _ => Err(format!("unknown command '{verb}': deskcrew help")),
@@ -2480,13 +2484,14 @@ impl Service {
     fn serve(&self, pipe: Pipe) {
         uia::enter_com();
         if let Ok(message) = pipe.receive() {
+            let client_pid = pipe.client_pid();
             let active = ActiveGuard::enter(&self.active, &self.last_request);
             let text = String::from_utf8_lossy(&message);
             let mut words = text.split('\0').map(str::to_string);
             let who = words.next().unwrap_or_default();
             let words: Vec<String> = words.collect();
             let quitting = words.first().is_some_and(|w| w == "quit");
-            let reply = if quitting { Ok("ok".to_string()) } else { self.handle(&who, &words) };
+            let reply = if quitting { Ok("ok".to_string()) } else { self.handle(&who, client_pid, &words) };
             let (code, body) = match reply {
                 Ok(body) => (0, body),
                 Err(body) => (1, body),

@@ -317,7 +317,9 @@ Each reply names the route it took.
 | `keyboard` | `key`, `type` and `set` with `--real` | untouched | borrowed for the action |
 | `mouse` | only `--mouse`, and only if you allow it | moved, then put back | borrowed for the action |
 
-**Nothing moves your cursor unless you say so.** Borrowing it is off by default. Run `deskcrew cursor ask` to let agents ask, and an agent that needs it gets a prompt on screen: **Just this once**, **This session**, **Always** or **No**. No answer in a minute counts as no, and the prompt never takes focus, so your typing cannot answer it.
+**Nothing moves your cursor unless you say so.** Borrowing it is off by default. Run `deskcrew cursor ask` to let agents ask, and an agent that needs it gets a prompt on screen showing its name (and its program if the name differs): **Just this once**, **This session**, **Always** or **No**. No answer in a minute counts as no, the prompt never takes focus so your typing cannot answer it, and a button press counts only from your own recent mouse click.
+
+**This session** and **Always** from the prompt are tied to the calling agent's actual process and program executable path (learned from the Windows pipe connection and process tree), not its self-reported `--agent` or `DESKCREW_AGENT` name, so another program cannot borrow an agent's grant by naming itself after it. Older name-only `always NAME` entries in `%USERPROFILE%\.deskcrew\cursor.txt` are still read and marked as needing re-confirmation once before they apply again.
 
 | `deskcrew cursor` | Effect |
 | --- | --- |
@@ -326,7 +328,7 @@ Each reply names the route it took.
 | `session` | every agent may borrow it until deskcrew stops |
 | `always` | every agent may borrow it when needed, until you run `off` |
 
-Anything except `off` opens a prompt you have to accept. This stops an agent from turning it on by accident or by habit, but it is not a security boundary: anything running as you can edit `%USERPROFILE%\.deskcrew\cursor.txt` or click the prompt.
+Anything except `off` opens a prompt you have to accept. This stops an agent from turning it on by accident or stealing another agent's grant by name, but it is not a security boundary against arbitrary code running as you: anything running as you can edit `%USERPROFILE%\.deskcrew\cursor.txt`.
 
 Some classic controls answer an accessibility request by quietly clicking with the real mouse, so a shield blocks every synthetic mouse event while those requests run. A control that needs that is refused with a message instead. In tests, Paint drawing and Edge presses caused no synthetic mouse events at all.
 

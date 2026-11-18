@@ -77,7 +77,12 @@ const AGENT_PROGRAMS: [(&str, &str); 16] = [
     ("grok", "Grok"),
     ("zed", "Zed"),
 ];
-const MOST_ANCESTORS: usize = 16;
+pub const MOST_ANCESTORS: usize = 16;
+
+/// Display name for a known agent program stem, or `None` if it is not a recognised agent binary.
+pub fn agent_program(program: &str) -> Option<&'static str> {
+    AGENT_PROGRAMS.iter().find(|(known, _)| *known == program).map(|(_, name)| *name)
+}
 
 /// Every process's parent and lower-case program name, without folder or `.exe`.
 #[cfg(not(windows))]
@@ -127,7 +132,7 @@ fn launched_by() -> Option<&'static str> {
     for _ in 0..MOST_ANCESTORS {
         let (parent, _) = parents.get(&id)?;
         let (_, program) = parents.get(parent)?;
-        if let Some((_, name)) = AGENT_PROGRAMS.iter().find(|(known, _)| known == program) {
+        if let Some(name) = agent_program(program) {
             return Some(name);
         }
         id = *parent;

@@ -379,6 +379,9 @@ fn everything_on_a_real_desktop() {
     let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
     r.check("the cursor cannot be borrowed until the person allows it", !ok && reply.contains("borrow") && pointer_and_focus() == before, &reply);
     std::fs::write(&settings, format!("always {a}")).unwrap();
+    let (legacy_ok, legacy_reply) = dc(a, &["click", "120,320", "--mouse"]);
+    r.check("old name-only always grants need re-confirming", !legacy_ok && legacy_reply.contains("borrow") && pointer_and_focus() == before, &legacy_reply);
+    std::fs::write(&settings, "always *").unwrap();
     let (ok, reply) = dc(a, &["click", "120,320", "--mouse"]);
     thread::sleep(Duration::from_millis(100));
     let after = pointer_and_focus();
