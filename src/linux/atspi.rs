@@ -12,8 +12,10 @@ const ROOT_BUS: &str = "org.a11y.atspi.Registry";
 const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const SCREEN: u32 = 0;
+const WINDOW: u32 = 1;
 
 // AtspiStateType, bit numbers in GetState's two words.
+const ACTIVE: u32 = 1;
 const ENABLED: u32 = 8;
 const CHECKED: u32 = 4;
 const COLLAPSED: u32 = 5;
@@ -31,10 +33,19 @@ const CHECKABLE: u32 = 41;
 const IS_DEFAULT: u32 = 39;
 
 /// One object on the accessibility bus.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Obj {
     pub bus: String,
     pub path: String,
+}
+
+/// A top-level window discovered on the accessibility bus.
+pub struct FrameWindow {
+    pub element: Obj,
+    pub pid: u32,
+    pub app: String,
+    pub title: String,
+    pub rect: Bounds,
 }
 
 pub struct Node {
@@ -131,18 +142,33 @@ fn interfaces(obj: &Obj) -> Vec<String> {
     call(obj, ACCESSIBLE, "GetInterfaces", &()).unwrap_or_default()
 }
 
+fn try_states(obj: &Obj) -> Result<u64, String> {
+    let words: Vec<u32> = call(obj, ACCESSIBLE, "GetState", &())?;
+    if words.is_empty() {
+        return Err("that control did not report its state".into());
+    }
+    Ok(words.first().copied().unwrap_or(0) as u64 | (words.get(1).copied().unwrap_or(0) as u64) << 32)
+}
+
 fn states(obj: &Obj) -> u64 {
-    let words: Vec<u32> = call(obj, ACCESSIBLE, "GetState", &()).unwrap_or_default();
-    words.first().copied().unwrap_or(0) as u64 | (words.get(1).copied().unwrap_or(0) as u64) << 32
+    try_states(obj).unwrap_or(0)
 }
 
 fn has(states: u64, bit: u32) -> bool {
     states & (1u64 << bit) != 0
 }
 
-/// Where the object is on screen, in X root pixels.
+/// Where the object is on screen (or relative to its surface on Wayland).
 pub fn rect(obj: &Obj) -> Option<Bounds> {
-    call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(SCREEN,)).ok()
+    let valid = |r: &Bounds| r.0 != i32::MIN && r.1 != i32::MIN && r.2 > 0 && r.3 > 0;
+    let screen = call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(SCREEN,)).ok();
+    if screen.as_ref().is_some_and(valid) || (super::x::has_display() && !super::x::is_xwayland()) {
+        return screen.filter(|r| r.0 != i32::MIN && r.1 != i32::MIN);
+    }
+    call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(WINDOW,))
+        .ok()
+        .filter(valid)
+        .or_else(|| screen.filter(|r| r.0 != i32::MIN && r.1 != i32::MIN))
 }
 
 /// The process behind a bus name on the accessibility bus.
@@ -178,6 +204,66 @@ fn applications() -> Vec<Obj> {
         .collect()
 }
 
+fn is_window_role(role: &str) -> bool {
+    matches!(role, "frame" | "window" | "dialog" | "file chooser" | "alert" | "color chooser" | "font chooser" | "page setup")
+}
+
+fn app_name(app: Option<&Obj>, pid: u32) -> String {
+    let from_bus = app.map(name).filter(|n| !n.is_empty());
+    let from_proc = (pid > 0).then(|| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()).flatten().map(|c| c.trim().to_string());
+    from_bus.or(from_proc).unwrap_or_default()
+}
+
+/// Top-level visible windows on the accessibility bus, active windows first.
+pub fn windows() -> Result<Vec<FrameWindow>, String> {
+    bus()?;
+    let me = std::process::id();
+    let mut out: Vec<(bool, FrameWindow)> = Vec::new();
+    for app in applications() {
+        let Some(pid) = pid_of(&app.bus) else { continue };
+        if pid == me {
+            continue;
+        }
+        let app_label = app_name(Some(&app), pid);
+        for frame in children(&app) {
+            if !is_window_role(&role_name(&frame)) {
+                continue;
+            }
+            let state = states(&frame);
+            if !has(state, SHOWING) && !has(state, VISIBLE) {
+                continue;
+            }
+            let title = name(&frame);
+            let bounds = rect(&frame).unwrap_or((0, 0, 0, 0));
+            if title.is_empty() && bounds.2 <= 0 && bounds.3 <= 0 && children(&frame).is_empty() {
+                continue;
+            }
+            out.push((
+                has(state, ACTIVE),
+                FrameWindow { element: frame, pid, app: app_label.clone(), title, rect: bounds },
+            ));
+        }
+    }
+    out.sort_by_key(|(active, _)| !*active);
+    Ok(out.into_iter().map(|(_, window)| window).collect())
+}
+
+/// Live properties of a top-level accessible window, or None if it closed.
+pub fn frame_info(obj: &Obj) -> Option<FrameWindow> {
+    if !is_window_role(&role_name(obj)) {
+        return None;
+    }
+    let state = states(obj);
+    if !has(state, SHOWING) && !has(state, VISIBLE) {
+        return None;
+    }
+    let pid = pid_of(&obj.bus).unwrap_or(0);
+    let app = app_name(parent(obj).as_ref(), pid);
+    let title = name(obj);
+    let bounds = rect(obj).unwrap_or((0, 0, 0, 0));
+    Some(FrameWindow { element: obj.clone(), pid, app, title, rect: bounds })
+}
+
 /// The app's top-level windows on the accessibility bus, with the process each belongs to.
 pub fn frames() -> Vec<(Obj, u32)> {
     let mut out = Vec::new();
@@ -197,7 +283,7 @@ pub fn frame_for(pid: u32, title: &str, at: Bounds) -> Option<Obj> {
     if let Some(same) = showing.iter().find(|f| !title.is_empty() && name(f) == title) {
         return Some((*same).clone());
     }
-    let near = |f: &&&Obj| rect(f).is_some_and(|r| (r.0 - at.0).abs() < 60 && (r.1 - at.1).abs() < 60 && (r.2 - at.2).abs() < 60);
+    let near = |f: &&&Obj| rect(f).is_some_and(|r| r.0.abs_diff(at.0) < 60 && r.1.abs_diff(at.1) < 60 && r.2.abs_diff(at.2) < 60);
     if let Some(placed) = showing.iter().find(near) {
         return Some((*placed).clone());
     }
@@ -241,8 +327,11 @@ fn acts(role: &str) -> bool {
 }
 
 fn outside(rect: Bounds, window: Bounds) -> bool {
-    let (x, y, w, h) = rect;
-    let (wx, wy, ww, wh) = window;
+    if window.2 <= 0 || window.3 <= 0 {
+        return false;
+    }
+    let (x, y, w, h) = (rect.0 as i64, rect.1 as i64, rect.2 as i64, rect.3 as i64);
+    let (wx, wy, ww, wh) = (window.0 as i64, window.1 as i64, window.2 as i64, window.3 as i64);
     w <= 0 || h <= 0 || x + w <= wx || y + h <= wy || x >= wx + ww || y >= wy + wh
 }
 
@@ -636,7 +725,7 @@ pub fn table(obj: &Obj, skip: usize, rows: usize, columns: usize) -> Result<Tabl
         headers.clear();
     }
     let mut cells = Vec::new();
-    for row in skip.min(total_rows)..total_rows.min(skip + rows) {
+    for row in skip.min(total_rows)..total_rows.min(skip.saturating_add(rows)) {
         let mut line = Vec::new();
         for column in 0..total_columns.min(columns) {
             let cell = call::<_, (String, OwnedObjectPath)>(&owner, TABLE, "GetAccessibleAt", &(row as i32, column as i32)).ok().and_then(object);
@@ -647,24 +736,53 @@ pub fn table(obj: &Obj, skip: usize, rows: usize, columns: usize) -> Result<Tabl
     Ok(Table { headers, rows: cells, total_rows, total_columns })
 }
 
+/// Live checked state (`"on"`, `"mixed"`, `"off"`) of a checkbox, radio or toggle button.
+pub fn toggle_state(obj: &Obj, role: &str) -> Result<Option<&'static str>, String> {
+    let state = try_states(obj)?;
+    Ok(match role {
+        "checkbox" | "radio" => Some(if has(state, CHECKED) { "on" } else if has(state, INDETERMINATE) { "mixed" } else { "off" }),
+        "button" if has(state, CHECKABLE) || role_name(obj) == "toggle button" => Some(if has(state, CHECKED) { "on" } else { "off" }),
+        _ => None,
+    })
+}
+
+/// Live expanded state (`"open"` or `"closed"`) of an expandable control or combo box.
+pub fn expand_state(obj: &Obj, role: &str) -> Result<Option<&'static str>, String> {
+    let state = try_states(obj)?;
+    if role == "combobox" || has(state, EXPANDABLE) {
+        if has(state, EXPANDED) {
+            return Ok(Some("open"));
+        }
+        if has(state, COLLAPSED) || role == "combobox" {
+            return Ok(Some("closed"));
+        }
+    }
+    Ok(None)
+}
+
 /// Where a field's caret is on the screen, as its top left and height, after the last character
 /// when it is at the end.
 pub fn caret(obj: &Obj) -> Option<(i32, i32, i32)> {
     const TEXT: &str = "org.a11y.atspi.Text";
     let offset: i32 = property(obj, TEXT, "CaretOffset").ok()?;
     let count: i32 = property(obj, TEXT, "CharacterCount").unwrap_or(0);
-    let extents = |at: i32| call::<_, (i32, i32, i32, i32)>(obj, TEXT, "GetCharacterExtents", &(at, SCREEN)).ok().filter(|e| e.3 > 0);
-    if offset < count
+    let extents = |at: i32| {
+        call::<_, (i32, i32, i32, i32)>(obj, TEXT, "GetCharacterExtents", &(at, SCREEN))
+            .ok()
+            .filter(|e| e.0 != i32::MIN && e.1 != i32::MIN && e.3 > 0)
+    };
+    if offset >= 0
+        && offset < count
         && let Some((x, y, _, h)) = extents(offset)
     {
         return Some((x, y, h));
     }
-    if let Some((x, y, w, h)) = extents((offset - 1).max(0)).filter(|_| count > 0) {
-        return Some((x + w, y, h));
+    if let Some((x, y, w, h)) = extents(offset.saturating_sub(1).max(0)).filter(|_| count > 0) {
+        return Some((x.saturating_add(w), y, h));
     }
     // An empty field: the start of its box, a little in.
-    let (x, y, _, h) = rect(obj)?;
-    (h > 4).then_some((x + 3, y + 3, h - 6))
+    let (x, y, _, h) = rect(obj).filter(|r| r.0 != i32::MIN && r.1 != i32::MIN)?;
+    (h > 4).then_some((x.saturating_add(3), y.saturating_add(3), h - 6))
 }
 
 /// Whether this is the button a dialog presses when its Enter is pressed, as Open or Save is.
