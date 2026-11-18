@@ -15,9 +15,16 @@ const CONNECT_WAIT: Duration = Duration::from_secs(120);
 
 fn path() -> PathBuf {
     let folder = std::env::var_os("TMPDIR").map(PathBuf::from).unwrap_or_else(std::env::temp_dir);
-    // On Linux each X display (a desktop, or an Xvfb) gets its own service.
+    // On Linux each X display (a desktop, or an Xvfb) or Wayland display gets its own service.
     #[cfg(target_os = "linux")]
-    let display: String = std::env::var("DISPLAY").unwrap_or_default().chars().map(|c| if c.is_alphanumeric() { c } else { '-' }).collect();
+    let display: String = std::env::var("DISPLAY")
+        .ok()
+        .filter(|d| !d.is_empty())
+        .or_else(|| std::env::var("WAYLAND_DISPLAY").ok().filter(|d| !d.is_empty()))
+        .unwrap_or_default()
+        .chars()
+        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+        .collect();
     #[cfg(not(target_os = "linux"))]
     let display = String::new();
     folder.join(format!("deskcrew-{}{}{display}.sock", env!("CARGO_PKG_VERSION"), if display.is_empty() { "" } else { "-" }))

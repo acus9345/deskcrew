@@ -55,63 +55,79 @@ pub enum Command {
 
 #[derive(Clone)]
 pub struct Overlay {
-    commands: Sender<Command>,
+    commands: Option<Sender<Command>>,
 }
 
 static SHARED: OnceLock<Overlay> = OnceLock::new();
 
 impl Overlay {
     /// Start drawing on the display, once. Screen copies hide the cursors from then on.
+    /// On Wayland without X11 there is no global overlay surface, so this is a no-op.
     pub fn start() -> Overlay {
         SHARED
             .get_or_init(|| {
+                if !super::x::has_display() {
+                    return Overlay { commands: None };
+                }
                 let (commands, inbox) = mpsc::channel();
                 thread::spawn(move || run(inbox));
-                Overlay { commands }
+                Overlay { commands: Some(commands) }
             })
             .clone()
     }
 
     /// The running overlay, if the service started one.
     pub fn running() -> Option<Overlay> {
-        SHARED.get().cloned()
+        SHARED.get().filter(|o| o.commands.is_some()).cloned()
     }
 
     /// Glide there and return once the cursor has arrived.
     pub fn move_to(&self, agent: &str, x: i32, y: i32) {
+        let Some(commands) = &self.commands else { return };
         let (done, arrived) = mpsc::channel();
-        let _ = self.commands.send(Command::Move { agent: agent.into(), x, y, instant: false, done: Some(done) });
+        let _ = commands.send(Command::Move { agent: agent.into(), x, y, instant: false, done: Some(done) });
         let _ = arrived.recv_timeout(Duration::from_secs(2));
     }
 
     /// Be there at once, for `--fast` and for following a stroke as it is drawn.
     pub fn jump(&self, agent: &str, x: i32, y: i32) {
-        let _ = self.commands.send(Command::Move { agent: agent.into(), x, y, instant: true, done: None });
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Move { agent: agent.into(), x, y, instant: true, done: None });
+        }
     }
 
     pub fn over(&self, agent: &str, window: u32) {
-        let _ = self.commands.send(Command::Over { agent: agent.into(), window });
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Over { agent: agent.into(), window });
+        }
     }
 
     pub fn press(&self, agent: &str, target: (i32, i32, i32, i32)) {
-        let _ = self.commands.send(Command::Press { agent: agent.into(), target });
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Press { agent: agent.into(), target });
+        }
     }
 
     /// Pulse this agent's name tag as it types this many keys.
     pub fn typing(&self, agent: &str, keys: usize) {
-        let _ = self.commands.send(Command::Type { agent: agent.into(), keys });
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Type { agent: agent.into(), keys });
+        }
     }
 
     /// Show this agent as a caret `h` pixels tall with its top at x,y, where its text goes in. It
     /// is the arrow again on its next move.
     pub fn caret(&self, agent: &str, x: i32, y: i32, h: i32) {
-        let _ = self.commands.send(Command::Caret { agent: agent.into(), x, y, h });
+        if let Some(commands) = &self.commands {
+            let _ = commands.send(Command::Caret { agent: agent.into(), x, y, h });
+        }
     }
 
     /// Hide every cursor while the screen is copied, or bring them back. Returns once done.
     pub fn aside(&self, on: bool) {
+        let Some(commands) = &self.commands else { return };
         let (done, finished) = mpsc::channel();
-        let _ = self.commands.send(Command::Aside { on, done });
+        let _ = commands.send(Command::Aside { on, done });
         let _ = finished.recv_timeout(Duration::from_millis(500));
     }
 }

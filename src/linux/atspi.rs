@@ -12,8 +12,10 @@ const ROOT_BUS: &str = "org.a11y.atspi.Registry";
 const ROOT_PATH: &str = "/org/a11y/atspi/accessible/root";
 const ACCESSIBLE: &str = "org.a11y.atspi.Accessible";
 const SCREEN: u32 = 0;
+const WINDOW: u32 = 1;
 
 // AtspiStateType, bit numbers in GetState's two words.
+const ACTIVE: u32 = 1;
 const ENABLED: u32 = 8;
 const CHECKED: u32 = 4;
 const COLLAPSED: u32 = 5;
@@ -31,10 +33,19 @@ const CHECKABLE: u32 = 41;
 const IS_DEFAULT: u32 = 39;
 
 /// One object on the accessibility bus.
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Obj {
     pub bus: String,
     pub path: String,
+}
+
+/// A top-level window discovered on the accessibility bus.
+pub struct FrameWindow {
+    pub element: Obj,
+    pub pid: u32,
+    pub app: String,
+    pub title: String,
+    pub rect: Bounds,
 }
 
 pub struct Node {
@@ -140,9 +151,16 @@ fn has(states: u64, bit: u32) -> bool {
     states & (1u64 << bit) != 0
 }
 
-/// Where the object is on screen, in X root pixels.
+/// Where the object is on screen (or relative to its surface on Wayland).
 pub fn rect(obj: &Obj) -> Option<Bounds> {
-    call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(SCREEN,)).ok()
+    let screen = call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(SCREEN,)).ok();
+    if screen.is_some_and(|r| r.2 > 0 && r.3 > 0) || (super::x::has_display() && !super::x::is_xwayland()) {
+        return screen;
+    }
+    call::<_, (i32, i32, i32, i32)>(obj, "org.a11y.atspi.Component", "GetExtents", &(WINDOW,))
+        .ok()
+        .filter(|r| r.2 > 0 && r.3 > 0)
+        .or(screen)
 }
 
 /// The process behind a bus name on the accessibility bus.
@@ -176,6 +194,66 @@ fn applications() -> Vec<Obj> {
         .map(|bus| Obj { bus, path: ROOT_PATH.into() })
         .filter(|app| role_name(app) == "application")
         .collect()
+}
+
+fn is_window_role(role: &str) -> bool {
+    matches!(role, "frame" | "window" | "dialog" | "file chooser" | "alert" | "color chooser" | "font chooser" | "page setup")
+}
+
+fn app_name(app: Option<&Obj>, pid: u32) -> String {
+    let from_bus = app.map(name).filter(|n| !n.is_empty());
+    let from_proc = (pid > 0).then(|| std::fs::read_to_string(format!("/proc/{pid}/comm")).ok()).flatten().map(|c| c.trim().to_string());
+    from_bus.or(from_proc).unwrap_or_default()
+}
+
+/// Top-level visible windows on the accessibility bus, active windows first.
+pub fn windows() -> Result<Vec<FrameWindow>, String> {
+    bus()?;
+    let me = std::process::id();
+    let mut out: Vec<(bool, FrameWindow)> = Vec::new();
+    for app in applications() {
+        let Some(pid) = pid_of(&app.bus) else { continue };
+        if pid == me {
+            continue;
+        }
+        let app_label = app_name(Some(&app), pid);
+        for frame in children(&app) {
+            if !is_window_role(&role_name(&frame)) {
+                continue;
+            }
+            let state = states(&frame);
+            if !has(state, SHOWING) && !has(state, VISIBLE) {
+                continue;
+            }
+            let title = name(&frame);
+            let bounds = rect(&frame).unwrap_or((0, 0, 0, 0));
+            if title.is_empty() && bounds.2 <= 0 && bounds.3 <= 0 && children(&frame).is_empty() {
+                continue;
+            }
+            out.push((
+                has(state, ACTIVE),
+                FrameWindow { element: frame, pid, app: app_label.clone(), title, rect: bounds },
+            ));
+        }
+    }
+    out.sort_by_key(|(active, _)| !*active);
+    Ok(out.into_iter().map(|(_, window)| window).collect())
+}
+
+/// Live properties of a top-level accessible window, or None if it closed.
+pub fn frame_info(obj: &Obj) -> Option<FrameWindow> {
+    if !is_window_role(&role_name(obj)) {
+        return None;
+    }
+    let state = states(obj);
+    if !has(state, SHOWING) && !has(state, VISIBLE) {
+        return None;
+    }
+    let pid = pid_of(&obj.bus).unwrap_or(0);
+    let app = app_name(parent(obj).as_ref(), pid);
+    let title = name(obj);
+    let bounds = rect(obj).unwrap_or((0, 0, 0, 0));
+    Some(FrameWindow { element: obj.clone(), pid, app, title, rect: bounds })
 }
 
 /// The app's top-level windows on the accessibility bus, with the process each belongs to.
@@ -241,6 +319,9 @@ fn acts(role: &str) -> bool {
 }
 
 fn outside(rect: Bounds, window: Bounds) -> bool {
+    if window.2 <= 0 || window.3 <= 0 {
+        return false;
+    }
     let (x, y, w, h) = rect;
     let (wx, wy, ww, wh) = window;
     w <= 0 || h <= 0 || x + w <= wx || y + h <= wy || x >= wx + ww || y >= wy + wh

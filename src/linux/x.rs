@@ -21,8 +21,6 @@ use x11rb::{
 
 pub type Bounds = (i32, i32, i32, i32);
 
-const LAUNCH_WAIT: Duration = Duration::from_secs(10);
-const LAUNCH_STEP: Duration = Duration::from_millis(150);
 const KEY_GAP: Duration = Duration::from_millis(8);
 const MOVE_SETTLE: Duration = Duration::from_millis(15);
 
@@ -43,21 +41,31 @@ struct X {
 
 static X: OnceLock<Result<X, String>> = OnceLock::new();
 
-/// Wayland stops one app from reading or driving another, so deskcrew needs X11.
+pub fn has_display() -> bool {
+    std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty())
+}
+
+pub fn has_wayland() -> bool {
+    std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty())
+}
+
+/// Wayland without X11 still drives accessible controls through AT-SPI; only a session with neither
+/// DISPLAY nor WAYLAND_DISPLAY has nothing to talk to.
 pub fn display_problem() -> Option<String> {
-    let x = std::env::var_os("DISPLAY").is_some_and(|d| !d.is_empty());
-    let wayland = std::env::var_os("WAYLAND_DISPLAY").is_some_and(|d| !d.is_empty());
-    match (x, wayland) {
-        (true, _) => None,
-        (false, true) => Some("deskcrew needs X11, and this is a Wayland session: Wayland does not let one app read or drive another. Log in to an X11 (Xorg) session, or run the apps on Xvfb with DISPLAY set.".into()),
-        (false, false) => Some("no X display: set DISPLAY, or start one with Xvfb (for example: Xvfb :99 & export DISPLAY=:99)".into()),
+    if has_display() || has_wayland() {
+        None
+    } else {
+        Some("no X display: set DISPLAY, or start one with Xvfb (for example: Xvfb :99 & export DISPLAY=:99)".into())
     }
 }
 
 fn x() -> Result<&'static X, String> {
     X.get_or_init(|| {
-        if let Some(problem) = display_problem() {
-            return Err(problem);
+        if !has_display() {
+            if has_wayland() {
+                return Err("that needs X11, and this Wayland session has no DISPLAY (screenshots, global keys/pointer and window placement need X11 or desktop portals)".into());
+            }
+            return Err("no X display: set DISPLAY, or start one with Xvfb (for example: Xvfb :99 & export DISPLAY=:99)".into());
         }
         let (conn, screen) = x11rb::connect(None).map_err(|e| format!("could not open the X display: {e}"))?;
         let root = conn.setup().roots[screen].root;
@@ -67,8 +75,44 @@ fn x() -> Result<&'static X, String> {
     .map_err(Clone::clone)
 }
 
+/// True when WAYLAND_DISPLAY is set and DISPLAY points at XWayland rather than a standalone X
+/// server such as Xvfb.
+pub fn is_xwayland() -> bool {
+    if !has_wayland() || !has_display() {
+        return false;
+    }
+    let Ok(x) = x() else { return false };
+    static XWAYLAND: OnceLock<bool> = OnceLock::new();
+    *XWAYLAND.get_or_init(|| detect_xwayland(x))
+}
+
+fn detect_xwayland(x: &X) -> bool {
+    if let Some(monitors) = x.conn.randr_get_monitors(x.root, true).ok().and_then(|c| c.reply().ok()) {
+        for monitor in monitors.monitors {
+            if let Some(name) = x.conn.get_atom_name(monitor.name).ok().and_then(|c| c.reply().ok())
+                && name.name.starts_with(b"XWAYLAND")
+            {
+                return true;
+            }
+        }
+    }
+    if let Some(res) = x.conn.randr_get_screen_resources_current(x.root).ok().and_then(|c| c.reply().ok()) {
+        for output in res.outputs {
+            if let Some(info) = x.conn.randr_get_output_info(output, res.config_timestamp).ok().and_then(|c| c.reply().ok())
+                && info.name.starts_with(b"XWAYLAND")
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// The accessibility bus the desktop published on the root window, as at-spi does.
 pub fn accessibility_bus() -> Option<String> {
+    if !has_display() {
+        return None;
+    }
     let x = x().ok()?;
     let bytes = x.property(x.root, "AT_SPI_BUS", AtomEnum::STRING.into())?;
     Some(String::from_utf8_lossy(&bytes).trim_end_matches('\0').to_string()).filter(|a| !a.is_empty())
@@ -802,12 +846,10 @@ pub fn stop_keys_down() -> bool {
 
 // ---- Apps and the clipboard. ----
 
-/// Start an app and wait for its first window: a new window of its process, or any new window,
-/// since single-instance apps hand the work to a process already running.
-pub fn launch(app: &str, args: &[String]) -> Result<Option<Window>, String> {
+/// Start an app in its own process group and return its PID.
+pub fn spawn(app: &str, args: &[String]) -> Result<u32, String> {
     use std::os::unix::process::CommandExt;
-    let before: Vec<u32> = list().iter().map(|w| w.id).collect();
-    let child = Command::new(app)
+    let mut child = Command::new(app)
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -816,22 +858,63 @@ pub fn launch(app: &str, args: &[String]) -> Result<Option<Window>, String> {
         .spawn()
         .map_err(|e| format!("could not start {app}: {e}"))?;
     let pid = child.id();
-    let started = Instant::now();
-    while started.elapsed() < LAUNCH_WAIT {
-        thread::sleep(LAUNCH_STEP);
-        let now = list();
-        if let Some(own) = now.iter().find(|w| w.pid == pid) {
-            return Ok(Some(own.clone()));
-        }
-        if let Some(new) = now.into_iter().find(|w| !before.contains(&w.id)) {
-            return Ok(Some(new));
-        }
-    }
-    Ok(None)
+    thread::spawn(move || {
+        let _ = child.wait();
+    });
+    Ok(pid)
 }
 
-/// The clipboard through xclip or xsel: X keeps a selection only while its owner runs.
+fn wayland_clipboard() -> Option<Result<Option<String>, String>> {
+    let types = match Command::new("wl-paste").arg("--list-types").stderr(Stdio::piped()).output() {
+        Ok(out) => out,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => return Some(Err(format!("could not run wl-paste: {e}"))),
+    };
+    if !types.status.success() {
+        let err = String::from_utf8_lossy(&types.stderr);
+        if err.contains("Nothing is copied") || err.trim().is_empty() {
+            return Some(Ok(None));
+        }
+        return Some(Err(format!("could not read the Wayland clipboard: {}", err.trim())));
+    }
+    let types_text = String::from_utf8_lossy(&types.stdout);
+    let list: Vec<&str> = types_text.lines().map(str::trim).collect();
+    let kind = ["text/plain;charset=utf-8", "UTF8_STRING", "text/plain", "STRING"]
+        .into_iter()
+        .find(|wanted| list.iter().any(|item| item.eq_ignore_ascii_case(wanted)))
+        .or_else(|| list.iter().copied().find(|k| k.starts_with("text/")));
+    let Some(kind) = kind else {
+        return Some(Ok(None));
+    };
+    let out = match Command::new("wl-paste").args(["--no-newline", "--type", kind]).stderr(Stdio::null()).output() {
+        Ok(out) => out,
+        Err(e) => return Some(Err(format!("could not run wl-paste: {e}"))),
+    };
+    Some(Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned())))
+}
+
+fn wayland_set_clipboard(text: Option<&str>) -> Option<Result<(), String>> {
+    let Some(text) = text else {
+        return match Command::new("wl-copy").arg("--clear").stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped()).output() {
+            Ok(out) if out.status.success() => Some(Ok(())),
+            Ok(out) => Some(Err(format!("could not clear the Wayland clipboard: {}", String::from_utf8_lossy(&out.stderr).trim()))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(e) => Some(Err(format!("could not run wl-copy: {e}"))),
+        };
+    };
+    own_clipboard("wl-copy", &[], text.as_bytes(), Some(text))
+}
+
+/// The clipboard through xclip or xsel on X11, or wl-clipboard on Wayland.
 pub fn clipboard() -> Result<Option<String>, String> {
+    if has_wayland() {
+        if let Some(res) = wayland_clipboard() {
+            return res;
+        }
+        if !has_display() {
+            return Err("the clipboard on Wayland needs wl-clipboard: install it (sudo apt install wl-clipboard)".into());
+        }
+    }
     for (program, args) in [("xclip", &["-selection", "clipboard", "-o"][..]), ("xsel", &["--clipboard", "--output"][..])] {
         if let Ok(out) = Command::new(program).args(args).stderr(Stdio::null()).output() {
             return Ok(out.status.success().then(|| String::from_utf8_lossy(&out.stdout).into_owned()));
@@ -841,6 +924,14 @@ pub fn clipboard() -> Result<Option<String>, String> {
 }
 
 pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
+    if has_wayland() {
+        if let Some(res) = wayland_set_clipboard(text) {
+            return res;
+        }
+        if !has_display() {
+            return Err("the clipboard on Wayland needs wl-clipboard: install it (sudo apt install wl-clipboard)".into());
+        }
+    }
     let text = text.unwrap_or("");
     for (program, args) in [("xclip", &["-selection", "clipboard", "-i"][..]), ("xsel", &["--clipboard", "--input"][..])] {
         if let Some(done) = own_clipboard(program, args, text.as_bytes(), Some(text)) {
@@ -850,7 +941,7 @@ pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
     Err("the clipboard needs xclip or xsel: install one (sudo apt install xclip)".into())
 }
 
-/// Hand the clipboard to xclip or xsel holding these bytes. None if the program is missing.
+/// Hand the clipboard to xclip, xsel or wl-copy holding these bytes. None if the program is missing.
 fn own_clipboard(program: &str, args: &[&str], bytes: &[u8], text: Option<&str>) -> Option<Result<(), String>> {
     let mut child = Command::new(program).args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::null()).spawn().ok()?;
     if let Some(mut input) = child.stdin.take()
@@ -862,8 +953,13 @@ fn own_clipboard(program: &str, args: &[&str], bytes: &[u8], text: Option<&str>)
     // so the next read sees the new contents.
     let started = Instant::now();
     while started.elapsed() < Duration::from_secs(1) {
-        if child.try_wait().ok().flatten().is_some() && text.is_none_or(|text| clipboard().ok().flatten().unwrap_or_default() == text) {
-            return Some(Ok(()));
+        if let Ok(Some(status)) = child.try_wait() {
+            if !status.success() {
+                return Some(Err(format!("{program} exited with {status}")));
+            }
+            if text.is_none_or(|text| clipboard().ok().flatten().unwrap_or_default() == text) {
+                return Some(Ok(()));
+            }
         }
         thread::sleep(Duration::from_millis(20));
     }

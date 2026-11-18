@@ -1,5 +1,6 @@
-// The Linux side, for X11 desktops and Xvfb: AT-SPI for reading and pressing controls, XTest for
-// points and keys, the window manager's hints for the window list, and drawn cursors.
+// The Linux side, for X11/Xvfb and Wayland (AT-SPI controls): AT-SPI for reading and pressing
+// controls, XTest for X11 points and keys, the window manager's hints for the X11 window list, and
+// drawn cursors on X11.
 pub mod atspi;
 pub mod notifications;
 pub mod overlay;
