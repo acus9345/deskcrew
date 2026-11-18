@@ -124,6 +124,10 @@ fn words(tool: &str, a: &Value) -> Result<Vec<String>, String> {
         "deskcrew" => {
             let list = a.get("args").and_then(Value::as_array).ok_or("`args` is required: the command's words")?;
             out = list.iter().map(|w| w.as_str().map(str::to_string).unwrap_or_else(|| w.to_string())).collect();
+            let flag_limit = out.iter().position(|w| w == "--").unwrap_or(out.len());
+            if out[..flag_limit].iter().any(|w| w == "--agent") {
+                return Err("the agent name is set by the MCP client, not --agent".into());
+            }
             match out.first().map(String::as_str) {
                 None => return Err("`args` is empty: [\"help\"] lists the commands".into()),
                 Some("mcp" | "service") => return Err("that command does not run as a tool".into()),
@@ -142,7 +146,7 @@ fn run(agent: &str, args: &[String]) -> (bool, String) {
         Err(e) => return (false, e.to_string()),
     };
     let mut command = Command::new(exe);
-    command.args(args).arg("--agent").arg(agent).stdin(Stdio::null());
+    command.env("DESKCREW_AGENT", agent).args(args).stdin(Stdio::null());
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -276,6 +280,8 @@ mod tests {
         assert_eq!(words("see", &json!({ "window": "Calc", "full": true })).unwrap(), ["see", "Calc", "-f"]);
         assert_eq!(words("shot", &json!({ "screen": true })).unwrap(), ["shot", "--screen"]);
         assert!(words("deskcrew", &json!({ "args": ["service"] })).is_err());
+        assert!(words("deskcrew", &json!({ "args": ["do", "click 1,1 --mouse", "--agent", "Claude Code"] })).is_err());
+        assert_eq!(words("deskcrew", &json!({ "args": ["type", "e3", "--", "--agent"] })).unwrap(), ["type", "e3", "--", "--agent"]);
         assert!(words("do", &json!({ "steps": "click OK" })).is_err());
     }
 

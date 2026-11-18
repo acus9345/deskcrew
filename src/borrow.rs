@@ -44,8 +44,8 @@ const OFF: &str = "the person has not let agents borrow the cursor. They can all
 
 /// Shells skipped when finding the program behind a shell command, unless no non-root parent sits above them.
 const SHELLS: [&str; 15] = ["cmd", "powershell", "pwsh", "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh", "nu", "elvish", "wsl", "wslhost"];
-/// Desktop, terminal, and system host processes we never attribute an agent's grant to when a shell sits below them.
-const ROOTS: [&str; 22] = [
+/// Desktop, terminal, and system host processes we never attribute an agent's grant to.
+const ROOTS: [&str; 23] = [
     "explorer",
     "windowsterminal",
     "wt",
@@ -68,9 +68,11 @@ const ROOTS: [&str; 22] = [
     "runtimebroker",
     "dllhost",
     "applicationframehost",
+    "wslservice",
 ];
 
 static ANSWER: AtomicI32 = AtomicI32::new(-1);
+static BUTTON_COUNT: AtomicI32 = AtomicI32::new(0);
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
@@ -79,13 +81,18 @@ fn wide(text: &str) -> Vec<u16> {
 unsafe extern "system" fn answer(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
     unsafe {
         match message {
-            // Only the person's own click answers: a message any program can post does not.
-            WM_COMMAND if clicked_by_person(hwnd) => {
-                ANSWER.store((w & 0xFFFF) as i32 - FIRST_BUTTON, Ordering::SeqCst);
-                DestroyWindow(hwnd);
+            // Only the person's own click on an actual prompt button answers: a message any program can post does not.
+            WM_COMMAND => {
+                let code = (w >> 16) & 0xFFFF;
+                let id = (w & 0xFFFF) as i32;
+                let idx = id - FIRST_BUTTON;
+                let count = BUTTON_COUNT.load(Ordering::SeqCst);
+                if code == 0 && idx >= 0 && idx < count && clicked_by_person(hwnd, id) {
+                    ANSWER.store(idx, Ordering::SeqCst);
+                    DestroyWindow(hwnd);
+                }
                 0
             }
-            WM_COMMAND => 0,
             WM_TIMER | WM_CLOSE => {
                 DestroyWindow(hwnd);
                 0
@@ -99,21 +106,25 @@ unsafe extern "system" fn answer(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM)
     }
 }
 
-/// Whether the real pointer is on the prompt and the person used the mouse or keyboard just now:
-/// a button press another program posts moves neither.
-fn clicked_by_person(hwnd: HWND) -> bool {
+/// Whether the real pointer is on the clicked button and the person used the mouse or keyboard
+/// just now: a button press another program posts moves neither.
+fn clicked_by_person(hwnd: HWND, button_id: i32) -> bool {
     use windows_sys::Win32::{
         Foundation::{POINT, RECT},
         System::SystemInformation::GetTickCount,
         UI::{
             Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
-            WindowsAndMessaging::{GetCursorPos, GetWindowRect},
+            WindowsAndMessaging::{GetCursorPos, GetDlgItem, GetWindowRect},
         },
     };
     unsafe {
+        let button = GetDlgItem(hwnd, button_id);
+        if button.is_null() {
+            return false;
+        }
         let (mut at, mut rect): (POINT, RECT) = (std::mem::zeroed(), std::mem::zeroed());
         let mut last = LASTINPUTINFO { cbSize: size_of::<LASTINPUTINFO>() as u32, dwTime: 0 };
-        if GetCursorPos(&mut at) == 0 || GetWindowRect(hwnd, &mut rect) == 0 || GetLastInputInfo(&mut last) == 0 {
+        if GetCursorPos(&mut at) == 0 || GetWindowRect(button, &mut rect) == 0 || GetLastInputInfo(&mut last) == 0 {
             return false;
         }
         let inside = at.x >= rect.left && at.x < rect.right && at.y >= rect.top && at.y < rect.bottom;
@@ -126,7 +137,9 @@ fn clicked_by_person(hwnd: HWND) -> bool {
 fn prompt(text: &str, buttons: &[&str]) -> Option<usize> {
     let (text, buttons) = (text.to_string(), buttons.iter().map(|b| b.to_string()).collect::<Vec<_>>());
     let shown = thread::spawn(move || unsafe {
+        const SS_NOPREFIX: u32 = 0x0080;
         ANSWER.store(-1, Ordering::SeqCst);
+        BUTTON_COUNT.store(buttons.len() as i32, Ordering::SeqCst);
         let module = GetModuleHandleW(null());
         let class = wide("deskcrew-ask");
         let mut kind: WNDCLASSW = std::mem::zeroed();
@@ -137,7 +150,7 @@ fn prompt(text: &str, buttons: &[&str]) -> Option<usize> {
         RegisterClassW(&kind);
         let scale = GetDpiForSystem() as i32;
         let px = |value: i32| value * scale / 96;
-        let (width, height) = (px(520), px(184));
+        let (width, height) = (px(580), px(200));
         let (left, top) = ((GetSystemMetrics(SM_CXSCREEN) - width) / 2, (GetSystemMetrics(SM_CYSCREEN) - height) / 2);
         let title = wide("deskcrew");
         let window = CreateWindowExW(
@@ -165,10 +178,10 @@ fn prompt(text: &str, buttons: &[&str]) -> Option<usize> {
             let made = CreateWindowExW(0, class.as_ptr(), label.as_ptr(), WS_CHILD | WS_VISIBLE | style, x, y, w, h, window, id as usize as _, module, null());
             SendMessageW(made, WM_SETFONT, font as usize, 1);
         };
-        child("STATIC", &text, 0, px(16), px(14), width - px(32), px(72), 0);
+        child("STATIC", &text, SS_NOPREFIX, px(16), px(14), width - px(32), px(84), 0);
         let wide_each = (width - px(32) - px(8) * (buttons.len() as i32 - 1)) / buttons.len() as i32;
         for (at, label) in buttons.iter().enumerate() {
-            child("BUTTON", label, 0, px(16) + at as i32 * (wide_each + px(8)), px(96), wide_each, px(34), FIRST_BUTTON + at as i32);
+            child("BUTTON", label, 0, px(16) + at as i32 * (wide_each + px(8)), px(110), wide_each, px(34), FIRST_BUTTON + at as i32);
         }
         ShowWindow(window, SW_SHOWNOACTIVATE);
         SetTimer(window, 1, ANSWER_MS, None);
@@ -313,6 +326,10 @@ fn process_info(pid: u32) -> Option<ProcNode> {
 }
 
 fn resolve_caller(client_pid: Option<u32>) -> Result<Caller, String> {
+    resolve_caller_with(client_pid, std::process::id())
+}
+
+fn resolve_caller_with(client_pid: Option<u32>, service_pid: u32) -> Result<Caller, String> {
     let client_pid = client_pid.ok_or_else(|| "could not identify the calling process".to_string())?;
     let first = process_info(client_pid).ok_or_else(|| "could not identify the calling process".to_string())?;
     let parents = crate::client::processes();
@@ -343,40 +360,77 @@ fn resolve_caller(client_pid: Option<u32>) -> Result<Caller, String> {
         .and_then(|path| normalize_exe(&path.to_string_lossy(), true))
         .map(|(_, key)| key)
         .unwrap_or_default();
-    pick_caller_from_chain(&chain, &self_exe_key)
+    pick_caller_from_chain(&chain, &self_exe_key, service_pid)
 }
 
-fn pick_caller_from_chain(chain: &[ProcNode], self_exe_key: &str) -> Result<Caller, String> {
-    if chain.is_empty() {
+fn is_same_app_helper(node: &ProcNode, ancestor: &ProcNode) -> bool {
+    let Some((dir, _)) = ancestor.exe_key.rsplit_once('\\') else {
+        return false;
+    };
+    dir.matches('\\').count() >= 2 && node.exe_key.starts_with(dir) && node.exe_key.as_bytes().get(dir.len()) == Some(&b'\\')
+}
+
+fn pick_caller_from_chain(chain: &[ProcNode], self_exe_key: &str, service_pid: u32) -> Result<Caller, String> {
+    if self_exe_key.is_empty() || chain.is_empty() {
         return Err("could not identify the calling program".into());
     }
-    let start_idx = if !self_exe_key.is_empty() && is_deskcrew_binary(&chain[0].exe_key, self_exe_key) {
-        chain
+    if chain[0].pid == service_pid {
+        return Err("could not identify the calling program".into());
+    }
+    let start_idx = if is_deskcrew_binary(&chain[0].exe_key, self_exe_key) {
+        let idx = chain
             .iter()
             .position(|node| !is_deskcrew_binary(&node.exe_key, self_exe_key))
-            .ok_or_else(|| "could not identify the calling program".to_string())?
+            .ok_or_else(|| "could not identify the calling program".to_string())?;
+        if chain[..idx].iter().any(|node| node.pid == service_pid) {
+            return Err("could not identify the calling program".into());
+        }
+        idx
     } else {
         0
     };
     let end_idx = chain.len().min(start_idx + crate::client::MOST_ANCESTORS);
     let window = &chain[start_idx..end_idx];
 
-    if let Some((node, known)) = window.iter().find_map(|node| crate::client::agent_program(exe_stem(&node.exe_key)).map(|name| (node, name))) {
-        return Ok(Caller::from_node(node, Some(known)));
-    }
-
-    let mut chosen = &window[0];
-    for node in window {
+    let mut last_shell: Option<&ProcNode> = None;
+    for (idx, node) in window.iter().enumerate() {
         let stem = exe_stem(&node.exe_key);
+        if is_deskcrew_binary(&node.exe_key, self_exe_key) {
+            if node.pid == service_pid {
+                return Err("could not identify the calling program".into());
+            }
+            continue;
+        }
         if ROOTS.contains(&stem) {
             break;
         }
-        chosen = node;
-        if !SHELLS.contains(&stem) {
-            break;
+        if let Some(known) = crate::client::agent_program(stem) {
+            return Ok(Caller::from_node(node, Some(known)));
         }
+        if SHELLS.contains(&stem) {
+            last_shell = Some(node);
+            continue;
+        }
+        // A bundled helper inside a known agent's own install folder (such as Antigravity's language
+        // server) attributes to that agent; any other binary (including tools inside an IDE's
+        // terminal) stops right here so it cannot inherit the IDE's grant.
+        for anc in &window[idx + 1..] {
+            let anc_stem = exe_stem(&anc.exe_key);
+            if anc.pid == service_pid || is_deskcrew_binary(&anc.exe_key, self_exe_key) || ROOTS.contains(&anc_stem) {
+                break;
+            }
+            if let Some(known) = crate::client::agent_program(anc_stem)
+                && is_same_app_helper(node, anc)
+            {
+                return Ok(Caller::from_node(anc, Some(known)));
+            }
+        }
+        return Ok(Caller::from_node(node, None));
     }
-    Ok(Caller::from_node(chosen, None))
+
+    last_shell
+        .map(|shell| Caller::from_node(shell, None))
+        .ok_or_else(|| "could not identify the calling program".into())
 }
 
 fn settings_file() -> PathBuf {
@@ -398,9 +452,14 @@ struct Settings {
     legacy: Vec<String>,
 }
 
+fn is_hidden_format(c: char) -> bool {
+    matches!(c, '\u{061C}' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}' | '\u{FEFF}')
+}
+
 fn clean_display(text: &str, max_chars: usize) -> String {
     let flat: String = text
         .chars()
+        .filter(|&c| !is_hidden_format(c))
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect::<String>()
         .split_whitespace()
@@ -507,15 +566,42 @@ impl SessionState {
     }
 }
 
+fn short_exe_display(exe: &str) -> String {
+    let clean = clean_display(exe, 260);
+    if clean.chars().count() <= 42 {
+        return clean;
+    }
+    let prefix = if clean.as_bytes().get(1) == Some(&b':') && clean.as_bytes().get(2) == Some(&b'\\') {
+        format!("{}\\...\\", &clean[..2])
+    } else if clean.starts_with(r"\\") {
+        r"\\...\".to_string()
+    } else {
+        r"...\".to_string()
+    };
+    let parts: Vec<&str> = clean.split('\\').filter(|p| !p.is_empty()).collect();
+    let mut tail = String::new();
+    for part in parts.iter().rev() {
+        let candidate = if tail.is_empty() { (*part).to_string() } else { format!("{part}\\{tail}") };
+        if !tail.is_empty() && prefix.chars().count() + candidate.chars().count() > 42 {
+            break;
+        }
+        tail = candidate;
+    }
+    let out = format!("{prefix}{tail}");
+    if out.chars().count() > 42 {
+        let last = parts.last().copied().unwrap_or(&clean);
+        let room = 42usize.saturating_sub(prefix.chars().count());
+        format!("{prefix}{}", last.chars().take(room).collect::<String>())
+    } else {
+        out
+    }
+}
+
 fn prompt_question(who: &str, caller: &Caller) -> String {
     let name = clean_display(who, 32);
     let name = if name.is_empty() { "your agent".to_string() } else { name };
-    let shown = if caller.known_name.is_some_and(|known| known == name) {
-        name
-    } else {
-        let program = clean_display(&caller.program, 32);
-        if program.is_empty() { name } else { format!("{name} ({program})") }
-    };
+    let path = short_exe_display(&caller.exe);
+    let shown = if path.is_empty() { name } else { format!("{name} ({path})") };
     format!("{shown} wants to borrow your cursor.\nIt will move your real mouse, then put it back.")
 }
 
@@ -540,7 +626,7 @@ fn legacy_matches_caller(legacy_name: &str, who: &str, caller: &Caller) -> bool 
         return false;
     }
     match caller.known_name {
-        None => true,
+        None => !is_known_agent_display_name(who),
         // Never let one recognised agent clear another recognised agent's legacy entry by spoofing --agent.
         Some(known) => legacy_name == known || !is_known_agent_display_name(who),
     }
@@ -549,7 +635,22 @@ fn legacy_matches_caller(legacy_name: &str, who: &str, caller: &Caller) -> bool 
 fn is_known_agent_display_name(name: &str) -> bool {
     matches!(
         name,
-        "Claude Code" | "Cursor" | "Codex" | "Gemini" | "Copilot" | "Windsurf" | "OpenCode" | "Aider" | "Goose" | "Amp" | "Kiro" | "Antigravity" | "Grok" | "Zed"
+        "Claude Code"
+            | "Claude"
+            | "Cursor"
+            | "Codex"
+            | "Gemini"
+            | "Copilot"
+            | "Windsurf"
+            | "OpenCode"
+            | "Aider"
+            | "Goose"
+            | "Amp"
+            | "Kiro"
+            | "Antigravity"
+            | "Grok"
+            | "Zed"
+            | "Cline"
     )
 }
 
@@ -599,13 +700,14 @@ impl Permission {
 
     fn allow_with(&self, who: &str, caller: Result<&Caller, String>, ask: impl FnOnce(&str, &[&str]) -> Option<usize>) -> Result<(), String> {
         let caller = caller?;
+        let can_always = !SHELLS.contains(&exe_stem(&caller.exe_key));
         let _one_prompt_at_a_time = self.asking.lock().unwrap();
         let off_gen = self.off_generation.load(Ordering::SeqCst);
         let may_ask = {
             let _file = self.file_lock.lock().unwrap();
             let settings = self.load();
             let allowed_session = self.session.lock().unwrap().allows(caller);
-            let allowed_always = settings.every || settings.programs.iter().any(|p| p.exe_key == caller.exe_key);
+            let allowed_always = settings.every || (can_always && settings.programs.iter().any(|p| p.exe_key == caller.exe_key));
             if allowed_session || allowed_always {
                 return Ok(());
             }
@@ -615,7 +717,12 @@ impl Permission {
             return Err(OFF.into());
         }
         let question = prompt_question(who, caller);
-        match ask(&question, &["Just this once", "This session", "Always", "No"]) {
+        let buttons: &[&str] = if can_always {
+            &["Just this once", "This session", "Always", "No"]
+        } else {
+            &["Just this once", "This session", "No"]
+        };
+        match ask(&question, buttons) {
             Some(0) => {
                 if self.off_generation.load(Ordering::SeqCst) != off_gen {
                     return Err("cursor permission was turned off".into());
@@ -635,7 +742,7 @@ impl Permission {
                 });
                 Ok(())
             }
-            Some(2) => {
+            Some(2) if can_always => {
                 let _file = self.file_lock.lock().unwrap();
                 if self.off_generation.load(Ordering::SeqCst) != off_gen {
                     return Err("cursor permission was turned off".into());
@@ -805,7 +912,7 @@ mod tests {
         // Codex claiming --agent "Claude Code" must still be prompted (and refused on No).
         let err = perm
             .allow_with("Claude Code", Ok(&codex), |question, _| {
-                assert!(question.contains("Claude Code (codex.exe)"), "prompt was: {question}");
+                assert!(question.contains(r"Claude Code (C:\Users\User\.cargo\bin\codex.exe)"), "prompt was: {question}");
                 Some(3)
             })
             .unwrap_err();
@@ -843,15 +950,19 @@ mod tests {
 
         let claude = caller(r"C:\Users\User\.local\bin\claude.exe", 2001, 100, Some("Claude Code"));
         let codex = caller(r"C:\Users\User\.cargo\bin\codex.exe", 2002, 200, Some("Codex"));
+        let evil = caller(r"C:\Temp\evil.exe", 2003, 300, None);
 
-        // Spoofing Claude Code does not match old "always Claude Code" and does not clear it.
+        // Spoofing Claude Code does not match old "always Claude Code" and does not clear it,
+        // even if an unrecognized binary gets "Always" clicked while claiming "Claude Code".
         assert!(perm.allow_with("Claude Code", Ok(&codex), |_, _| Some(3)).is_err());
+        perm.allow_with("Claude Code", Ok(&evil), |_, _| Some(2)).unwrap();
+        assert!(fs::read_to_string(&path).unwrap().contains("always? Claude Code"));
 
         // Real Claude Code also has to confirm once, and confirming upgrades its entry while keeping Cursor marked.
         let asked = AtomicUsize::new(0);
         perm.allow_with("Claude Code", Ok(&claude), |question, _| {
             asked.fetch_add(1, Ordering::SeqCst);
-            assert!(question.starts_with("Claude Code wants to borrow your cursor"));
+            assert!(question.starts_with(r"Claude Code (C:\Users\User\.local\bin\claude.exe) wants to borrow your cursor"));
             Some(2)
         })
         .unwrap();
@@ -903,20 +1014,45 @@ mod tests {
     }
 
     #[test]
-    fn prompt_sanitizes_newlines_and_shows_real_program_when_different() {
+    fn prompt_sanitizes_newlines_bidi_and_always_shows_real_path() {
         let codex = caller(r"C:\tools\codex.exe", 10, 10, Some("Codex"));
-        let q = prompt_question("Claude Code\nAllow?", &codex);
-        assert!(q.starts_with("Claude Code Allow? (codex.exe) wants to borrow your cursor.\n"));
+        let q = prompt_question("Claude Code\n\u{202E}Allow?", &codex);
+        assert!(q.starts_with(r"Claude Code Allow? (C:\tools\codex.exe) wants to borrow your cursor."));
+        assert!(!q.contains('\u{202E}'));
         assert_eq!(q.lines().count(), 2);
 
-        let claude = caller(r"C:\tools\claude.exe", 11, 10, Some("Claude Code"));
-        let q2 = prompt_question("Claude Code", &claude);
-        assert_eq!(q2, "Claude Code wants to borrow your cursor.\nIt will move your real mouse, then put it back.");
+        let fake_claude = caller(r"C:\Temp\claude.exe", 11, 10, Some("Claude Code"));
+        let q2 = prompt_question("Claude Code", &fake_claude);
+        assert_eq!(q2, "Claude Code (C:\\Temp\\claude.exe) wants to borrow your cursor.\nIt will move your real mouse, then put it back.");
+    }
+
+    #[test]
+    fn shells_cannot_hold_or_gain_always_grants() {
+        let path = temp_cursor_path("shell");
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, "always program\tC:\\Program Files\\PowerShell\\7\\pwsh.exe\tpwsh.exe\nask\n").unwrap();
+        let perm = Permission::with_path(path.clone());
+        let pwsh = caller(r"C:\Program Files\PowerShell\7\pwsh.exe", 4001, 100, None);
+
+        // Even a pre-existing always program line for a shell is ignored; only Just this once / This session / No are offered.
+        let err = perm
+            .allow_with("your agent", Ok(&pwsh), |_, buttons| {
+                assert_eq!(buttons, &["Just this once", "This session", "No"]);
+                Some(2)
+            })
+            .unwrap_err();
+        assert!(err.contains("said no"));
+
+        // "This session" still works for that specific shell process.
+        perm.allow_with("your agent", Ok(&pwsh), |_, _| Some(1)).unwrap();
+        perm.allow_with("your agent", Ok(&pwsh), |_, _| panic!("session should allow")).unwrap();
+        let _ = fs::remove_dir_all(path.parent().unwrap());
     }
 
     #[test]
     fn ancestor_selection_picks_nearest_agent_or_non_shell_caller() {
         let self_exe = r"c:\users\user\.cargo\bin\deskcrew.exe";
+        let service_pid = 9999;
 
         // Normal agent in shell: claude.exe -> bash.exe -> deskcrew.exe
         let chain = vec![
@@ -924,20 +1060,31 @@ mod tests {
             node(2, r"C:\Program Files\Git\usr\bin\bash.exe", 20),
             node(1, r"C:\Users\User\.local\bin\claude.exe", 10),
         ];
-        let picked = pick_caller_from_chain(&chain, self_exe).unwrap();
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
         assert_eq!(picked.pid, 1);
         assert_eq!(picked.known_name, Some("Claude Code"));
 
-        // MCP: Antigravity -> language_server -> deskcrew mcp -> deskcrew
+        // MCP: Antigravity -> language_server (same app folder) -> deskcrew mcp -> deskcrew
         let chain = vec![
             node(4, r"C:\Users\User\.cargo\bin\deskcrew.exe", 40),
             node(3, r"C:\Users\User\.cargo\bin\deskcrew.exe", 30),
-            node(2, r"C:\Users\User\AppData\Local\Programs\antigravity\language_server.exe", 20),
+            node(2, r"C:\Users\User\AppData\Local\Programs\antigravity\resources\bin\language_server.exe", 20),
             node(1, r"C:\Users\User\AppData\Local\Programs\antigravity\Antigravity.exe", 10),
         ];
-        let picked = pick_caller_from_chain(&chain, self_exe).unwrap();
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
         assert_eq!(picked.pid, 1);
         assert_eq!(picked.known_name, Some("Antigravity"));
+
+        // Arbitrary binary in an IDE terminal cannot inherit the IDE's grant.
+        let chain = vec![
+            node(4, r"C:\Users\User\.cargo\bin\deskcrew.exe", 40),
+            node(3, r"C:\Temp\evil.exe", 30),
+            node(2, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", 20),
+            node(1, r"C:\Users\User\AppData\Local\Programs\cursor\Cursor.exe", 10),
+        ];
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
+        assert_eq!(picked.pid, 3);
+        assert_eq!(picked.exe_key, r"c:\temp\evil.exe");
 
         // Old MCP copy left during `deskcrew setup` + non-listed host (VS Code):
         let chain = vec![
@@ -945,7 +1092,7 @@ mod tests {
             node(2, r"C:\Users\User\.cargo\bin\deskcrew-old-1.exe", 20),
             node(1, r"C:\Users\User\AppData\Local\Programs\Microsoft VS Code\Code.exe", 10),
         ];
-        let picked = pick_caller_from_chain(&chain, self_exe).unwrap();
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
         assert_eq!(picked.pid, 1);
         assert_eq!(picked.known_name, None);
 
@@ -956,19 +1103,39 @@ mod tests {
             node(2, r"C:\tools\codex.exe", 20),
             node(1, r"C:\Users\User\AppData\Local\Programs\cursor\Cursor.exe", 10),
         ];
-        let picked = pick_caller_from_chain(&chain, self_exe).unwrap();
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
         assert_eq!(picked.pid, 2);
         assert_eq!(picked.known_name, Some("Codex"));
 
+        // `deskcrew run` skips the outer deskcrew client and resolves the actual caller.
+        let chain = vec![
+            node(4, r"C:\Users\User\.cargo\bin\deskcrew.exe", 40),
+            node(3, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", 30),
+            node(2, r"C:\Users\User\.cargo\bin\deskcrew.exe", 20),
+            node(1, r"C:\Temp\evil.exe", 10),
+        ];
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
+        assert_eq!(picked.pid, 1);
+        assert_eq!(picked.exe_key, r"c:\temp\evil.exe");
+
+        // `deskcrew launch` child passing through the service process itself fails closed.
+        let chain = vec![
+            node(4, r"C:\Users\User\.cargo\bin\deskcrew.exe", 40),
+            node(3, r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", 30),
+            node(service_pid, r"C:\Users\User\.cargo\bin\deskcrew.exe", 20),
+            node(1, r"C:\Users\User\.local\bin\claude.exe", 10),
+        ];
+        assert!(pick_caller_from_chain(&chain, self_exe, service_pid).is_err());
+
         // Direct pipe connection by another program is not skipped.
         let chain = vec![node(2, r"C:\Temp\evil.exe", 20), node(1, r"C:\Windows\explorer.exe", 10)];
-        let picked = pick_caller_from_chain(&chain, self_exe).unwrap();
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
         assert_eq!(picked.pid, 2);
         assert_eq!(picked.exe_key, r"c:\temp\evil.exe");
 
         // Imposter copy of deskcrew.exe elsewhere is not skipped to explorer.exe.
         let chain = vec![node(2, r"C:\Temp\deskcrew.exe", 20), node(1, r"C:\Windows\explorer.exe", 10)];
-        let picked = pick_caller_from_chain(&chain, self_exe).unwrap();
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
         assert_eq!(picked.pid, 2);
         assert_eq!(picked.exe_key, r"c:\temp\deskcrew.exe");
 
@@ -979,13 +1146,16 @@ mod tests {
             node(2, r"C:\Program Files\PowerShell\7\pwsh.exe", 20),
             node(1, r"C:\Program Files\WindowsApps\WT\WindowsTerminal.exe", 10),
         ];
-        let picked = pick_caller_from_chain(&chain, self_exe).unwrap();
+        let picked = pick_caller_from_chain(&chain, self_exe, service_pid).unwrap();
         assert_eq!(picked.pid, 2);
         assert_eq!(picked.program, "pwsh.exe");
 
-        // Orphaned deskcrew process with no parent fails closed.
+        // Direct spawn from explorer.exe (or orphaned deskcrew) fails closed.
+        let chain = vec![node(2, r"C:\Users\User\.cargo\bin\deskcrew.exe", 20), node(1, r"C:\Windows\explorer.exe", 10)];
+        assert!(pick_caller_from_chain(&chain, self_exe, service_pid).is_err());
         let chain = vec![node(1, r"C:\Users\User\.cargo\bin\deskcrew.exe", 10)];
-        assert!(pick_caller_from_chain(&chain, self_exe).is_err());
+        assert!(pick_caller_from_chain(&chain, self_exe, service_pid).is_err());
+        assert!(pick_caller_from_chain(&chain, "", service_pid).is_err());
     }
 
     #[test]
@@ -1032,7 +1202,8 @@ mod tests {
         assert!(got_pid);
         assert_eq!(client_pid, child.id());
 
-        let caller = resolve_caller(Some(client_pid)).unwrap();
+        // Test harness itself spawned powershell.exe, so disable service_pid exclusion here.
+        let caller = resolve_caller_with(Some(client_pid), 0).unwrap();
         assert!(!caller.exe_key.is_empty());
         assert_ne!(caller.pid, 0);
 

@@ -28,12 +28,14 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Who is asking, so each agent keeps its own cursor. A flag beats the environment.
 pub fn agent(args: &mut Vec<String>) -> String {
-    if let Some(at) = args.iter().position(|a| a == "--agent")
-        && at + 1 < args.len() {
-            let name = args.remove(at + 1);
-            args.remove(at);
-            return name;
-        }
+    let limit = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    if let Some(at) = args[..limit].iter().position(|a| a == "--agent")
+        && at + 1 < limit
+    {
+        let name = args.remove(at + 1);
+        args.remove(at);
+        return name;
+    }
     let has = |name: &str| env::var_os(name).is_some();
     if let Ok(name) = env::var("DESKCREW_AGENT") {
         name

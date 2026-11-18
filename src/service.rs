@@ -263,7 +263,7 @@ struct AgentState {
 // Pixels are only ever touched while the agent map is locked.
 unsafe impl Send for AgentState {}
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Flags {
     real: bool,
     mouse: bool,
@@ -433,10 +433,16 @@ const CARET_WATCH: Duration = Duration::from_millis(15);
 const CARET_SETTLE: Duration = Duration::from_millis(30);
 const MARKED: [&str; 11] = ["button", "edit", "menuitem", "checkbox", "radio", "combobox", "tab", "item", "link", "slider", "spinner"];
 
+#[derive(Default)]
+struct Step {
+    flags: Flags,
+    words: Vec<String>,
+}
+
 /// The step that checks `--expect`: it always waits for the text, even text such as "42" that
 /// `wait` would read as milliseconds.
-fn expected(flags: &Flags) -> Option<Vec<String>> {
-    flags.expect.as_ref().map(|text| vec!["expect".to_string(), text.clone()])
+fn expected(flags: &Flags) -> Option<Step> {
+    flags.expect.as_ref().map(|text| Step { flags: Flags::default(), words: vec!["expect".to_string(), text.clone()] })
 }
 
 enum Target {
@@ -1157,14 +1163,13 @@ impl Service {
     }
 
     /// What a do script would touch, without touching it.
-    fn dry_run(&self, tracked: &Tracked, view: &View, steps: &[Vec<String>]) -> String {
+    fn dry_run(&self, tracked: &Tracked, view: &View, steps: &[Step]) -> String {
         let name = |word: &str| is_ref(word).and_then(|id| view.nodes.get(&id)).map(|node| lines::line(&node.parts));
         steps
             .iter()
             .enumerate()
             .map(|(at, step)| {
-                let (_, words) = parse(step);
-                let named: Vec<String> = words.iter().map(|word| name(word).map_or(word.clone(), |line| format!("{word} ({line})"))).collect();
+                let named: Vec<String> = step.words.iter().map(|word| name(word).map_or(word.clone(), |line| format!("{word} ({line})"))).collect();
                 format!("{}. {}", at + 1, named.join(" "))
             })
             .chain(Some(format!("nothing done in w{}", tracked.id)))
@@ -1294,7 +1299,8 @@ impl Service {
         if flags.real {
             let (x, y) = act::centre(rect);
             let all = real::chord("ctrl+a")?;
-            return self.with_front(tracked, view, &[(x, y)], || {
+            let loan = if flags.mouse { Loan::Mouse } else { Loan::Keys };
+            return self.front(tracked, view, &[(x, y)], loan, || {
                 press_at(tracked.hwnd, x, y, flags)?;
                 real::check_front(tracked.hwnd, &view.surfaces)?;
                 real::press_chord(&all);
@@ -1375,7 +1381,8 @@ impl Service {
             if real {
                 let points: Vec<(i32, i32)> = place.into_iter().collect();
                 let to_end = real::chord("ctrl+end")?;
-                return self.with_front(tracked, view, &points, || {
+                let loan = if flags.mouse && place.is_some() { Loan::Mouse } else { Loan::Keys };
+                return self.front(tracked, view, &points, loan, || {
                     if let Some((x, y)) = place {
                         press_at(tracked.hwnd, x, y, flags)?;
                         // A click lands mid-text; typing adds to the end, as it does without --real.
@@ -1808,30 +1815,27 @@ impl Service {
 
     /// One step of a do, with the flags it may carry itself: its own --expect is checked after it,
     /// and flags that would need another window or another go-ahead are refused, not dropped.
-    fn step(&self, who: &str, caller: &CallerLookup, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        let (own, _) = parse(words);
-        if own.window.is_some() {
+    fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, step: &Step) -> Reply {
+        if step.flags.window.is_some() {
             return Err("a step cannot pick another window: a do runs in one, so run another command for that window".into());
         }
-        if matches!(own.risk.as_deref(), Some("medium" | "high")) && !flags.force && !own.force {
+        if matches!(step.flags.risk.as_deref(), Some("medium" | "high")) && !flags.force && !step.flags.force {
             return Err("declared risky: ask the person, then add --force".into());
         }
-        let route = self.run_step(who, caller, flags, tracked, view, words)?;
-        if let Some(text) = &own.expect {
-            let waiting = Flags { ms: own.ms.or(flags.ms), ..Flags::default() };
+        let route = self.run_step(who, flags, tracked, view, step)?;
+        if let Some(text) = &step.flags.expect {
+            let waiting = Flags { ms: step.flags.ms.or(flags.ms), ..Flags::default() };
             self.wait_text(&waiting, tracked, view, text)?;
         }
         Ok(route)
     }
 
-    fn run_step(&self, who: &str, caller: &CallerLookup, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+    fn run_step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, step: &Step) -> Reply {
         self.overlay.over(who, tracked.hwnd);
-        let (own, words) = parse(words);
-        if let Some(error) = own.button_error {
-            return Err(error);
-        }
-        if own.mouse && !flags.mouse {
-            self.borrow.allow(who, caller.resolve())?;
+        let own = &step.flags;
+        let words = &step.words;
+        if let Some(error) = &own.button_error {
+            return Err(error.clone());
         }
         let flags = Flags {
             real: flags.real || own.real,
@@ -1845,7 +1849,7 @@ impl Service {
             back: flags.back || own.back,
             forward: flags.forward || own.forward,
             paste: flags.paste || own.paste,
-            with: own.with.or(flags.with.clone()),
+            with: own.with.clone().or_else(|| flags.with.clone()),
             button: own.button.or(flags.button),
             hold: own.hold.or(flags.hold),
             gone: flags.gone || own.gone,
@@ -1894,13 +1898,13 @@ impl Service {
     }
 
     /// Run steps against one window, then report the result as a single set of changes.
-    fn act(&self, who: &str, caller: &CallerLookup, flags: &Flags, steps: &[Vec<String>]) -> Reply {
+    fn act(&self, who: &str, flags: &Flags, steps: &[Step]) -> Reply {
         if self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
         let tracked = self.pick(who, flags.window.as_deref())?;
         // A covered browser window is drawn and takes input while an agent works in it.
-        let _drawn = win::keep_drawn(tracked.hwnd, steps.iter().any(|step| step.first().is_some_and(|verb| verb == "draw") || step.iter().skip(1).any(|word| is_point(word).is_some())));
+        let _drawn = win::keep_drawn(tracked.hwnd, steps.iter().any(|step| step.words.first().is_some_and(|verb| verb == "draw") || step.words.iter().skip(1).any(|word| is_point(word).is_some())));
         let mut guard = tracked.view.lock().unwrap();
         let view = &mut *guard;
         if !view.read_once {
@@ -1917,7 +1921,7 @@ impl Service {
                 failure = Some(STOPPED.to_string());
                 break;
             }
-            match self.step(who, caller, flags, &tracked, view, step) {
+            match self.step(who, flags, &tracked, view, step) {
                 Ok(route) => routes.push(route),
                 Err(error) => {
                     failure = Some(error);
@@ -2438,7 +2442,13 @@ impl Service {
             }
             "do" => {
                 let script = args.first().ok_or("do \"click e1; key enter\"")?;
-                let mut steps = lines::split_steps(script);
+                let mut steps: Vec<Step> = lines::split_steps(script)
+                    .into_iter()
+                    .map(|raw| {
+                        let (flags, words) = parse(&raw);
+                        Step { flags, words }
+                    })
+                    .collect();
                 if flags.dry {
                     let tracked = self.pick(who, flags.window.as_deref())?;
                     let mut view = tracked.view.lock().unwrap();
@@ -2450,31 +2460,43 @@ impl Service {
                 if matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
                     return Err("declared risky: ask the person, then add --force".into());
                 }
-                if steps.iter().any(|step| parse(step).0.mouse) {
-                    let _ = caller.resolve();
+                for step in &steps {
+                    if let Some(error) = &step.flags.button_error {
+                        return Err(error.clone());
+                    }
+                    step.flags.modifiers()?;
+                    if step.flags.window.is_some() {
+                        return Err("a step cannot pick another window: a do runs in one, so run another command for that window".into());
+                    }
+                    if matches!(step.flags.risk.as_deref(), Some("medium" | "high")) && !flags.force && !step.flags.force {
+                        return Err("declared risky: ask the person, then add --force".into());
+                    }
+                }
+                if !flags.mouse && steps.iter().any(|step| step.flags.mouse) {
+                    self.borrow.allow(who, caller.resolve())?;
                 }
                 steps.extend(expected(&flags));
-                self.act(who, &caller, &flags, &steps)
+                self.act(who, &flags, &steps)
             }
             "click" if !args.is_empty() => {
-                let mut steps: Vec<Vec<String>> = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
+                let mut steps: Vec<Step> = args.iter().map(|word| Step { flags: Flags::default(), words: vec!["click".to_string(), word.clone()] }).collect();
                 steps.extend(expected(&flags));
-                self.act(who, &caller, &flags, &steps)
+                self.act(who, &flags, &steps)
             }
             "draw" if !flags.real && !flags.mouse && self.pick(who, flags.window.as_deref()).is_ok_and(|t| win::is_chromium(t.hwnd)) => {
                 let drawn = self.draw_together(who, &flags, args)?;
                 // --expect is checked here too, as on every other action.
                 match expected(&flags) {
-                    Some(step) => self.act(who, &caller, &flags, &[step]).map(|found| format!("{drawn}
+                    Some(step) => self.act(who, &flags, &[step]).map(|found| format!("{drawn}
 {found}")).map_err(|error| format!("{drawn}
 {error}")),
                     None => Ok(drawn),
                 }
             }
             "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" | "pick-file" => {
-                let mut steps = vec![rest.clone()];
+                let mut steps = vec![Step { flags: Flags::default(), words: rest.clone() }];
                 steps.extend(expected(&flags));
-                self.act(who, &caller, &flags, &steps)
+                self.act(who, &flags, &steps)
             }
             "" | "help" => Ok(HELP.to_string()),
             _ => Err(format!("unknown command '{verb}': deskcrew help")),
@@ -2483,8 +2505,8 @@ impl Service {
 
     fn serve(&self, pipe: Pipe) {
         uia::enter_com();
+        let client_pid = pipe.client_pid();
         if let Ok(message) = pipe.receive() {
-            let client_pid = pipe.client_pid();
             let active = ActiveGuard::enter(&self.active, &self.last_request);
             let text = String::from_utf8_lossy(&message);
             let mut words = text.split('\0').map(str::to_string);
@@ -2677,5 +2699,19 @@ mod tests {
 
         let held = format_status(false, &[], Some(windows_sys::Win32::Foundation::ERROR_HOTKEY_ALREADY_REGISTERED));
         assert!(held.contains("running") && held.contains("Ctrl+Alt+Esc") && held.contains("another process holds them"));
+    }
+
+    #[test]
+    fn literal_flag_text_is_preserved_without_double_parsing() {
+        let words = vec!["type".to_string(), "e3".to_string(), "--".to_string(), "--mouse".to_string(), "--expect".to_string(), "--real".to_string()];
+        let (flags, rest) = parse(&words);
+        assert!(!flags.mouse);
+        assert_eq!(rest, vec!["type", "e3", "--mouse", "--expect", "--real"]);
+
+        let expect_words = vec!["click".to_string(), "e3".to_string(), "--expect".to_string(), "--real".to_string()];
+        let (expect_flags, _) = parse(&expect_words);
+        let step = expected(&expect_flags).unwrap();
+        assert_eq!(step.words, vec!["expect", "--real"]);
+        assert!(!step.flags.real);
     }
 }
