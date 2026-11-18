@@ -20,8 +20,13 @@ pub const NEEDS_REAL: &str = "no background way to do this here: add --real";
 /// Part of the reply for keys that would go to the app the person has in front.
 pub const IN_FRONT: &str = "goes to the window in front";
 pub const NEEDS_MOUSE: &str = "this control only answers the real mouse: try click x,y on it, or --mouse to ask the person to borrow their cursor";
-/// Closing one of these takes the person's desktop with it.
+const MINIMIZED_WPF: &str = "refused: this WPF window is minimized, and it takes no keys until it is shown again. Windows would not let deskcrew show it off screen without it coming forward just now. Ask the person to restore it, or add --real";
+/// Closing or moving one of these takes the person's desktop with it.
 const SHELL_WINDOWS: [&str; 4] = ["Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd"];
+
+pub fn is_shell_window(hwnd: Hwnd) -> bool {
+    SHELL_WINDOWS.contains(&win::class(hwnd).as_str())
+}
 pub const NO_PEN: &str = "Windows would not take pen input here: --mouse asks the person to borrow their cursor";
 const WHEEL_DELTA: i32 = 120;
 const ACCESS_DENIED: u32 = 5;
@@ -466,7 +471,14 @@ fn release(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> Result<(),
 fn send(hwnd: Hwnd, message: u32, wparam: usize, lparam: isize) -> Result<isize, String> {
     let mut result = 0;
     let sent = unsafe { SendMessageTimeoutW(hwnd as HWND, message, wparam, lparam, SMTO_ABORTIFHUNG, 1000, &mut result) };
-    if sent != 0 { Ok(result as isize) } else { Err("that window stopped taking messages".into()) }
+    if sent != 0 {
+        return Ok(result as isize);
+    }
+    Err(if unsafe { GetLastError() } == ACCESS_DENIED {
+        "blocked: the window runs as administrator".to_string()
+    } else {
+        "that window stopped taking messages".to_string()
+    })
 }
 
 /// Put a text box's caret after its last letter, so typing adds to the end.
@@ -503,6 +515,7 @@ pub fn set(node: &Node, root: Hwnd, value: &str) -> Result<String, String> {
             return node.element.set_range(number).map(|_| "range".into());
         }
     if node.can.value && !node.element.value_read_only() {
+        let _lock = win::draws_itself(root).then(win::ForegroundLock::take);
         return node.element.set_value(value).map(|_| "value".into());
     }
     Err(NEEDS_REAL.into())
@@ -523,13 +536,34 @@ pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, next: impl F
 }
 
 fn post_chars(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: impl FnMut(Hwnd, u16)) -> Result<String, String> {
-    for unit in text.encode_utf16() {
+    // WPF checks keyboard focus when dispatching posted WM_CHAR messages: if focus leaves right
+    // after PostMessageW, trailing characters still in the queue are dropped. Sending WM_CHAR
+    // synchronously delivers every character while focus is held, while newlines in WPF controls
+    // require a posted Return keydown/keyup.
+    const VK_RETURN: usize = 0x0D;
+    let sync = win::is_wpf(hwnd);
+    let mut units = text.encode_utf16().peekable();
+    while let Some(unit) = units.next() {
         if stop.load(Ordering::Relaxed) {
             return Err("stopped by the person with Ctrl+Alt+Esc".into());
         }
         let started = std::time::Instant::now();
         next(hwnd, unit);
-        post(hwnd, WM_CHAR, if unit == 10 { 13 } else { unit as usize }, 1)?;
+        if sync && (unit == 10 || (unit == 13 && units.peek() == Some(&10))) {
+            if unit == 13 {
+                units.next();
+            }
+            let scan = unsafe { MapVirtualKeyW(VK_RETURN as u32, MAPVK_VK_TO_VSC) } as isize;
+            send(hwnd, WM_KEYDOWN, VK_RETURN, 1 | (scan << 16))?;
+            let _ = send(hwnd, WM_KEYUP, VK_RETURN, 1 | (scan << 16) | (1 << 30) | (1 << 31));
+        } else {
+            let ch = if unit == 10 { 13 } else { unit as usize };
+            if sync {
+                send(hwnd, WM_CHAR, ch, 1)?;
+            } else {
+                post(hwnd, WM_CHAR, ch, 1)?;
+            }
+        }
         std::thread::sleep(crate::motion::KEY_EVERY.saturating_sub(started.elapsed()));
     }
     Ok("message".into())
@@ -537,9 +571,12 @@ fn post_chars(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: impl FnMut(Hw
 
 /// One key or shortcut as window messages, to the control with focus in the app's window.
 pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String> {
+    if chord.has_win() {
+        return Err(format!("{spec} needs the real keyboard: add --real"));
+    }
     // WPF reads keys only while its window has keyboard focus, which a minimized one cannot get.
     if win::is_wpf(root) && win::minimized(root) {
-        return Err("refused: this WPF window is minimized, and it takes no keys until it is shown again. Windows would not let deskcrew show it off screen without it coming forward just now. Ask the person to restore it, or add --real".into());
+        return Err(MINIMIZED_WPF.into());
     }
     if win::keys_need_focus(root) {
         return post_chord(win::key_window(root), chord, spec, true);
@@ -617,6 +654,12 @@ const REPEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(33);
 /// A key held down for a while as window messages: down, repeats as a keyboard sends them, then up,
 /// with it set down in the app's keyboard state the whole time for apps that ask that state.
 pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
+    if chord.has_win() {
+        return Err("holding the Windows key needs the real keyboard: add --real".into());
+    }
+    if win::is_wpf(root) && win::minimized(root) {
+        return Err(MINIMIZED_WPF.into());
+    }
     let all: Vec<u16> = chord.keys.iter().map(|(vk, _)| *vk).collect();
     // WPF, Qt and Firefox take keys only with focus inside their own app, held for the whole time.
     if win::keys_need_focus(root) {
@@ -691,11 +734,7 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<St
         VK_MENU => Some(VK_LMENU),
         _ => None,
     };
-    // The Windows key belongs to the shell. Any other key held with the last one, such as A in
-    // a+b, goes down in the app's keyboard state and as a message, as Ctrl does.
-    const VK_LWIN: u16 = 0x5B;
-    const VK_RWIN: u16 = 0x5C;
-    if held.iter().any(|(vk, _)| matches!(*vk, VK_LWIN | VK_RWIN)) {
+    if chord.has_win() {
         return Err(format!("{spec} needs the real keyboard: add --real"));
     }
     let alt = held.iter().any(|(vk, _)| *vk == VK_MENU);
@@ -799,6 +838,9 @@ fn attached<T>(target: Hwnd, spec: &str, focus: bool, work: impl FnOnce() -> Res
 /// Firefox), sent while it has that focus for the moment. They go to whatever the app last had
 /// focused, in a dialog it opened if there is one.
 pub fn post_text_focused(root: Hwnd, text: &str, stop: &AtomicBool) -> Result<String, String> {
+    if win::is_wpf(root) && win::minimized(root) {
+        return Err(MINIMIZED_WPF.into());
+    }
     let window = win::key_window(root);
     attached(window, "typing", true, || post_chars(window, text, stop, |_, _| {}))
 }
@@ -811,23 +853,34 @@ pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
     use windows_sys::Win32::System::Threading::{AttachThreadInput, GetCurrentThreadId};
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetFocus, SetFocus};
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
+    if win::is_wpf(root) && win::minimized(root) {
+        return Err(MINIMIZED_WPF.into());
+    }
+    let window = win::key_window(root);
+    let front = win::foreground();
+    if front == root || front == window {
+        return if node.element.set_focus().is_ok() {
+            Ok("focus".into())
+        } else {
+            Err(NEEDS_REAL.into())
+        };
+    }
     unsafe {
-        let theirs = GetWindowThreadProcessId(root as HWND, std::ptr::null_mut());
+        let theirs = GetWindowThreadProcessId(window as HWND, std::ptr::null_mut());
         if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
             return Err(NEEDS_REAL.into());
         }
-        let front = win::foreground();
         let _lock = win::ForegroundLock::take();
         let mine = GetCurrentThreadId();
         if AttachThreadInput(mine, theirs, 1) == 0 {
             return Err(NEEDS_REAL.into());
         }
-        SetFocus(root as HWND);
-        let focused = GetFocus() == root as HWND && node.element.set_focus().is_ok();
+        SetFocus(window as HWND);
+        let focused = GetFocus() == window as HWND && node.element.set_focus().is_ok();
         SetFocus(std::ptr::null_mut());
         AttachThreadInput(mine, theirs, 0);
         // Should the app have come forward all the same, the person gets their window back.
-        if win::foreground() != front && win::pid(win::foreground()) == win::pid(root) && !win::bring_forward(front) {
+        if front != 0 && win::foreground() != front && win::pid(win::foreground()) == win::pid(root) && !win::bring_forward(front) {
             win::stop_flashing(front);
         }
         if !focused {
@@ -837,8 +890,220 @@ pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
     }
 }
 
+fn run_sta<T: Send>(work: impl FnOnce() -> Result<T, String> + Send) -> Result<T, String> {
+    std::thread::scope(|s| {
+        s.spawn(|| unsafe {
+            use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx, CoUninitialize};
+            let hr = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+            let result = work();
+            if hr.is_ok() {
+                CoUninitialize();
+            }
+            result
+        })
+        .join()
+        .unwrap_or_else(|_| Err("shell call failed".into()))
+    })
+}
+
+fn shell_dispatch<I: windows::core::Interface>(work: impl FnOnce(&I) -> windows::core::Result<()> + Send) -> Result<(), String> {
+    run_sta(|| unsafe {
+        use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+        use windows::Win32::UI::Shell::Shell;
+        let shell: I = CoCreateInstance(&Shell, None, CLSCTX_INPROC_SERVER).map_err(|e| format!("shell COM refused: {e}"))?;
+        work(&shell).map_err(|e| format!("shell action failed: {e}"))
+    })
+}
+
+fn windows_dir_path(windows_root: bool) -> Result<String, String> {
+    use windows_sys::Win32::System::SystemInformation::{GetSystemDirectoryW, GetWindowsDirectoryW};
+    let query = |buf: &mut [u16]| unsafe {
+        if windows_root {
+            GetWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32)
+        } else {
+            GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32)
+        }
+    };
+    let mut buf = vec![0u16; 260];
+    let mut len = query(&mut buf);
+    if len as usize >= buf.len() {
+        buf.resize(len as usize + 1, 0);
+        len = query(&mut buf);
+    }
+    if len == 0 || len as usize >= buf.len() {
+        return Err("Windows would not report its system folder".into());
+    }
+    Ok(String::from_utf16_lossy(&buf[..len as usize]))
+}
+
+fn system_file(windows_root: bool, name: &str) -> Result<String, String> {
+    Ok(format!("{}\\{name}", windows_dir_path(windows_root)?.trim_end_matches('\\')))
+}
+
+fn shell_launch(file: &str) -> Result<(), String> {
+    let file = file.to_string();
+    let dir = windows_dir_path(false)?;
+    run_sta(move || {
+        let wide = |t: &str| t.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
+        let (verb, target, work_dir) = (wide("open"), wide(&file), wide(&dir));
+        let code = unsafe {
+            windows_sys::Win32::UI::Shell::ShellExecuteW(
+                std::ptr::null_mut(),
+                verb.as_ptr(),
+                target.as_ptr(),
+                std::ptr::null(),
+                work_dir.as_ptr(),
+                windows_sys::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL,
+            )
+        };
+        if code as isize > 32 { Ok(()) } else { Err(format!("Windows could not open '{file}'")) }
+    })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WinShortcut {
+    Explorer,
+    ToggleDesktop,
+    MinimizeAll,
+    UndoMinimizeAll,
+    RunDialog,
+    TaskView,
+    Search,
+    Settings,
+    Accessibility,
+    About,
+    ActionCenter,
+    Project,
+    Cast,
+    ScreenSnip,
+    GameBar,
+    OnScreenKeyboard,
+    Magnifier,
+    Lock,
+    MaximizeWindow,
+    MinimizeOrRestoreWindow,
+    SnapLeft,
+    SnapRight,
+    PrevMonitor,
+    NextMonitor,
+}
+
+impl WinShortcut {
+    pub fn from_chord(chord: &Chord) -> Option<Self> {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
+            VK_A, VK_D, VK_DOWN, VK_E, VK_G, VK_I, VK_K, VK_L, VK_LEFT, VK_M, VK_O, VK_OEM_PLUS, VK_P, VK_PAUSE, VK_Q, VK_R,
+            VK_RIGHT, VK_S, VK_TAB, VK_U, VK_UP,
+        };
+        let (ctrl, shift, alt, vk) = chord.win_pattern()?;
+        if alt {
+            return None;
+        }
+        Some(match (ctrl, shift, vk) {
+            (false, false, VK_E) => Self::Explorer,
+            (false, false, VK_D) => Self::ToggleDesktop,
+            (false, false, VK_M) => Self::MinimizeAll,
+            (false, true, VK_M) => Self::UndoMinimizeAll,
+            (false, false, VK_R) => Self::RunDialog,
+            (false, false, VK_TAB) => Self::TaskView,
+            (false, false, VK_S | VK_Q) => Self::Search,
+            (false, false, VK_I) => Self::Settings,
+            (false, false, VK_U) => Self::Accessibility,
+            (false, false, VK_PAUSE) => Self::About,
+            (false, false, VK_A) => Self::ActionCenter,
+            (false, false, VK_P) => Self::Project,
+            (false, false, VK_K) => Self::Cast,
+            (false, true, VK_S) => Self::ScreenSnip,
+            (false, false, VK_G) => Self::GameBar,
+            (true, false, VK_O) => Self::OnScreenKeyboard,
+            (false, false, VK_OEM_PLUS) => Self::Magnifier,
+            (false, false, VK_L) => Self::Lock,
+            (false, false, VK_UP) => Self::MaximizeWindow,
+            (false, false, VK_DOWN) => Self::MinimizeOrRestoreWindow,
+            (false, false, VK_LEFT) => Self::SnapLeft,
+            (false, false, VK_RIGHT) => Self::SnapRight,
+            (false, true, VK_LEFT) => Self::PrevMonitor,
+            (false, true, VK_RIGHT) => Self::NextMonitor,
+            _ => return None,
+        })
+    }
+
+    pub fn needs_window(self) -> bool {
+        matches!(
+            self,
+            Self::MaximizeWindow | Self::MinimizeOrRestoreWindow | Self::SnapLeft | Self::SnapRight | Self::PrevMonitor | Self::NextMonitor
+        )
+    }
+}
+
+/// True if this chord is a desktop/shell-level Windows shortcut with a direct equivalent (needs no target window).
+pub fn is_shell_win_shortcut(chord: &Chord) -> bool {
+    WinShortcut::from_chord(chord).is_some_and(|action| !action.needs_window())
+}
+
+/// Run a Windows-key shortcut through its direct shell COM, protocol URI, Win32, or background
+/// window equivalent without using the real keyboard. `None` if no direct equivalent exists.
+pub fn win_shortcut(chord: &Chord, target: Option<Hwnd>) -> Option<Result<String, String>> {
+    use windows::Win32::UI::Shell::{IShellDispatch, IShellDispatch4, IShellDispatch5, IShellDispatch6};
+    let action = WinShortcut::from_chord(chord)?;
+    if action.needs_window() {
+        let hwnd = target?;
+        if is_shell_window(hwnd) {
+            return Some(Err("refused: that window is the Windows desktop or taskbar".into()));
+        }
+        return Some(match action {
+            WinShortcut::MaximizeWindow => (|| {
+                if win::foreground() == hwnd {
+                    win::place_max_front(hwnd)?;
+                } else {
+                    win::fill_screen_behind(hwnd)?;
+                }
+                Ok("direct (maximize)".into())
+            })(),
+            WinShortcut::MinimizeOrRestoreWindow => win::minimize_or_restore(hwnd).map(|_| "direct (restore or minimize)".into()),
+            WinShortcut::SnapLeft => win::snap_half(hwnd, false).map(|_| "direct (snap left)".into()),
+            WinShortcut::SnapRight => win::snap_half(hwnd, true).map(|_| "direct (snap right)".into()),
+            WinShortcut::PrevMonitor => win::move_monitor(hwnd, false).map(|moved| {
+                if moved { "direct (previous monitor)" } else { "direct (only one monitor)" }.into()
+            }),
+            WinShortcut::NextMonitor => win::move_monitor(hwnd, true).map(|moved| {
+                if moved { "direct (next monitor)" } else { "direct (only one monitor)" }.into()
+            }),
+            _ => unreachable!(),
+        });
+    }
+    Some(match action {
+        WinShortcut::Explorer => system_file(true, "explorer.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (explorer)".into()),
+        WinShortcut::ToggleDesktop => shell_dispatch::<IShellDispatch4>(|s| unsafe { s.ToggleDesktop() }).map(|_| "direct (toggle desktop)".into()),
+        WinShortcut::MinimizeAll => shell_dispatch::<IShellDispatch>(|s| unsafe { s.MinimizeAll() }).map(|_| "direct (minimize all)".into()),
+        WinShortcut::UndoMinimizeAll => shell_dispatch::<IShellDispatch>(|s| unsafe { s.UndoMinimizeALL() }).map(|_| "direct (restore minimized)".into()),
+        WinShortcut::RunDialog => shell_dispatch::<IShellDispatch>(|s| unsafe { s.FileRun() }).map(|_| "direct (run dialog)".into()),
+        WinShortcut::TaskView => shell_dispatch::<IShellDispatch5>(|s| unsafe { s.WindowSwitcher() }).map(|_| "direct (task view)".into()),
+        WinShortcut::Search => shell_dispatch::<IShellDispatch6>(|s| unsafe { s.SearchCommand() })
+            .or_else(|_| shell_launch("ms-search:"))
+            .map(|_| "direct (search)".into()),
+        WinShortcut::Settings => shell_launch("ms-settings:").map(|_| "direct (settings)".into()),
+        WinShortcut::Accessibility => shell_launch("ms-settings:easeofaccess").map(|_| "direct (accessibility)".into()),
+        WinShortcut::About => shell_launch("ms-settings:about").map(|_| "direct (about)".into()),
+        WinShortcut::ActionCenter => shell_launch("ms-actioncenter:").map(|_| "direct (action center)".into()),
+        WinShortcut::Project => system_file(false, "DisplaySwitch.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (project)".into()),
+        WinShortcut::Cast => shell_launch("ms-settings-connectabledevices:devicediscovery").map(|_| "direct (cast)".into()),
+        WinShortcut::ScreenSnip => shell_launch("ms-screenclip:").map(|_| "direct (screen snip)".into()),
+        WinShortcut::GameBar => shell_launch("ms-gamebar:").map(|_| "direct (game bar)".into()),
+        WinShortcut::OnScreenKeyboard => system_file(false, "osk.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (on-screen keyboard)".into()),
+        WinShortcut::Magnifier => system_file(false, "Magnify.exe").and_then(|p| shell_launch(&p)).map(|_| "direct (magnifier)".into()),
+        WinShortcut::Lock => {
+            if unsafe { windows_sys::Win32::System::Shutdown::LockWorkStation() } != 0 {
+                Ok("direct (lock)".into())
+            } else {
+                Err("Windows refused to lock the workstation".into())
+            }
+        }
+        _ => unreachable!(),
+    })
+}
+
 pub fn close_window(hwnd: Hwnd) -> Result<(), String> {
-    if SHELL_WINDOWS.contains(&win::class(hwnd).as_str()) {
+    if is_shell_window(hwnd) {
         return Err("refused: that window is the Windows desktop or taskbar".into());
     }
     post(hwnd, WM_CLOSE, 0, 0)
@@ -924,4 +1189,28 @@ pub fn select_item(node: &Node, item: &str, uia: &Uia, root: Hwnd, surfaces: &[H
         }
         done.map(|d| route("select", d))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn win_shortcuts_map_known_chords_and_reject_unmapped() {
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+e").unwrap()), Some(WinShortcut::Explorer));
+        assert_eq!(WinShortcut::from_chord(&real::chord("cmd+d").unwrap()), Some(WinShortcut::ToggleDesktop));
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+shift+m").unwrap()), Some(WinShortcut::UndoMinimizeAll));
+        assert_eq!(WinShortcut::from_chord(&real::chord("shift+win+s").unwrap()), Some(WinShortcut::ScreenSnip));
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+ctrl+o").unwrap()), Some(WinShortcut::OnScreenKeyboard));
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+pause").unwrap()), Some(WinShortcut::About));
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+plus").unwrap()), Some(WinShortcut::Magnifier));
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+up").unwrap()), Some(WinShortcut::MaximizeWindow));
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+shift+left").unwrap()), Some(WinShortcut::PrevMonitor));
+        assert!(is_shell_win_shortcut(&real::chord("win+i").unwrap()));
+        assert!(!is_shell_win_shortcut(&real::chord("win+left").unwrap()));
+        assert_eq!(WinShortcut::from_chord(&real::chord("win").unwrap()), None);
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+x").unwrap()), None);
+        assert_eq!(WinShortcut::from_chord(&real::chord("win+alt+e").unwrap()), None);
+        assert_eq!(WinShortcut::from_chord(&real::chord("ctrl+s").unwrap()), None);
+    }
 }
