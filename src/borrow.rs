@@ -89,7 +89,12 @@ unsafe extern "system" fn button_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
     use windows_sys::Win32::{
         Foundation::POINT,
         System::SystemInformation::GetTickCount,
-        UI::WindowsAndMessaging::{CallWindowProcW, GetCursorPos, GetDlgCtrlID, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint},
+        UI::{
+            Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON},
+            WindowsAndMessaging::{
+                CallWindowProcW, GetCursorPos, GetDlgCtrlID, WM_LBUTTONDBLCLK, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint,
+            },
+        },
     };
     unsafe {
         let on_button = || {
@@ -97,9 +102,10 @@ unsafe extern "system" fn button_proc(hwnd: HWND, message: u32, w: WPARAM, l: LP
             GetCursorPos(&mut at) != 0 && WindowFromPoint(at) == hwnd
         };
         match message {
-            WM_LBUTTONDOWN => {
+            WM_LBUTTONDOWN | WM_LBUTTONDBLCLK => {
                 let now = GetTickCount();
-                if now.wrapping_sub(SHOWN_AT.load(Ordering::SeqCst)) >= PROMPT_GRACE_MS && on_button() {
+                let real_down = (GetAsyncKeyState(VK_LBUTTON as i32) as u16 & 0x8000) != 0;
+                if real_down && now.wrapping_sub(SHOWN_AT.load(Ordering::SeqCst)) >= PROMPT_GRACE_MS && on_button() {
                     MOUSE_DOWN_ID.store(GetDlgCtrlID(hwnd), Ordering::SeqCst);
                 } else {
                     MOUSE_DOWN_ID.store(-1, Ordering::SeqCst);
@@ -253,8 +259,8 @@ fn prompt(text: &str, buttons: &[&str]) -> Option<usize> {
                 }
             }
         }
-        ShowWindow(window, SW_SHOWNOACTIVATE);
         SHOWN_AT.store(GetTickCount(), Ordering::SeqCst);
+        ShowWindow(window, SW_SHOWNOACTIVATE);
         SetTimer(window, 1, ANSWER_MS, None);
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
@@ -412,18 +418,61 @@ fn resolve_caller_with(client_pid: Option<u32>, service_pid: u32) -> Result<Call
 
     let mut chain = vec![first];
     let mut seen = HashSet::from([client_pid]);
+    let mut ended = false;
     for _ in 0..MAX_CHAIN {
         let cur = chain.last().unwrap();
-        let Some(&(parent_pid, _)) = parents.get(&cur.pid) else { break };
+        let Some(&(parent_pid, _)) = parents.get(&cur.pid) else {
+            ended = true;
+            break;
+        };
         if parent_pid <= 4 || !seen.insert(parent_pid) {
+            ended = true;
             break;
         }
-        let Some(parent) = process_info(parent_pid) else { break };
+        let Some(parent) = process_info(parent_pid) else {
+            ended = true;
+            break;
+        };
         // A parent created after its child is a reused PID, not the true parent.
         if parent.created > cur.created {
+            ended = true;
             break;
         }
         chain.push(parent);
+    }
+    // If the ancestor chain ran past MAX_CHAIN, keep walking to ensure service_pid isn't hidden
+    // deeper in the tree (e.g. a deeply nested `deskcrew launch` descendant).
+    if !ended {
+        const EXTENDED_CHAIN: usize = 256;
+        let mut cur_pid = chain.last().unwrap().pid;
+        let mut cur_created = chain.last().unwrap().created;
+        let mut terminated = false;
+        for _ in 0..EXTENDED_CHAIN {
+            let Some(&(parent_pid, _)) = parents.get(&cur_pid) else {
+                terminated = true;
+                break;
+            };
+            if parent_pid <= 4 || !seen.insert(parent_pid) {
+                terminated = true;
+                break;
+            }
+            if parent_pid == service_pid {
+                return Err("could not identify the calling program".into());
+            }
+            let Some(parent) = process_info(parent_pid) else {
+                terminated = true;
+                break;
+            };
+            if parent.created > cur_created {
+                terminated = true;
+                break;
+            }
+            cur_pid = parent.pid;
+            cur_created = parent.created;
+        }
+        if !terminated {
+            return Err("could not identify the calling program".into());
+        }
     }
 
     let self_exe_key = std::env::current_exe()
@@ -438,6 +487,10 @@ fn is_same_app_helper(node: &ProcNode, ancestor: &ProcNode) -> bool {
     let Some((dir, _)) = ancestor.exe_key.rsplit_once('\\') else {
         return false;
     };
+    let leaf = dir.rsplit('\\').next().unwrap_or("");
+    if matches!(leaf, "bin" | "scripts" | "windowsapps" | "system32" | "syswow64" | "windows" | "tools" | "temp") {
+        return false;
+    }
     dir.matches('\\').count() >= 2 && node.exe_key.starts_with(dir) && node.exe_key.as_bytes().get(dir.len()) == Some(&b'\\')
 }
 
@@ -1298,5 +1351,15 @@ mod tests {
             ProcNode { pid: 300, created: 30, exe: r"C:\Tools\deskcrew.exe".into(), exe_key: self_exe.into() },
         ];
         assert!(pick_caller_from_chain(&chain, self_exe, 300).is_err());
+
+        // A sibling executable inside a shared bin folder (.cargo\bin) does not inherit an agent's grant.
+        let sibling_chain = vec![
+            ProcNode { pid: 10, created: 30, exe: r"C:\Tools\deskcrew.exe".into(), exe_key: self_exe.into() },
+            ProcNode { pid: 20, created: 20, exe: r"C:\Users\User\.cargo\bin\other-tool.exe".into(), exe_key: r"c:\users\user\.cargo\bin\other-tool.exe".into() },
+            ProcNode { pid: 30, created: 10, exe: r"C:\Users\User\.cargo\bin\codex.exe".into(), exe_key: r"c:\users\user\.cargo\bin\codex.exe".into() },
+        ];
+        let picked = pick_caller_from_chain(&sibling_chain, self_exe, 9999).unwrap();
+        assert_eq!(picked.pid, 20);
+        assert_eq!(picked.known_name, None);
     }
 }

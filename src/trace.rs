@@ -67,11 +67,12 @@ fn write_manifest(dir: &Path, value: &Value) -> Result<(), String> {
     fs::write(dir.join("session.json"), serde_json::to_string_pretty(value).unwrap_or_default()).map_err(|e| e.to_string())
 }
 
-/// Take `--session ID` out of the arguments.
+/// Take `--session ID` out of the arguments, stopping at `--`.
 fn take_flag(args: &mut Vec<String>) -> Option<String> {
-    let at = args.iter().position(|a| a == "--session")?;
-    let id = args.get(at + 1).cloned();
-    args.drain(at..(at + 2).min(args.len()));
+    let limit = args.iter().position(|a| a == "--").unwrap_or(args.len());
+    let at = args[..limit].iter().position(|a| a == "--session")?;
+    let id = (at + 1 < limit).then(|| args[at + 1].clone());
+    args.drain(at..(at + 2).min(limit));
     id
 }
 
@@ -161,7 +162,12 @@ impl Session {
         if fs::read_dir(&pictures).map(|d| d.count()).unwrap_or(0) >= MOST_PICTURES {
             return None;
         }
-        let window = args.iter().position(|a| a == "-w" || a == "--window").and_then(|at| args.get(at + 1)).cloned().or_else(|| {
+        let limit = args.iter().position(|a| a == "--").unwrap_or(args.len());
+        let window = args[..limit]
+            .iter()
+            .position(|a| a == "-w" || a == "--window")
+            .and_then(|at| (at + 1 < limit).then(|| args[at + 1].clone()))
+            .or_else(|| {
             // The window this agent is working in carries a * in its list.
             let (_, listed) = crate::client::ask(who, &["windows".to_string()]).ok()?;
             listed.lines().find_map(|line| line.split_whitespace().next().filter(|first| first.ends_with('*')).map(|first| first.trim_end_matches('*').to_string()))
@@ -449,5 +455,9 @@ secret"), "<9 characters>");
         let mut args = words(&["click", "Save", "--session", "s1", "-w", "Notes"]);
         assert_eq!(take_flag(&mut args), Some("s1".into()));
         assert_eq!(args, words(&["click", "Save", "-w", "Notes"]));
+
+        let mut literal = words(&["see", "--", "--session"]);
+        assert_eq!(take_flag(&mut literal), None);
+        assert_eq!(literal, words(&["see", "--", "--session"]));
     }
 }

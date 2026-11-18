@@ -161,6 +161,7 @@ struct Flags {
     forward: bool,
     /// From --button; an error when the word was not left, right or middle.
     button: Option<Result<input::Button, ()>>,
+    flag_error: Option<String>,
     fill: bool,
     close: bool,
     with: Option<String>,
@@ -225,6 +226,29 @@ impl Flags {
     }
 }
 
+#[derive(Default)]
+struct Step {
+    flags: Flags,
+    words: Vec<String>,
+}
+
+fn take_text(dst: &mut Option<String>, next: Option<String>, flag: &str, err: &mut Option<String>) {
+    match next {
+        Some(value) => *dst = Some(value),
+        None => {
+            err.get_or_insert_with(|| format!("{flag} needs a value"));
+        }
+    }
+}
+
+fn take_num<T: std::str::FromStr>(next: Option<String>, flag: &str, hint: &str, err: &mut Option<String>) -> Option<T> {
+    let parsed = next.and_then(|n| n.parse::<T>().ok());
+    if parsed.is_none() {
+        err.get_or_insert_with(|| format!("{flag} needs {hint}"));
+    }
+    parsed
+}
+
 fn parse(words: &[String]) -> (Flags, Vec<String>) {
     let mut flags = Flags::default();
     let mut rest = Vec::new();
@@ -236,20 +260,30 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
             break;
         }
         let next = words.get(at + 1).cloned();
-        let number = |text: &Option<String>| text.as_ref().and_then(|n| n.parse::<u64>().ok());
         let mut took = true;
         match word.as_str() {
-            "-w" | "--window" => flags.window = next.clone(),
-            "--find" => flags.find = next.clone(),
-            "--region" => flags.region = next.clone(),
-            "--expect" => flags.expect = next.clone(),
-            "--with" => flags.with = next.clone(),
-            "--button" => flags.button = Some(next.as_deref().and_then(input::Button::named).filter(|b| matches!(b, input::Button::Left | input::Button::Right | input::Button::Middle)).ok_or(()) ),
-            "--risk" => flags.risk = next.clone(),
-            "--from" => flags.from = number(&next).unwrap_or(0) as usize,
-            "--edge" => flags.edge = number(&next).map(|n| n as u32),
-            "--ms" | "--timeout" => flags.ms = number(&next),
-            "--hold" => flags.hold = number(&next),
+            "-w" | "--window" => take_text(&mut flags.window, next, word, &mut flags.flag_error),
+            "--find" => take_text(&mut flags.find, next, word, &mut flags.flag_error),
+            "--region" => take_text(&mut flags.region, next, word, &mut flags.flag_error),
+            "--expect" => take_text(&mut flags.expect, next, word, &mut flags.flag_error),
+            "--with" => take_text(&mut flags.with, next, word, &mut flags.flag_error),
+            "--button" => match next.as_deref().and_then(input::Button::named) {
+                Some(button @ (input::Button::Left | input::Button::Right | input::Button::Middle)) => flags.button = Some(Ok(button)),
+                _ => {
+                    flags.button = Some(Err(()));
+                    flags.flag_error.get_or_insert_with(|| "--button takes left, right or middle".into());
+                }
+            },
+            "--risk" => match next.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("low" | "medium" | "high") => flags.risk = next.map(|v| v.to_ascii_lowercase()),
+                _ => {
+                    flags.flag_error.get_or_insert_with(|| "--risk takes low, medium or high".into());
+                }
+            },
+            "--from" => flags.from = take_num::<u64>(next, word, "a number", &mut flags.flag_error).unwrap_or(0).min(usize::MAX as u64) as usize,
+            "--edge" => flags.edge = take_num::<u64>(next, word, "pixels", &mut flags.flag_error).map(|n| n.min(u32::MAX as u64) as u32),
+            "--ms" | "--timeout" => flags.ms = take_num::<u64>(next, word, "milliseconds", &mut flags.flag_error),
+            "--hold" => flags.hold = take_num::<u64>(next, word, "milliseconds", &mut flags.flag_error),
             _ => took = false,
         }
         if took {
@@ -966,31 +1000,45 @@ impl Service {
         }
     }
 
-    fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        let (own, words) = parse(words);
-        let flags = own.merged(flags);
-        let (command, args) = words.split_first().ok_or("empty step")?;
-        match (command.as_str(), args) {
-            ("click", [word]) => self.click(who, &flags, tracked, view, word),
-            ("hover", [word]) => self.hover(who, &flags, tracked, view, word),
-            ("set", [word, value]) => self.set(who, &flags, tracked, view, word, value),
-            ("clear", [word]) => self.set(who, &flags, tracked, view, word, ""),
-            ("check", [word]) => self.ensure(who, &flags, tracked, view, word, Some("on")),
-            ("uncheck", [word]) => self.ensure(who, &flags, tracked, view, word, Some("off")),
-            ("toggle", [word]) => self.ensure(who, &flags, tracked, view, word, None),
-            ("expand", [word]) => self.expand(who, &flags, tracked, view, word, true),
-            ("collapse", [word]) => self.expand(who, &flags, tracked, view, word, false),
-            ("show", [word]) => self.show(who, tracked, view, word),
-            ("select", [word, item]) => self.select(who, &flags, tracked, view, word, item),
-            ("type", rest) => self.type_text(who, &flags, tracked, view, rest),
-            ("key", [spec]) => self.key(who, &flags, tracked, spec),
-            ("down", rest) => self.down(who, tracked, rest),
-            ("scroll", rest) => self.scroll(who, &flags, tracked, view, rest),
-            ("drag", [from, to]) => self.drag(who, &flags, tracked, view, from, to),
-            ("draw", rest) => self.draw(who, &flags, tracked, view, rest),
-            ("wait", [text]) => self.wait(&flags, tracked, view, text),
-            _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
+    fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, step: &Step) -> Reply {
+        if let Some(error) = &step.flags.flag_error {
+            return Err(error.clone());
         }
+        if step.flags.window.is_some() {
+            return Err("a step cannot pick another window: a do runs in one, so run another command for that window".into());
+        }
+        if matches!(step.flags.risk.as_deref(), Some("medium" | "high")) && !flags.force && !step.flags.force {
+            return Err("declared risky: ask the person, then add --force".into());
+        }
+        let merged = step.flags.clone().merged(flags);
+        let words = &step.words;
+        let (command, args) = words.split_first().ok_or("empty step")?;
+        let route = match (command.as_str(), args) {
+            ("click", [word]) => self.click(who, &merged, tracked, view, word),
+            ("hover", [word]) => self.hover(who, &merged, tracked, view, word),
+            ("set", [word, value]) => self.set(who, &merged, tracked, view, word, value),
+            ("clear", [word]) => self.set(who, &merged, tracked, view, word, ""),
+            ("check", [word]) => self.ensure(who, &merged, tracked, view, word, Some("on")),
+            ("uncheck", [word]) => self.ensure(who, &merged, tracked, view, word, Some("off")),
+            ("toggle", [word]) => self.ensure(who, &merged, tracked, view, word, None),
+            ("expand", [word]) => self.expand(who, &merged, tracked, view, word, true),
+            ("collapse", [word]) => self.expand(who, &merged, tracked, view, word, false),
+            ("show", [word]) => self.show(who, tracked, view, word),
+            ("select", [word, item]) => self.select(who, &merged, tracked, view, word, item),
+            ("type", rest) => self.type_text(who, &merged, tracked, view, rest),
+            ("key", [spec]) => self.key(who, &merged, tracked, spec),
+            ("down", rest) => self.down(who, tracked, rest),
+            ("scroll", rest) => self.scroll(who, &merged, tracked, view, rest),
+            ("drag", [from, to]) => self.drag(who, &merged, tracked, view, from, to),
+            ("draw", rest) => self.draw(who, &merged, tracked, view, rest),
+            ("wait", [text]) => self.wait(&merged, tracked, view, text),
+            _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
+        }?;
+        if let Some(text) = &step.flags.expect {
+            let waiting = Flags { ms: merged.ms, ..Flags::default() };
+            self.wait(&waiting, tracked, view, text)?;
+        }
+        Ok(route)
     }
 
     /// Where the window's picture changed since `before`, in window points, ignoring a caret.
@@ -1005,7 +1053,7 @@ impl Service {
     }
 
     /// Run steps against one window, then report the result as a single set of changes.
-    fn act(&self, who: &str, flags: &Flags, steps: &[Vec<String>]) -> Reply {
+    fn act(&self, who: &str, flags: &Flags, steps: &[Step]) -> Reply {
         if STOP.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
@@ -1341,14 +1389,13 @@ impl Service {
         Ok("ok".into())
     }
 
-    fn dry_run(&self, tracked: &Tracked, view: &View, steps: &[Vec<String>]) -> String {
+    fn dry_run(&self, tracked: &Tracked, view: &View, steps: &[Step]) -> String {
         let name = |word: &str| is_ref(word).and_then(|id| view.nodes.get(&id)).map(|node| lines::line(&node.parts));
         steps
             .iter()
             .enumerate()
             .map(|(at, step)| {
-                let (_, words) = parse(step);
-                let named: Vec<String> = words.iter().map(|word| name(word).map_or(word.clone(), |line| format!("{word} ({line})"))).collect();
+                let named: Vec<String> = step.words.iter().map(|word| name(word).map_or(word.clone(), |line| format!("{word} ({line})"))).collect();
                 format!("{}. {}", at + 1, named.join(" "))
             })
             .chain(Some(format!("nothing done in w{}", tracked.id)))
@@ -1358,10 +1405,16 @@ impl Service {
 
     fn handle(&self, who: &str, words: &[String]) -> Reply {
         let (flags, rest) = parse(words);
+        if let Some(error) = &flags.flag_error {
+            return Err(error.clone());
+        }
         let (command, args) = rest.split_first().ok_or(HELP)?;
-        let with_expect = |mut steps: Vec<Vec<String>>| {
+        if !(command == "do" && flags.dry) && matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
+            return Err("declared risky: ask the person, then add --force".into());
+        }
+        let with_expect = |mut steps: Vec<Step>| {
             if let Some(text) = &flags.expect {
-                steps.push(vec!["wait".to_string(), text.clone()]);
+                steps.push(Step { flags: Flags::default(), words: vec!["wait".to_string(), text.clone()] });
             }
             steps
         };
@@ -1430,7 +1483,13 @@ impl Service {
             }
             "do" => {
                 let script = args.join(" ");
-                let steps = lines::split_steps(&script);
+                let steps: Vec<Step> = lines::split_steps(&script)
+                    .into_iter()
+                    .map(|raw| {
+                        let (flags, words) = parse(&raw);
+                        Step { flags, words }
+                    })
+                    .collect();
                 if flags.dry {
                     let tracked = self.pick(who, flags.window.as_deref())?;
                     let mut view = tracked.view.lock().unwrap();
@@ -1442,17 +1501,28 @@ impl Service {
                 if matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
                     return Err("declared risky: ask the person, then add --force".into());
                 }
+                for step in &steps {
+                    if let Some(error) = &step.flags.flag_error {
+                        return Err(error.clone());
+                    }
+                    if step.flags.window.is_some() {
+                        return Err("a step cannot pick another window: a do runs in one, so run another command for that window".into());
+                    }
+                    if matches!(step.flags.risk.as_deref(), Some("medium" | "high")) && !flags.force && !step.flags.force {
+                        return Err("declared risky: ask the person, then add --force".into());
+                    }
+                }
                 self.act(who, &flags, &with_expect(steps))
             }
             "click" if args.len() > 1 => {
-                let steps = args.iter().map(|word| vec!["click".to_string(), word.clone()]).collect();
+                let steps = args.iter().map(|word| Step { flags: Flags::default(), words: vec!["click".to_string(), word.clone()] }).collect();
                 self.act(who, &flags, &with_expect(steps))
             }
             "click" | "hover" | "set" | "clear" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "show" | "select" | "type" | "key"
             | "down" | "scroll" | "drag" | "draw" | "wait" => {
-                let mut step = vec![command.clone()];
-                step.extend(args.iter().cloned());
-                self.act(who, &flags, &with_expect(vec![step]))
+                let mut words = vec![command.clone()];
+                words.extend(args.iter().cloned());
+                self.act(who, &flags, &with_expect(vec![Step { flags: Flags::default(), words }]))
             }
             other => Err(format!("unknown command '{other}': deskcrew help")),
         }

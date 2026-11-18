@@ -312,7 +312,12 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                     }
                 }
             }
-            "--risk" => take_text(&mut flags.risk, next, word, &mut flags.flag_error),
+            "--risk" => match next.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                Some("low" | "medium" | "high") => flags.risk = next.map(|v| v.to_ascii_lowercase()),
+                _ => {
+                    flags.flag_error.get_or_insert_with(|| "--risk takes low, medium or high".into());
+                }
+            },
             "--from" => flags.from = take_num::<u64>(next, word, "a number", &mut flags.flag_error).unwrap_or(0).min(usize::MAX as u64) as usize,
             "--edge" => flags.edge = take_num::<u64>(next, word, "pixels", &mut flags.flag_error).map(|n| n.min(u32::MAX as u64) as u32),
             "--ms" | "--timeout" => flags.ms = take_num::<u64>(next, word, "milliseconds", &mut flags.flag_error),
@@ -824,10 +829,12 @@ impl Service {
         let Some(xid) = tracked.x11 else {
             return Err("pointer input on Wayland needs X11 (or the RemoteDesktop portal)".into());
         };
-        if by == By::Agent && x::shows_at(xid, px, py) {
+        if by == By::Agent {
             let _turn = self.real_input.lock().unwrap();
-            work()?;
-            return Ok("own pointer".into());
+            if x::shows_at(xid, px, py) {
+                work()?;
+                return Ok("own pointer".into());
+            }
         }
         self.front(tracked, || {
             if !x::shows_at(xid, px, py) {
@@ -844,10 +851,8 @@ impl Service {
         }
         let (px, py) = self.point_of(word, who, tracked, view)?;
         self.cursor_on(who, tracked, (px, py, 0, 0), false);
-        let _turn = self.real_input.lock().unwrap();
         let by = self.pointer_for(&[]);
-        x::move_by(by, px, py)?;
-        Ok(if by == By::Agent { "own pointer" } else { "pointer" }.into())
+        self.with_pointer(by, tracked, (px, py), || x::move_by(by, px, py))
     }
 
     fn set(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
@@ -1035,16 +1040,19 @@ impl Service {
         if tracked.x11.is_none() {
             return Err("pressing keys on Wayland needs X11 (or the RemoteDesktop portal); use set, type <control>, select, check or click <control> through AT-SPI".into());
         }
-        let mut chord = x::chord(spec)?;
-        let held = self.all_held_keys();
-        // Keys held with down by any agent are physically pressed too: down ctrl, then key q, is ctrl+q.
-        let pressed = x::Chord { modifiers: chord.modifiers.iter().chain(&held).copied().collect(), key: chord.key };
-        if x::is_risky(&pressed) && !flags.force {
-            return Err(format!("'{spec}' can quit or close things: ask the person, then add --force"));
-        }
-        chord.modifiers.retain(|m| !held.contains(m));
+        let chord = x::chord(spec)?;
         let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
-        self.keyboard(tracked, || x::press(&chord, hold))?;
+        self.keyboard(tracked, || {
+            let mut chord = x::Chord { modifiers: chord.modifiers.clone(), key: chord.key };
+            let held = self.all_held_keys();
+            // Keys held with down by any agent are physically pressed too: down ctrl, then key q, is ctrl+q.
+            let pressed = x::Chord { modifiers: chord.modifiers.iter().chain(&held).copied().collect(), key: chord.key };
+            if x::is_risky(&pressed) && !flags.force {
+                return Err(format!("'{spec}' can quit or close things: ask the person, then add --force"));
+            }
+            chord.modifiers.retain(|m| !held.contains(m));
+            x::press(&chord, hold)
+        })?;
         Ok("keys".into())
     }
 
@@ -1128,7 +1136,7 @@ impl Service {
         // The drawn cursor rides along with the pen. The agents' own pointer needs the window to
         // show along the whole stroke, or it would draw on whatever covers it.
         let by = self.pointer_for(modifiers);
-        let shows = by == By::Agent && strokes.iter().flatten().all(|p| x::shows_at(xid, p.0 as i32, p.1 as i32));
+        let all_visible = || strokes.iter().flatten().all(|p| x::shows_at(xid, p.0 as i32, p.1 as i32));
         let finished = std::cell::Cell::new(true);
         let draw = || {
             x::modifiers(modifiers, true)?;
@@ -1144,13 +1152,25 @@ impl Service {
             let _ = x::modifiers(modifiers, false);
             res
         };
-        let route = if shows {
+        let mut route = None;
+        if by == By::Agent {
             let _turn = self.real_input.lock().unwrap();
-            draw()?;
-            "own pointer".to_string()
-        } else {
-            self.front(tracked, draw)?;
-            if by == By::Agent { "own pointer, window brought forward" } else { "pointer" }.to_string()
+            if all_visible() {
+                draw()?;
+                route = Some("own pointer".to_string());
+            }
+        }
+        let route = match route {
+            Some(route) => route,
+            None => {
+                self.front(tracked, || {
+                    if !all_visible() {
+                        return Err("refused: another window covers part of that stroke".into());
+                    }
+                    draw()
+                })?;
+                if by == By::Agent { "own pointer, window brought forward" } else { "pointer" }.to_string()
+            }
         };
         if finished.get() { Ok(route) } else { Err(STOPPED.into()) }
     }
@@ -1254,11 +1274,13 @@ impl Service {
         if let Some(done) = self.fill_file_dialog(tracked, view, path) {
             return done;
         }
-        for window in self.list_windows()?.into_iter().filter(|w| w.pid == pid && w.key != tracked.key) {
-            let dialog = Tracked { id: 0, key: window.key, x11: window.x11, view: Mutex::new(View { element: window.element, ..View::default() }) };
-            let mut dialog_view = dialog.view.lock().unwrap();
-            if let Some(done) = self.fill_file_dialog(&dialog, &mut dialog_view, path) {
-                return done;
+        if pid > 0 {
+            for window in self.list_windows()?.into_iter().filter(|w| w.pid == pid && w.key != tracked.key) {
+                let dialog = Tracked { id: 0, key: window.key, x11: window.x11, view: Mutex::new(View { element: window.element, ..View::default() }) };
+                let mut dialog_view = dialog.view.lock().unwrap();
+                if let Some(done) = self.fill_file_dialog(&dialog, &mut dialog_view, path) {
+                    return done;
+                }
             }
         }
         Err("no file dialog in this window or one its app opened: open it first, then pick-file".into())
@@ -1787,6 +1809,9 @@ impl Service {
         let changes = matches!(command.as_str(), "focus" | "close" | "place") || (command == "clip" && !args.is_empty());
         if changes && STOP.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
+        }
+        if !(command == "do" && flags.dry) && matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
+            return Err("declared risky: ask the person, then add --force".into());
         }
         match command.as_str() {
             "help" => Ok(HELP.into()),

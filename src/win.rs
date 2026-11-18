@@ -1200,14 +1200,11 @@ pub fn stack_above(layer: Hwnd, root: Hwnd, force: bool) {
     }
 }
 
-/// Which process owns this window, and when that process started. A handle can be given to a new
-/// window after the old one closes, so a handle alone does not prove it is the same window.
-pub fn identity(hwnd: Hwnd) -> (u32, u64) {
+fn process_identity(owner: u32) -> (u32, u64) {
     use windows_sys::Win32::{
         Foundation::FILETIME,
         System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
-    let owner = content_pid(hwnd);
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, owner);
         if process.is_null() {
@@ -1218,6 +1215,24 @@ pub fn identity(hwnd: Hwnd) -> (u32, u64) {
         CloseHandle(process);
         (owner, if read != 0 { (made.dwHighDateTime as u64) << 32 | made.dwLowDateTime as u64 } else { 0 })
     }
+}
+
+/// Which process owns this window, and when that process started. A handle can be given to a new
+/// window after the old one closes, so a handle alone does not prove it is the same window.
+pub fn identity(hwnd: Hwnd) -> (u32, u64) {
+    process_identity(pid(hwnd))
+}
+
+/// For a Store app (`ApplicationFrameWindow`), the hosted child app's process identity when present.
+/// Returns `None` for non-Store windows or when a minimized/suspended Store app temporarily has no
+/// attached content child, so callers can detect frame reuse without mistaking minimize for close.
+pub fn content_identity(hwnd: Hwnd) -> Option<(u32, u64)> {
+    if class(hwnd) != "ApplicationFrameWindow" {
+        return None;
+    }
+    let own = pid(hwnd);
+    let content = content_pid(hwnd);
+    (content != 0 && content != own).then(|| process_identity(content))
 }
 
 /// Whether the window in front is this one or a dialog or popup of its own. Being the same process

@@ -240,10 +240,29 @@ struct Tracked {
     id: u32,
     hwnd: Hwnd,
     identity: (u32, u64),
+    content_identity: Mutex<Option<(u32, u64)>>,
     view: Mutex<View>,
     pointer: Mutex<()>,
     // Agents drawing in this window right now. Strokes are cut into turns only when there are two.
     drawers: AtomicUsize,
+}
+
+impl Tracked {
+    fn same_window(&self) -> bool {
+        if win::identity(self.hwnd) != self.identity {
+            return false;
+        }
+        let now_content = win::content_identity(self.hwnd);
+        let mut stored = self.content_identity.lock().unwrap();
+        match (*stored, now_content) {
+            (Some(old), Some(now)) => old == now,
+            (None, Some(now)) => {
+                *stored = Some(now);
+                true
+            }
+            _ => true,
+        }
+    }
 }
 
 struct LastShot {
@@ -394,7 +413,12 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
                     took_next = true;
                 }
                 "--risk" => {
-                    take_text(&mut flags.risk, next, word, &mut flags.flag_error);
+                    match next.as_deref().map(str::to_ascii_lowercase).as_deref() {
+                        Some("low" | "medium" | "high") => flags.risk = next.map(|v| v.to_ascii_lowercase()),
+                        _ => {
+                            flags.flag_error.get_or_insert_with(|| "--risk takes low, medium or high".into());
+                        }
+                    }
                     took_next = true;
                 }
                 "--gone" => flags.gone = true,
@@ -492,6 +516,14 @@ pub struct Service {
     active: AtomicUsize,
 }
 
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum MouseHold {
+    #[default]
+    Off,
+    Starting,
+    Held,
+}
+
 #[derive(Default)]
 struct Home {
     agents: usize,
@@ -499,8 +531,8 @@ struct Home {
     pids: Vec<u32>,
     leaving: Option<Instant>,
     on_loan: bool,
-    /// True while a mouse button is held down via `down left x,y --mouse`.
-    holding_mouse: bool,
+    /// State while a mouse button is being held down via `down left x,y --mouse`.
+    holding_mouse: MouseHold,
     /// The notification panel focus is lent to: the loan ends when it closes, however it closes.
     panel: Option<Hwnd>,
     /// The person's window from the last time agents worked, kept after the keeper goes idle.
@@ -547,12 +579,21 @@ impl Service {
     fn track(&self, hwnd: Hwnd) -> Arc<Tracked> {
         win::note_worked_in(hwnd);
         let mut windows = self.windows.lock().unwrap();
-        let identity = win::identity(hwnd);
-        if let Some(found) = windows.1.get(&hwnd).filter(|found| found.identity == identity) {
+        if let Some(found) = windows.1.get(&hwnd).filter(|found| found.same_window()) {
             return found.clone();
         }
+        let identity = win::identity(hwnd);
+        let content_identity = win::content_identity(hwnd);
         windows.0 += 1;
-        let tracked = Arc::new(Tracked { id: windows.0, hwnd, identity, view: Mutex::new(View::default()), pointer: Mutex::new(()), drawers: AtomicUsize::new(0) });
+        let tracked = Arc::new(Tracked {
+            id: windows.0,
+            hwnd,
+            identity,
+            content_identity: Mutex::new(content_identity),
+            view: Mutex::new(View::default()),
+            pointer: Mutex::new(()),
+            drawers: AtomicUsize::new(0),
+        });
         windows.1.insert(hwnd, tracked.clone());
         tracked
     }
@@ -568,14 +609,14 @@ impl Service {
     fn pick(&self, who: &str, spec: Option<&str>) -> Result<Arc<Tracked>, String> {
         let Some(spec) = spec else {
             let current = self.agents.lock().unwrap().get(who).and_then(|a| a.current).ok_or(NO_WINDOW)?;
-            let reused = self.windows.lock().unwrap().1.get(&current).is_some_and(|known| known.identity != win::identity(current));
+            let reused = self.windows.lock().unwrap().1.get(&current).is_some_and(|known| !known.same_window());
             if !win::exists(current) || reused {
                 return Err("that window closed: run deskcrew windows".into());
             }
             return Ok(self.track(current));
         };
         if let Some(id) = spec.strip_prefix('w').and_then(|n| n.parse::<u32>().ok()) {
-            let found = self.by_id(id).filter(|t| win::exists(t.hwnd) && t.identity == win::identity(t.hwnd)).ok_or(format!("no window {spec}: run deskcrew windows"))?;
+            let found = self.by_id(id).filter(|t| win::exists(t.hwnd) && t.same_window()).ok_or(format!("no window {spec}: run deskcrew windows"))?;
             self.set_current(who, found.hwnd);
             return Ok(found);
         }
@@ -748,10 +789,10 @@ impl Service {
                     home.on_loan = false;
                     home.panel = None;
                 }
-                if home.holding_mouse && !real::holding_button() {
-                    home.holding_mouse = false;
+                if home.holding_mouse == MouseHold::Held && !real::holding_button() {
+                    home.holding_mouse = MouseHold::Off;
                 }
-                let paused = home.on_loan || home.holding_mouse;
+                let paused = home.on_loan || home.holding_mouse != MouseHold::Off;
                 let held = home.guard.clone().filter(|_| !paused).map(|guard| (guard, home.pids.clone()));
                 if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
                     home.guard = None;
@@ -778,7 +819,7 @@ impl Service {
                 }
                 None if {
                     let home = self.home.lock().unwrap();
-                    home.on_loan || home.holding_mouse
+                    home.on_loan || home.holding_mouse != MouseHold::Off
                 } =>
                 {
                     thread::sleep(FOCUS_WATCH)
@@ -922,7 +963,11 @@ impl Service {
         }
         let _turn = self.real_input.lock().unwrap();
         // The focus keeper stands aside while focus is on loan, or it would take it straight back.
-        self.home.lock().unwrap().on_loan = true;
+        {
+            let mut home = self.home.lock().unwrap();
+            home.on_loan = true;
+            home.panel = None;
+        }
         let result = (|| {
             let _borrowed = real::borrow(tracked.hwnd, &view.pids, loan)?;
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::owns_point(&family, *x, *y)) {
@@ -967,6 +1012,9 @@ impl Service {
                 refuse_risky(chord, spec, flags)?;
             }
             return self.front(tracked, view, &[(x, y)], Loan::Mouse, || {
+                if let (Some(chord), Some(spec)) = (&held, &flags.with) {
+                    refuse_risky(chord, spec, flags)?;
+                }
                 if let Some(chord) = &held {
                     real::set_keys(chord, true);
                 }
@@ -985,6 +1033,7 @@ impl Service {
                 return act::post_press(tracked.hwnd, x, y, flags.button(), times, chord.mouse_keys(), &chord.modifiers());
             }
             return self.with_front(tracked, view, &[(x, y)], || {
+                refuse_risky(&chord, with, flags)?;
                 real::set_keys(&chord, true);
                 // Posted messages overtake real input, so the app has to see the modifier first.
                 thread::sleep(MODIFIER_SETTLE);
@@ -1239,7 +1288,7 @@ impl Service {
             // window really is in front.
             let _turn = self.real_input.lock().unwrap();
             real::wait_for_quiet();
-            self.home.lock().unwrap().holding_mouse = true;
+            self.home.lock().unwrap().holding_mouse = MouseHold::Starting;
             let result = (|| {
                 if !win::bring_forward(tracked.hwnd) {
                     return Err("Windows would not bring that window forward".into());
@@ -1252,8 +1301,9 @@ impl Service {
                 real::hold_button(who, x, y, button)?;
                 Ok("held: run up within 30 s".into())
             })();
-            if result.is_err() && !real::holding_button() {
-                self.home.lock().unwrap().holding_mouse = false;
+            {
+                let mut home = self.home.lock().unwrap();
+                home.holding_mouse = if result.is_ok() || real::holding_button() { MouseHold::Held } else { MouseHold::Off };
             }
             return result;
         }
@@ -1262,7 +1312,10 @@ impl Service {
         }
         let chord = real::chord(what)?;
         refuse_risky(&chord, what, flags)?;
-        self.with_front(tracked, view, &[], || real::hold_keys(who, &chord))??;
+        self.with_front(tracked, view, &[], || {
+            refuse_risky(&chord, what, flags)?;
+            real::hold_keys(who, &chord)
+        })??;
         Ok("held, and it reaches whatever has focus: run up within 30 s".into())
     }
 
@@ -1286,7 +1339,13 @@ impl Service {
         let chord = real::chord("win+n")?;
         if words.first().is_some_and(|word| word == "close") {
             let _turn = self.real_input.lock().unwrap();
-            real::press_chord(&chord);
+            let open = {
+                let home = self.home.lock().unwrap();
+                home.panel.is_some() || home.on_loan
+            };
+            if open {
+                real::press_chord(&chord);
+            }
             let mut home = self.home.lock().unwrap();
             home.on_loan = false;
             home.panel = None;
@@ -1295,7 +1354,11 @@ impl Service {
         // The panel closes the moment it loses focus, so the focus keeper stands aside until close.
         let front = {
             let _turn = self.real_input.lock().unwrap();
-            self.home.lock().unwrap().on_loan = true;
+            {
+                let mut home = self.home.lock().unwrap();
+                home.on_loan = true;
+                home.panel = None;
+            }
             let before = win::foreground();
             real::press_chord(&chord);
             let until = Instant::now() + NOTIFICATIONS_OPEN;
@@ -1304,10 +1367,14 @@ impl Service {
             }
             let front = win::foreground();
             if front == 0 || front == before || act::is_shell_window(front) {
-                self.home.lock().unwrap().on_loan = false;
+                let mut home = self.home.lock().unwrap();
+                home.on_loan = false;
+                home.panel = None;
                 return Err("the notification panel did not open".into());
             }
-            self.home.lock().unwrap().panel = Some(front);
+            let mut home = self.home.lock().unwrap();
+            home.on_loan = true;
+            home.panel = Some(front);
             front
         };
         thread::sleep(NOTIFICATIONS_SETTLE);
@@ -1652,8 +1719,15 @@ impl Service {
         let hold = flags.hold.map(|ms| Duration::from_millis(ms.min(HOLD_MOST_MS)));
         let keyboard = || -> Reply {
             match hold {
-                Some(hold) => self.with_front(tracked, view, &[], || real::hold_chord(&chord, hold))?,
-                None => self.with_front(tracked, view, &[], || real::check_front(tracked.hwnd, &view.surfaces).map(|_| real::press_chord(&chord)))??,
+                Some(hold) => self.with_front(tracked, view, &[], || {
+                    refuse_risky(&chord, spec, flags)?;
+                    real::hold_chord(&chord, hold);
+                    Ok::<(), String>(())
+                })??,
+                None => self.with_front(tracked, view, &[], || {
+                    refuse_risky(&chord, spec, flags)?;
+                    real::check_front(tracked.hwnd, &view.surfaces).map(|_| real::press_chord(&chord))
+                })??,
             }
             Ok("keyboard".into())
         };
@@ -2547,6 +2621,9 @@ impl Service {
         if stopped_command(verb, args, &flags) && self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
+        if !(verb == "do" && flags.dry) && matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
+            return Err("declared risky: ask the person, then add --force".into());
+        }
         match verb {
             "windows" => self.windows_list(who, args.first()),
             "see" => self.see(who, &flags, args),
@@ -2573,8 +2650,9 @@ impl Service {
             "cursor" => self.borrow.set(args.first().map(String::as_str)),
             "up" => {
                 let count = real::release_of(who);
-                if !real::holding_button() {
-                    self.home.lock().unwrap().holding_mouse = false;
+                let mut home = self.home.lock().unwrap();
+                if home.holding_mouse == MouseHold::Held && !real::holding_button() {
+                    home.holding_mouse = MouseHold::Off;
                 }
                 Ok(format!("let go of {count}"))
             }
@@ -2977,6 +3055,11 @@ mod tests {
         let literal_force = parse(&["key".into(), "win+e".into(), "--".into(), "--force".into()]);
         assert!(!literal_force.0.force);
         assert_eq!(literal_force.1, vec!["key", "win+e", "--force"]);
+        let upper_risk = parse(&["click".into(), "Delete".into(), "--risk".into(), "HIGH".into()]);
+        assert!(upper_risk.0.flag_error.is_none());
+        assert_eq!(upper_risk.0.risk.as_deref(), Some("high"));
+        let bad_risk = parse(&["click".into(), "Delete".into(), "--risk".into(), "critical".into()]);
+        assert!(bad_risk.0.flag_error.as_deref().is_some_and(|e| e.contains("--risk")));
     }
 
     #[test]

@@ -604,11 +604,16 @@ fn button_by(by: By, number: u8, down: bool) -> Result<(), String> {
     }
 }
 
-/// Whether the window, rather than another one on top of it, shows at this point of the screen,
-/// so a press there reaches it without bringing it forward.
+/// Whether the window (or a popup/dialog belonging to it), rather than another app on top of it,
+/// shows at this point of the screen, so a press there reaches it without bringing it forward.
 pub fn shows_at(window: u32, px: i32, py: i32) -> bool {
+    let (Ok(px16), Ok(py16)) = (i16::try_from(px), i16::try_from(py)) else {
+        return false;
+    };
     let Ok(x) = x() else { return false };
-    let Some(top) = x.conn.translate_coordinates(x.root, x.root, px as i16, py as i16).ok().and_then(|c| c.reply().ok()).map(|r| r.child) else { return false };
+    let Some(top) = x.conn.translate_coordinates(x.root, x.root, px16, py16).ok().and_then(|c| c.reply().ok()).map(|r| r.child) else {
+        return false;
+    };
     if top == x11rb::NONE {
         return false;
     }
@@ -620,7 +625,28 @@ pub fn shows_at(window: u32, px: i32, py: i32) -> bool {
         }
         match x.conn.query_tree(at).ok().and_then(|c| c.reply().ok()) {
             Some(tree) if tree.parent != x.root && tree.parent != x11rb::NONE => at = tree.parent,
-            _ => return false,
+            _ => break,
+        }
+    }
+    // A dialog transient for this window, or an override-redirect menu/dropdown of the same app.
+    let mut owner = top;
+    for _ in 0..8 {
+        let Some(&transient) = x.numbers(owner, "WM_TRANSIENT_FOR", AtomEnum::WINDOW.into()).first() else {
+            break;
+        };
+        if transient == window {
+            return true;
+        }
+        if transient == x11rb::NONE || transient == owner {
+            break;
+        }
+        owner = transient;
+    }
+    if x.conn.get_window_attributes(top).ok().and_then(|c| c.reply().ok()).is_some_and(|a| a.override_redirect) {
+        let win_pid = x.numbers(window, "_NET_WM_PID", AtomEnum::CARDINAL.into()).first().copied().unwrap_or(0);
+        let top_pid = x.numbers(top, "_NET_WM_PID", AtomEnum::CARDINAL.into()).first().copied().unwrap_or(0);
+        if win_pid > 0 && win_pid == top_pid {
+            return true;
         }
     }
     false

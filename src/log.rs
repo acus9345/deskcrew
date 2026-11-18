@@ -112,9 +112,18 @@ pub fn hidden(words: &[String]) -> String {
     // Positions of the words that are not flags or flag values.
     let mut plain = Vec::new();
     let mut skip = false;
+    let mut literal = false;
     for (at, word) in words.iter().enumerate() {
+        if literal {
+            plain.push(at);
+            continue;
+        }
         if skip {
             skip = false;
+            continue;
+        }
+        if word == "--" {
+            literal = true;
             continue;
         }
         if flags_with_values.contains(&word.as_str()) {
@@ -234,6 +243,8 @@ mod tests {
     fn do_scripts_keep_their_steps_but_not_their_text() {
         let script = "set Name 'Ada Lovelace'; check 'Gift wrap'; type e3 \"pw\"; click Submit";
         assert_eq!(hidden(&words(&["do", script, "-w", "Form"])), "do \"set Name <12 characters>; check 'Gift wrap'; type e3 <2 characters>; click Submit\" -w Form");
+        assert_eq!(hidden(&words(&["type", "e3", "--", "--my-secret"])), "type e3 -- <11 characters>");
+        assert_eq!(hidden(&words(&["set", "e3", "--", "-p"])), "set e3 -- <2 characters>");
     }
 
     #[test]
