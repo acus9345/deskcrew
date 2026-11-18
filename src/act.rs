@@ -511,12 +511,12 @@ pub fn set(node: &Node, root: Hwnd, value: &str) -> Result<String, String> {
         return set_window_text(node.native, value).map(|_| "message".into());
     }
     if node.can.range
-        && let Ok(number) = value.parse::<f64>() {
-            return node.element.set_range(number).map(|_| "range".into());
-        }
+        && let Ok(number) = value.parse::<f64>()
+    {
+        return behind(root, || node.element.set_range(number)).map(|_| "range".into());
+    }
     if node.can.value && !node.element.value_read_only() {
-        let _lock = win::draws_itself(root).then(win::ForegroundLock::take);
-        return node.element.set_value(value).map(|_| "value".into());
+        return behind(root, || node.element.set_value(value)).map(|_| "value".into());
     }
     Err(NEEDS_REAL.into())
 }
@@ -880,7 +880,8 @@ pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
         SetFocus(std::ptr::null_mut());
         AttachThreadInput(mine, theirs, 0);
         // Should the app have come forward all the same, the person gets their window back.
-        if front != 0 && win::foreground() != front && win::pid(win::foreground()) == win::pid(root) && !win::bring_forward(front) {
+        let now = win::foreground();
+        if front != 0 && now != front && win::same_app(now, root) && !win::bring_forward(front) {
             win::stop_flashing(front);
         }
         if !focused {

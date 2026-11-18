@@ -47,7 +47,19 @@ const QUIET_TIMEOUT: Duration = Duration::from_secs(3);
 /// Marks our own mouse events, so the shield against hidden ones lets them through.
 pub const OURS: usize = 0x6465_736B;
 
-const RISKY: [&str; 9] = ["alt+f4", "win+l", "win+r", "win+d", "win+x", "alt+tab", "ctrl+shift+esc", "win+e", "win+m"];
+/// Shortcuts that end a session or reach the shell: refused unless asked for with --force.
+/// Defined as virtual keys rather than layout-dependent strings so non-Latin layouts cannot bypass them.
+const RISKY: [&[VIRTUAL_KEY]; 9] = [
+    &[VK_MENU, VK_F1 + 3],              // alt+f4
+    &[VK_LWIN, b'L' as u16],            // win+l
+    &[VK_LWIN, b'R' as u16],            // win+r
+    &[VK_LWIN, b'D' as u16],            // win+d
+    &[VK_LWIN, b'X' as u16],            // win+x
+    &[VK_MENU, VK_TAB],                 // alt+tab
+    &[VK_CONTROL, VK_SHIFT, VK_ESCAPE], // ctrl+shift+esc
+    &[VK_LWIN, b'E' as u16],            // win+e
+    &[VK_LWIN, b'M' as u16],            // win+m
+];
 
 fn send(inputs: &[INPUT]) {
     unsafe { SendInput(inputs.len() as u32, inputs.as_ptr(), size_of::<INPUT>() as i32) };
@@ -239,6 +251,10 @@ pub fn hold_button(who: &str, x: i32, y: i32, button: Button) -> Result<(), Stri
     Ok(())
 }
 
+pub fn holding_button() -> bool {
+    HELD.lock().unwrap().iter().any(|(_, held)| matches!(held, Held::Mouse(_)))
+}
+
 /// Let go of what one agent holds.
 pub fn release_of(who: &str) -> usize {
     release(|holder| holder == who)
@@ -328,6 +344,12 @@ fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
                 }
             let mut chars = lower.chars();
             let (c, None) = (chars.next()?, chars.next()) else { return None };
+            if c.is_ascii_lowercase() {
+                return Some((c.to_ascii_uppercase() as u16, false));
+            }
+            if c.is_ascii_digit() {
+                return Some((c as u16, false));
+            }
             let Ok(unit) = u16::try_from(u32::from(c)) else { return None };
             let scan = unsafe { VkKeyScanW(unit) };
             if scan == -1 {
@@ -413,15 +435,25 @@ pub fn is_risky(spec: &str) -> bool {
     chord(spec).is_ok_and(|parsed| is_risky_chord(&parsed))
 }
 
+fn normalize_vk(vk: VIRTUAL_KEY) -> VIRTUAL_KEY {
+    match vk {
+        VK_LWIN | VK_RWIN => VK_LWIN,
+        VK_CONTROL | VK_LCONTROL | VK_RCONTROL => VK_CONTROL,
+        VK_SHIFT | VK_LSHIFT | VK_RSHIFT => VK_SHIFT,
+        VK_MENU | VK_LMENU | VK_RMENU => VK_MENU,
+        other => other,
+    }
+}
+
 /// Whether pressing this chord, with any keys agents already hold down, makes a risky shortcut.
 pub fn is_risky_chord(pressed: &Chord) -> bool {
-    let mut down: Vec<VIRTUAL_KEY> = pressed.keys.iter().map(|(vk, _)| *vk).collect();
+    let mut down: Vec<VIRTUAL_KEY> = pressed.keys.iter().map(|(vk, _)| normalize_vk(*vk)).collect();
     for (_, held) in HELD.lock().unwrap().iter() {
         if let Held::Keys(keys) = held {
-            down.extend(keys.iter().map(|(vk, _)| *vk));
+            down.extend(keys.iter().map(|(vk, _)| normalize_vk(*vk)));
         }
     }
-    RISKY.iter().any(|risky| chord(risky).is_ok_and(|risky| risky.keys.iter().all(|(vk, _)| down.contains(vk))))
+    RISKY.iter().any(|risky| risky.iter().all(|vk| down.contains(vk)))
 }
 
 /// Real keys go to whatever has focus, so they are only sent while the target still has it.
@@ -564,6 +596,10 @@ mod tests {
         assert!(is_risky("super+r"));
         assert!(is_risky("win+m"));
         assert!(is_risky("win+shift+m"));
+        let rwin_l = Chord { keys: vec![(VK_RWIN, true), (b'L' as u16, false)], modified: true };
+        assert!(is_risky_chord(&rwin_l));
+        let lmenu_f4 = Chord { keys: vec![(VK_LMENU, false), (VK_F1 + 3, false)], modified: true };
+        assert!(is_risky_chord(&lmenu_f4));
     }
 
     #[test]

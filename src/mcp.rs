@@ -103,14 +103,14 @@ fn words(tool: &str, a: &Value) -> Result<Vec<String>, String> {
             if let Some(word) = s("find") {
                 out.extend(["--find".into(), reject_agent(&word)?]);
             }
-            out.push(need("window")?);
+            out.extend(["--".into(), need("window")?]);
         }
         "do" => {
             out.extend(["do".into(), "-w".into(), reject_agent(&need("window")?)?]);
             if on("dry") {
                 out.push("--dry".into());
             }
-            out.push(need("steps")?);
+            out.extend(["--".into(), need("steps")?]);
         }
         "shot" => {
             out.push("shot".into());
@@ -127,7 +127,7 @@ fn words(tool: &str, a: &Value) -> Result<Vec<String>, String> {
                 out.push("--rulers".into());
             }
             if let Some(w) = s("window") {
-                out.push(w);
+                out.extend(["--".into(), w]);
             }
         }
         "deskcrew" => {
@@ -285,13 +285,15 @@ mod tests {
 
     #[test]
     fn tools_become_command_words() {
-        assert_eq!(words("do", &json!({ "steps": "click OK", "window": "Calc" })).unwrap(), ["do", "-w", "Calc", "click OK"]);
-        assert_eq!(words("see", &json!({ "window": "Calc", "full": true })).unwrap(), ["see", "-f", "Calc"]);
-        assert_eq!(words("see", &json!({ "window": "--agent", "full": true })).unwrap(), ["see", "-f", "--agent"]);
-        assert_eq!(words("do", &json!({ "steps": "--agent", "window": "Calc" })).unwrap(), ["do", "-w", "Calc", "--agent"]);
+        assert_eq!(words("do", &json!({ "steps": "click OK", "window": "Calc" })).unwrap(), ["do", "-w", "Calc", "--", "click OK"]);
+        assert_eq!(words("see", &json!({ "window": "Calc", "full": true })).unwrap(), ["see", "-f", "--", "Calc"]);
+        assert_eq!(words("see", &json!({ "window": "--agent", "full": true })).unwrap(), ["see", "-f", "--", "--agent"]);
+        assert_eq!(words("see", &json!({ "window": "--mouse" })).unwrap(), ["see", "--", "--mouse"]);
+        assert_eq!(words("do", &json!({ "steps": "--agent", "window": "Calc" })).unwrap(), ["do", "-w", "Calc", "--", "--agent"]);
         assert!(words("see", &json!({ "window": "Calc", "find": "--agent" })).is_err());
         assert!(words("do", &json!({ "steps": "click OK", "window": "--agent" })).is_err());
         assert_eq!(words("shot", &json!({ "screen": true })).unwrap(), ["shot", "--screen"]);
+        assert_eq!(words("shot", &json!({ "window": "--mouse" })).unwrap(), ["shot", "--", "--mouse"]);
         assert!(words("deskcrew", &json!({ "args": ["service"] })).is_err());
         assert!(words("deskcrew", &json!({ "args": ["do", "click 1,1 --mouse", "--agent", "Claude Code"] })).is_err());
         assert_eq!(words("deskcrew", &json!({ "args": ["type", "e3", "--", "--agent"] })).unwrap(), ["type", "e3", "--", "--agent"]);

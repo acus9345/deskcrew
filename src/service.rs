@@ -499,6 +499,8 @@ struct Home {
     pids: Vec<u32>,
     leaving: Option<Instant>,
     on_loan: bool,
+    /// True while a mouse button is held down via `down left x,y --mouse`.
+    holding_mouse: bool,
     /// The notification panel focus is lent to: the loan ends when it closes, however it closes.
     panel: Option<Hwnd>,
     /// The person's window from the last time agents worked, kept after the keeper goes idle.
@@ -746,7 +748,11 @@ impl Service {
                     home.on_loan = false;
                     home.panel = None;
                 }
-                let held = home.guard.clone().filter(|_| !home.on_loan).map(|guard| (guard, home.pids.clone()));
+                if home.holding_mouse && !real::holding_button() {
+                    home.holding_mouse = false;
+                }
+                let paused = home.on_loan || home.holding_mouse;
+                let held = home.guard.clone().filter(|_| !paused).map(|guard| (guard, home.pids.clone()));
                 if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
                     home.guard = None;
                     home.pids.clear();
@@ -770,7 +776,13 @@ impl Service {
                     }
                     thread::sleep(FOCUS_WATCH);
                 }
-                None if self.home.lock().unwrap().on_loan => thread::sleep(FOCUS_WATCH),
+                None if {
+                    let home = self.home.lock().unwrap();
+                    home.on_loan || home.holding_mouse
+                } =>
+                {
+                    thread::sleep(FOCUS_WATCH)
+                }
                 None => thread::park(),
             }
         }
@@ -1219,20 +1231,31 @@ impl Service {
             if !win::inside(tracked.hwnd, x, y) {
                 return Err("refused: that point is not on the window".into());
             }
+            if !win::on_screen(x, y) {
+                return Err("refused: that point is off screen".into());
+            }
             self.cursor_on(who, flags, (x, y, 0, 0));
             // The real mouse is shared: agents take turns with it, and it presses only where this
             // window really is in front.
             let _turn = self.real_input.lock().unwrap();
-            if !win::bring_forward(tracked.hwnd) {
-                return Err("Windows would not bring that window forward".into());
+            real::wait_for_quiet();
+            self.home.lock().unwrap().holding_mouse = true;
+            let result = (|| {
+                if !win::bring_forward(tracked.hwnd) {
+                    return Err("Windows would not bring that window forward".into());
+                }
+                let mut family = view.surfaces.clone();
+                family.push(tracked.hwnd);
+                if !win::owns_point(&family, x, y) {
+                    return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
+                }
+                real::hold_button(who, x, y, button)?;
+                Ok("held: run up within 30 s".into())
+            })();
+            if result.is_err() && !real::holding_button() {
+                self.home.lock().unwrap().holding_mouse = false;
             }
-            let mut family = view.surfaces.clone();
-            family.push(tracked.hwnd);
-            if !win::owns_point(&family, x, y) {
-                return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
-            }
-            real::hold_button(who, x, y, button)?;
-            return Ok("held: run up within 30 s".into());
+            return result;
         }
         if !flags.real {
             return Err("holding a key needs --real".into());
@@ -1262,6 +1285,7 @@ impl Service {
     fn notifications(&self, who: &str, words: &[String]) -> Reply {
         let chord = real::chord("win+n")?;
         if words.first().is_some_and(|word| word == "close") {
+            let _turn = self.real_input.lock().unwrap();
             real::press_chord(&chord);
             let mut home = self.home.lock().unwrap();
             home.on_loan = false;
@@ -1269,19 +1293,23 @@ impl Service {
             return Ok("ok".into());
         }
         // The panel closes the moment it loses focus, so the focus keeper stands aside until close.
-        self.home.lock().unwrap().on_loan = true;
-        let before = win::foreground();
-        real::press_chord(&chord);
-        let until = Instant::now() + NOTIFICATIONS_OPEN;
-        while win::foreground() == before && Instant::now() < until {
-            thread::sleep(FIELD_SETTLE);
-        }
-        let front = win::foreground();
-        if front == before {
-            self.home.lock().unwrap().on_loan = false;
-            return Err("the notification panel did not open".into());
-        }
-        self.home.lock().unwrap().panel = Some(front);
+        let front = {
+            let _turn = self.real_input.lock().unwrap();
+            self.home.lock().unwrap().on_loan = true;
+            let before = win::foreground();
+            real::press_chord(&chord);
+            let until = Instant::now() + NOTIFICATIONS_OPEN;
+            while win::foreground() == before && Instant::now() < until {
+                thread::sleep(FIELD_SETTLE);
+            }
+            let front = win::foreground();
+            if front == 0 || front == before || act::is_shell_window(front) {
+                self.home.lock().unwrap().on_loan = false;
+                return Err("the notification panel did not open".into());
+            }
+            self.home.lock().unwrap().panel = Some(front);
+            front
+        };
         thread::sleep(NOTIFICATIONS_SETTLE);
         let tracked = self.track(front);
         self.set_current(who, front);
@@ -2519,9 +2547,6 @@ impl Service {
         if stopped_command(verb, args, &flags) && self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
-        if flags.mouse {
-            self.borrow.allow(who, caller.resolve())?;
-        }
         match verb {
             "windows" => self.windows_list(who, args.first()),
             "see" => self.see(who, &flags, args),
@@ -2546,7 +2571,13 @@ impl Service {
             },
             "is" => self.is(who, &flags, args),
             "cursor" => self.borrow.set(args.first().map(String::as_str)),
-            "up" => Ok(format!("let go of {}", real::release_of(who))),
+            "up" => {
+                let count = real::release_of(who);
+                if !real::holding_button() {
+                    self.home.lock().unwrap().holding_mouse = false;
+                }
+                Ok(format!("let go of {count}"))
+            }
             "notifications" => self.notifications(who, args),
             "apps" => {
                 let list = self.windows_list(who, None)?;
@@ -2595,13 +2626,16 @@ impl Service {
                     let step_verb = step.words.first().map_or("", String::as_str);
                     reject_step_flags(step_verb, &flags, Some(&step.flags))?;
                 }
-                if !flags.mouse && steps.iter().any(|step| step.flags.mouse) {
+                if flags.mouse || steps.iter().any(|step| step.flags.mouse) {
                     self.borrow.allow(who, caller.resolve())?;
                 }
                 steps.extend(expected(&flags));
                 self.act(who, &flags, &steps)
             }
             "click" if !args.is_empty() => {
+                if flags.mouse {
+                    self.borrow.allow(who, caller.resolve())?;
+                }
                 let mut steps: Vec<Step> = args.iter().map(|word| Step { flags: Flags::default(), words: vec!["click".to_string(), word.clone()] }).collect();
                 steps.extend(expected(&flags));
                 self.act(who, &flags, &steps)
@@ -2633,6 +2667,28 @@ impl Service {
                 self.act(who, &flags, &steps)
             }
             "set" | "type" | "key" | "select" | "scroll" | "show" | "drag" | "draw" | "wait" | "click" | "hover" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "clear" | "down" | "pick-file" => {
+                if flags.mouse
+                    && matches!(
+                        verb,
+                        "click"
+                            | "hover"
+                            | "set"
+                            | "type"
+                            | "clear"
+                            | "toggle"
+                            | "check"
+                            | "uncheck"
+                            | "expand"
+                            | "collapse"
+                            | "down"
+                            | "scroll"
+                            | "drag"
+                            | "draw"
+                            | "pick-file"
+                    )
+                {
+                    self.borrow.allow(who, caller.resolve())?;
+                }
                 let mut steps = vec![Step { flags: Flags::default(), words: rest.clone() }];
                 steps.extend(expected(&flags));
                 self.act(who, &flags, &steps)
@@ -2779,6 +2835,7 @@ fn changes_things(verb: &str, args: &[String]) -> bool {
 fn stopped_command(verb: &str, args: &[String], flags: &Flags) -> bool {
     changes_things(verb, args)
         || (verb == "do" && !flags.dry)
+        || (verb == "cursor" && args.first().is_some_and(|w| matches!(w.as_str(), "ask" | "session" | "always")))
         || matches!(
             verb,
             "launch"
@@ -2943,5 +3000,10 @@ mod tests {
         assert!(stopped_command("do", &[], &flags));
         assert!(!stopped_command("do", &[], &Flags { dry: true, ..Flags::default() }));
         assert!(!stopped_command("see", &[], &flags));
+        assert!(stopped_command("cursor", &["ask".into()], &flags));
+        assert!(stopped_command("cursor", &["session".into()], &flags));
+        assert!(stopped_command("cursor", &["always".into()], &flags));
+        assert!(!stopped_command("cursor", &["off".into()], &flags));
+        assert!(!stopped_command("cursor", &[], &flags));
     }
 }

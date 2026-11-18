@@ -603,7 +603,11 @@ pub fn scroll(obj: &Obj, vertical: bool, notches: i32) -> Result<(), String> {
     let (Some(now), Some(low), Some(high)) = (value_of(&bar, "CurrentValue"), value_of(&bar, "MinimumValue"), value_of(&bar, "MaximumValue")) else {
         return Err("that scroll bar does not say where it is".into());
     };
-    let step = ((high - low) / 10.0).max(value_of(&bar, "MinimumIncrement").unwrap_or(0.0));
+    if !now.is_finite() || !low.is_finite() || !high.is_finite() || low > high {
+        return Err("that scroll bar reported invalid bounds".into());
+    }
+    let inc = value_of(&bar, "MinimumIncrement").filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
+    let step = ((high - low) / 10.0).max(inc);
     let wanted = (now + step * notches as f64).clamp(low, high);
     set_value(&bar, wanted)?;
     if (value_of(&bar, "CurrentValue").unwrap_or(now) - now).abs() < f64::EPSILON && wanted != now {

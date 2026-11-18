@@ -520,7 +520,7 @@ fn animations(hwnd: Hwnd, on: bool) {
     unsafe { DwmSetWindowAttribute(raw(hwnd), DWMWA_TRANSITIONS_FORCEDISABLED as u32, &off as *const i32 as *const _, size_of::<i32>() as u32) };
 }
 
-fn same_app(now: Hwnd, target: Hwnd) -> bool {
+pub fn same_app(now: Hwnd, target: Hwnd) -> bool {
     if now == target {
         return true;
     }
@@ -545,6 +545,10 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
     let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
+    let was_min = was_minimized(hwnd);
+    if was_min {
+        FILLED.lock().unwrap().remove(&hwnd);
+    }
     commit_shown_inner(hwnd);
     if unsafe { IsZoomed(raw(hwnd)) } != 0 {
         return Ok(true);
@@ -583,7 +587,7 @@ static FILLED: std::sync::Mutex<std::collections::BTreeMap<Hwnd, RECT>> = std::s
 
 fn restore_behind_inner(hwnd: Hwnd) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
-    let was_iconic = unsafe { IsIconic(raw(hwnd)) != 0 } && !OFF_SCREEN.lock().unwrap().contains_key(&hwnd);
+    let was_min = was_minimized(hwnd);
     commit_shown_inner(hwnd);
     if unsafe { IsIconic(raw(hwnd)) } != 0 {
         show(hwnd, SW_SHOWNOACTIVATE)?;
@@ -592,7 +596,7 @@ fn restore_behind_inner(hwnd: Hwnd) -> Result<(), String> {
         show(hwnd, SW_SHOWNOACTIVATE)?;
     }
     let before = FILLED.lock().unwrap().remove(&hwnd);
-    if !was_iconic
+    if !was_min
         && let Some(before) = before
         && unsafe { IsIconic(raw(hwnd)) } == 0
         && unsafe { IsZoomed(raw(hwnd)) } == 0
@@ -640,8 +644,8 @@ pub fn place_min(hwnd: Hwnd, theirs: bool) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{SW_MINIMIZE, SW_SHOWMINNOACTIVE};
     let lock = window_lock(hwnd);
     let _guard = lock.lock().unwrap();
+    FILLED.lock().unwrap().remove(&hwnd);
     if !was_minimized(hwnd) {
-        FILLED.lock().unwrap().remove(&hwnd);
         show(hwnd, if theirs { SW_MINIMIZE } else { SW_SHOWMINNOACTIVE })?;
     }
     Ok(())
@@ -762,9 +766,9 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
     let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
-    let was_iconic_on_screen = unsafe { IsIconic(raw(hwnd)) != 0 } && !OFF_SCREEN.lock().unwrap().contains_key(&hwnd);
+    let was_min = was_minimized(hwnd);
     let restored_maximized = commit_shown_inner(hwnd);
-    if was_iconic_on_screen {
+    if was_min {
         FILLED.lock().unwrap().remove(&hwnd);
     }
     if unsafe { IsIconic(raw(hwnd)) } != 0 {
@@ -813,9 +817,7 @@ pub fn minimize_or_restore(hwnd: Hwnd) -> Result<(), String> {
     let guard = lock.lock().unwrap();
     let _fg_lock = (!theirs).then(ForegroundLock::take);
     if was_minimized(hwnd) {
-        if minimized(hwnd) {
-            FILLED.lock().unwrap().remove(&hwnd);
-        }
+        FILLED.lock().unwrap().remove(&hwnd);
         return Ok(());
     }
     if is_zoomed_or_filled(hwnd) {
@@ -934,6 +936,7 @@ fn show_off_screen(hwnd: Hwnd) -> ShownOffScreen {
             SetWindowPos(raw(hwnd), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
         let ready = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
+        FILLED.lock().unwrap().remove(&hwnd);
         let shown = OffScreen { hwnd, placement, _lock: lock, restore_minimized: true, front, ready };
         // Should it come forward all the same, the person gets their window back at once.
         let now = foreground();
@@ -1020,7 +1023,6 @@ pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
                         let now = foreground();
                         if now != front && same_app(now, hwnd) {
                             let removed = OFF_SCREEN.lock().unwrap().remove(&hwnd);
-                            signal.set(false);
                             drop(removed);
                             bring_back = front;
                             false
@@ -1037,6 +1039,7 @@ pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
                     if bring_back != 0 && !bring_forward(bring_back) {
                         stop_flashing(bring_back);
                     }
+                    signal.set(false);
                     return KeptDrawn(None, None);
                 }
                 Some((hwnd, epoch))
@@ -1159,15 +1162,21 @@ pub fn stack_above(layer: Hwnd, root: Hwnd, force: bool) {
             id
         };
         let topmost = |window: HWND| GetWindowLongPtrW(window, GWL_EXSTYLE) as u32 & WS_EX_TOPMOST != 0;
-        let (me, theirs) = (GetCurrentProcessId(), process(root));
+        let me = GetCurrentProcessId();
+        let owners = app_pids(root as Hwnd);
+        let is_theirs = |window: HWND| {
+            let w = window as Hwnd;
+            w == root as Hwnd || owners.contains(&pid(w)) || owners.contains(&content_pid(w))
+        };
         let mut top = root;
         let mut at = GetWindow(root, GW_HWNDPREV);
         while !at.is_null() {
-            let popup = GetWindow(at, GW_OWNER) == root || (process(at) == theirs && GetWindowLongPtrW(at, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0);
+            let theirs = is_theirs(at);
+            let popup = GetWindow(at, GW_OWNER) == root || (theirs && GetWindowLongPtrW(at, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW != 0);
             let shown = IsWindowVisible(at) != 0;
             if popup && shown {
                 top = at;
-            } else if shown && process(at) != me && process(at) != theirs {
+            } else if shown && process(at) != me && !theirs {
                 // Someone else's window covers this one: a popup above that, such as a tooltip
                 // kept on top, would lift the cursor over the person's window too.
                 break;
@@ -1198,7 +1207,7 @@ pub fn identity(hwnd: Hwnd) -> (u32, u64) {
         Foundation::FILETIME,
         System::Threading::{GetProcessTimes, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION},
     };
-    let owner = pid(hwnd);
+    let owner = content_pid(hwnd);
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, owner);
         if process.is_null() {

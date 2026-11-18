@@ -8,7 +8,7 @@ use std::{
     ptr::null,
     sync::{
         Mutex, OnceLock,
-        atomic::{AtomicI32, AtomicU64, Ordering},
+        atomic::{AtomicI32, AtomicU32, AtomicU64, AtomicUsize, Ordering},
     },
     thread,
 };
@@ -32,6 +32,8 @@ use windows_sys::Win32::{
 const ANSWER_MS: u32 = 60_000;
 /// How recent the person's own input must be for a button press on the prompt to count.
 const PERSON_CLICK_MS: u32 = 1_000;
+/// Ignore clicks during the first moment after showing so an in-flight click underneath cannot answer.
+const PROMPT_GRACE_MS: u32 = 250;
 const FIRST_BUTTON: i32 = 100;
 const EVERY_AGENT: &str = "*";
 const PROGRAM_PREFIX: &str = "always program\t";
@@ -73,9 +75,53 @@ const ROOTS: [&str; 23] = [
 
 static ANSWER: AtomicI32 = AtomicI32::new(-1);
 static BUTTON_COUNT: AtomicI32 = AtomicI32::new(0);
+static SHOWN_AT: AtomicU32 = AtomicU32::new(0);
+static BUTTON_PROC: AtomicUsize = AtomicUsize::new(0);
+static MOUSE_DOWN_ID: AtomicI32 = AtomicI32::new(-1);
+static MOUSE_UP_ID: AtomicI32 = AtomicI32::new(-1);
+static MOUSE_UP_AT: AtomicU32 = AtomicU32::new(0);
 
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
+}
+
+unsafe extern "system" fn button_proc(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
+    use windows_sys::Win32::{
+        Foundation::POINT,
+        System::SystemInformation::GetTickCount,
+        UI::WindowsAndMessaging::{CallWindowProcW, GetCursorPos, GetDlgCtrlID, WM_LBUTTONDOWN, WM_LBUTTONUP, WindowFromPoint},
+    };
+    unsafe {
+        let on_button = || {
+            let mut at: POINT = std::mem::zeroed();
+            GetCursorPos(&mut at) != 0 && WindowFromPoint(at) == hwnd
+        };
+        match message {
+            WM_LBUTTONDOWN => {
+                let now = GetTickCount();
+                if now.wrapping_sub(SHOWN_AT.load(Ordering::SeqCst)) >= PROMPT_GRACE_MS && on_button() {
+                    MOUSE_DOWN_ID.store(GetDlgCtrlID(hwnd), Ordering::SeqCst);
+                } else {
+                    MOUSE_DOWN_ID.store(-1, Ordering::SeqCst);
+                }
+            }
+            WM_LBUTTONUP => {
+                let id = GetDlgCtrlID(hwnd);
+                if MOUSE_DOWN_ID.swap(-1, Ordering::SeqCst) == id && on_button() {
+                    MOUSE_UP_ID.store(id, Ordering::SeqCst);
+                    MOUSE_UP_AT.store(GetTickCount(), Ordering::SeqCst);
+                }
+            }
+            _ => {}
+        }
+        let prev = BUTTON_PROC.load(Ordering::SeqCst);
+        if prev != 0 {
+            let proc: unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT = std::mem::transmute(prev);
+            CallWindowProcW(Some(proc), hwnd, message, w, l)
+        } else {
+            DefWindowProcW(hwnd, message, w, l)
+        }
+    }
 }
 
 unsafe extern "system" fn answer(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM) -> LRESULT {
@@ -87,7 +133,7 @@ unsafe extern "system" fn answer(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM)
                 let id = (w & 0xFFFF) as i32;
                 let idx = id - FIRST_BUTTON;
                 let count = BUTTON_COUNT.load(Ordering::SeqCst);
-                if code == 0 && idx >= 0 && idx < count && clicked_by_person(hwnd, id) {
+                if code == 0 && idx >= 0 && idx < count && clicked_by_person(hwnd, id, l) {
                     ANSWER.store(idx, Ordering::SeqCst);
                     DestroyWindow(hwnd);
                 }
@@ -106,20 +152,30 @@ unsafe extern "system" fn answer(hwnd: HWND, message: u32, w: WPARAM, l: LPARAM)
     }
 }
 
-/// Whether the real pointer is on the clicked button and the person used the mouse or keyboard
-/// just now: a button press another program posts moves neither.
-fn clicked_by_person(hwnd: HWND, button_id: i32) -> bool {
+/// Whether the real pointer is directly on the clicked button and the person actually pressed and
+/// released it after the prompt appeared: a posted `WM_COMMAND`, `BM_CLICK`, or UIA `Invoke` cannot
+/// pass this check even if the user is typing while the cursor happens to sit over the prompt.
+fn clicked_by_person(hwnd: HWND, button_id: i32, l: LPARAM) -> bool {
     use windows_sys::Win32::{
         Foundation::{POINT, RECT},
         System::SystemInformation::GetTickCount,
         UI::{
             Input::KeyboardAndMouse::{GetLastInputInfo, LASTINPUTINFO},
-            WindowsAndMessaging::{GetCursorPos, GetDlgItem, GetWindowRect},
+            WindowsAndMessaging::{GetCursorPos, GetDlgItem, GetWindowRect, WindowFromPoint},
         },
     };
     unsafe {
         let button = GetDlgItem(hwnd, button_id);
-        if button.is_null() {
+        if button.is_null() || l != button as LPARAM {
+            return false;
+        }
+        let now = GetTickCount();
+        if now.wrapping_sub(SHOWN_AT.load(Ordering::SeqCst)) < PROMPT_GRACE_MS {
+            return false;
+        }
+        let up_id = MOUSE_UP_ID.swap(-1, Ordering::SeqCst);
+        let up_at = MOUSE_UP_AT.load(Ordering::SeqCst);
+        if up_id != button_id || now.wrapping_sub(up_at) >= PERSON_CLICK_MS {
             return false;
         }
         let (mut at, mut rect): (POINT, RECT) = (std::mem::zeroed(), std::mem::zeroed());
@@ -128,7 +184,7 @@ fn clicked_by_person(hwnd: HWND, button_id: i32) -> bool {
             return false;
         }
         let inside = at.x >= rect.left && at.x < rect.right && at.y >= rect.top && at.y < rect.bottom;
-        inside && GetTickCount().wrapping_sub(last.dwTime) < PERSON_CLICK_MS
+        inside && WindowFromPoint(at) == button && now.wrapping_sub(last.dwTime) < PERSON_CLICK_MS
     }
 }
 
@@ -137,9 +193,16 @@ fn clicked_by_person(hwnd: HWND, button_id: i32) -> bool {
 fn prompt(text: &str, buttons: &[&str]) -> Option<usize> {
     let (text, buttons) = (text.to_string(), buttons.iter().map(|b| b.to_string()).collect::<Vec<_>>());
     let shown = thread::spawn(move || unsafe {
+        use windows_sys::Win32::{
+            System::SystemInformation::GetTickCount,
+            UI::WindowsAndMessaging::{GWLP_WNDPROC, SetWindowLongPtrW},
+        };
         const SS_NOPREFIX: u32 = 0x0080;
         ANSWER.store(-1, Ordering::SeqCst);
         BUTTON_COUNT.store(buttons.len() as i32, Ordering::SeqCst);
+        MOUSE_DOWN_ID.store(-1, Ordering::SeqCst);
+        MOUSE_UP_ID.store(-1, Ordering::SeqCst);
+        MOUSE_UP_AT.store(0, Ordering::SeqCst);
         let module = GetModuleHandleW(null());
         let class = wide("deskcrew-ask");
         let mut kind: WNDCLASSW = std::mem::zeroed();
@@ -173,17 +236,25 @@ fn prompt(text: &str, buttons: &[&str]) -> Option<usize> {
             DeleteObject(font);
             return -1;
         }
-        let child = |class: &str, label: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32| {
+        let child = |class: &str, label: &str, style: u32, x: i32, y: i32, w: i32, h: i32, id: i32| -> HWND {
             let (class, label) = (wide(class), wide(label));
             let made = CreateWindowExW(0, class.as_ptr(), label.as_ptr(), WS_CHILD | WS_VISIBLE | style, x, y, w, h, window, id as usize as _, module, null());
             SendMessageW(made, WM_SETFONT, font as usize, 1);
+            made
         };
         child("STATIC", &text, SS_NOPREFIX, px(16), px(14), width - px(32), px(84), 0);
         let wide_each = (width - px(32) - px(8) * (buttons.len() as i32 - 1)) / buttons.len() as i32;
         for (at, label) in buttons.iter().enumerate() {
-            child("BUTTON", label, 0, px(16) + at as i32 * (wide_each + px(8)), px(110), wide_each, px(34), FIRST_BUTTON + at as i32);
+            let button = child("BUTTON", label, 0, px(16) + at as i32 * (wide_each + px(8)), px(110), wide_each, px(34), FIRST_BUTTON + at as i32);
+            if !button.is_null() {
+                let prev = SetWindowLongPtrW(button, GWLP_WNDPROC, button_proc as *const () as usize as isize);
+                if prev != 0 {
+                    BUTTON_PROC.store(prev as usize, Ordering::SeqCst);
+                }
+            }
         }
         ShowWindow(window, SW_SHOWNOACTIVATE);
+        SHOWN_AT.store(GetTickCount(), Ordering::SeqCst);
         SetTimer(window, 1, ANSWER_MS, None);
         let mut message: MSG = std::mem::zeroed();
         while GetMessageW(&mut message, std::ptr::null_mut(), 0, 0) > 0 {
@@ -374,7 +445,7 @@ fn pick_caller_from_chain(chain: &[ProcNode], self_exe_key: &str, service_pid: u
     if self_exe_key.is_empty() || chain.is_empty() {
         return Err("could not identify the calling program".into());
     }
-    if chain[0].pid == service_pid {
+    if chain.iter().any(|node| node.pid == service_pid) {
         return Err("could not identify the calling program".into());
     }
     let start_idx = if is_deskcrew_binary(&chain[0].exe_key, self_exe_key) {
@@ -1216,5 +1287,16 @@ mod tests {
             CloseHandle(server_handle);
         }
         let _ = child.wait();
+    }
+
+    #[test]
+    fn launch_descendant_non_shell_fails_closed() {
+        let self_exe = r"c:\tools\deskcrew.exe";
+        let chain = vec![
+            ProcNode { pid: 100, created: 10, exe: r"C:\Tools\deskcrew.exe".into(), exe_key: self_exe.into() },
+            ProcNode { pid: 200, created: 20, exe: r"C:\Program Files\nodejs\node.exe".into(), exe_key: r"c:\program files\nodejs\node.exe".into() },
+            ProcNode { pid: 300, created: 30, exe: r"C:\Tools\deskcrew.exe".into(), exe_key: self_exe.into() },
+        ];
+        assert!(pick_caller_from_chain(&chain, self_exe, 300).is_err());
     }
 }

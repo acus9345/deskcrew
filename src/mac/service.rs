@@ -231,6 +231,10 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
     let mut at = 0;
     while at < words.len() {
         let word = &words[at];
+        if word == "--" {
+            rest.extend(words[at + 1..].iter().cloned());
+            break;
+        }
         let next = words.get(at + 1).cloned();
         let number = |text: &Option<String>| text.as_ref().and_then(|n| n.parse::<u64>().ok());
         let mut took = true;
@@ -1420,6 +1424,7 @@ impl Service {
             }
             "quit" => {
                 self.release(true);
+                pipe::remove();
                 self.quit.store(true, Ordering::Relaxed);
                 Ok("bye".into())
             }
