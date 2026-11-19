@@ -6,6 +6,14 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.29] - 2026-11-19
+
+- **Cursor grants tied to the calling program (Windows):** "this session" and "always" cursor permissions now follow the calling agent's actual process and executable path rather than the self-reported `--agent` name. The prompt shows the real program alongside the agent name when they differ, and older name-only `always` lines in `cursor.txt` ask to be confirmed once.
+- **Store and WinUI apps stay in the back:** toggles, list and combo selections, expand/collapse controls, and range/value edits keep Store and WinUI apps behind your window, with per-app process isolation for `ApplicationFrameHost` windows and tighter popup item matching.
+- **Minimized WPF input and background Win shortcuts:** minimized WPF windows can receive typing and keys off-screen without coming forward, and common `Win+...` shortcuts route through shell/COM or background window placement instead of taking the real keyboard.
+- **Linux Wayland and socket hardening:** accessibility actions work over AT-SPI on Wayland without requiring an X11 display, Linux CI verifies the typing caret, and Unix service sockets on Linux and macOS use private `0700` directories with owner and lock checks.
+- **Reliability and safety:** `deskcrew status` reports when another process holds the `Ctrl+Alt+Esc` stop keys; log trimming is locked against concurrent writers; broken-pipe accept loops exit cleanly; risky shortcut checks are keyboard-layout independent; and `--risk` and `--` argument handling are consistent across Windows, macOS, and Linux (including MCP).
+
 ## [0.1.28] - 2026-11-18
 
 - A review of the whole codebase, fixed:
