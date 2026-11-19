@@ -167,7 +167,10 @@ impl Uia {
         unsafe {
             let auto: IUIAutomation = CoCreateInstance(&CUIAutomation8, None, CLSCTX_INPROC_SERVER).map_err(say)?;
             // A hung app must cost a timeout, not a hung agent.
+            // AutoSetFocus defaults to true, which makes UI Automation try to foreground the
+            // target window before pattern calls (causing flashing and focus steals on Qt/WPF/etc.).
             if let Ok(newer) = auto.cast::<IUIAutomation2>() {
+                let _ = newer.SetAutoSetFocus(false);
                 let _ = newer.SetConnectionTimeout(2000);
                 let _ = newer.SetTransactionTimeout(8000);
             }
@@ -826,5 +829,19 @@ impl Uia {
             }
             None
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn uia_disables_auto_set_focus() {
+        enter_com();
+        let uia = Uia::new().expect("Uia::new should succeed");
+        let newer = uia.auto.cast::<IUIAutomation2>().expect("CUIAutomation8 implements IUIAutomation2");
+        let auto_focus = unsafe { newer.AutoSetFocus().expect("AutoSetFocus should succeed") };
+        assert!(!auto_focus.as_bool(), "AutoSetFocus must be false so UIA actions do not steal focus or flash windows");
     }
 }

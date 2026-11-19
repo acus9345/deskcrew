@@ -13,6 +13,7 @@ and this project uses [Semantic Versioning](https://semver.org/).
 - **Minimized WPF input and background Win shortcuts:** minimized WPF windows can receive typing and keys off-screen without coming forward, and common `Win+...` shortcuts route through shell/COM or background window placement instead of taking the real keyboard.
 - **Linux Wayland and socket hardening:** accessibility actions work over AT-SPI on Wayland without requiring an X11 display, Linux CI verifies the typing caret, and Unix service sockets on Linux and macOS use private `0700` directories with owner and lock checks.
 - **Reliability and safety:** `deskcrew status` reports when another process holds the `Ctrl+Alt+Esc` stop keys; log trimming is locked against concurrent writers; broken-pipe accept loops exit cleanly; risky shortcut checks are keyboard-layout independent; and `--risk` and `--` argument handling are consistent across Windows, macOS, and Linux (including MCP).
+- **No focus stealing or flashing from Windows UI Automation (Krita / Qt / WPF):** disabled `IUIAutomation2::AutoSetFocus` so accessibility actions such as `set` on Krita's brush size and opacity spinners no longer try to foreground the window or flash its frame (`WM_NCACTIVATE`) while an agent draws.
 
 ## [0.1.28] - 2026-11-18
 
