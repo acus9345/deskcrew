@@ -16,21 +16,25 @@ const WINDOW: u32 = 1;
 
 // AtspiStateType, bit numbers in GetState's two words.
 const ACTIVE: u32 = 1;
-const ENABLED: u32 = 8;
 const CHECKED: u32 = 4;
 const COLLAPSED: u32 = 5;
+const DEFUNCT: u32 = 6;
+const EDITABLE: u32 = 7;
+const ENABLED: u32 = 8;
 const EXPANDABLE: u32 = 9;
 const EXPANDED: u32 = 10;
 const FOCUSED: u32 = 12;
+const HORIZONTAL: u32 = 14;
+const PRESSED: u32 = 20;
 const SELECTED: u32 = 23;
 const SENSITIVE: u32 = 24;
 const SHOWING: u32 = 25;
+const VERTICAL: u32 = 29;
 const VISIBLE: u32 = 30;
 const INDETERMINATE: u32 = 32;
-const HORIZONTAL: u32 = 14;
-const VERTICAL: u32 = 29;
-const CHECKABLE: u32 = 41;
 const IS_DEFAULT: u32 = 39;
+const CHECKABLE: u32 = 41;
+const READ_ONLY: u32 = 43;
 
 /// One object on the accessibility bus.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -58,6 +62,20 @@ pub struct Node {
 
 static BUS: OnceLock<Result<Connection, String>> = OnceLock::new();
 
+/// Turn on desktop accessibility status properties on the session bus so Chromium, Electron,
+/// Firefox, GTK and Qt publish their full accessibility trees.
+fn enable_session_a11y(session: &Connection) {
+    for prop in ["IsEnabled", "ScreenReaderEnabled"] {
+        let _ = session.call_method(
+            Some("org.a11y.Bus"),
+            "/org/a11y/bus",
+            Some("org.freedesktop.DBus.Properties"),
+            "Set",
+            &("org.a11y.Status", prop, zbus::zvariant::Value::from(true)),
+        );
+    }
+}
+
 /// The accessibility bus: the one AT_SPI_BUS_ADDRESS or the X display names, or the one the
 /// session bus hands out. Apps started after this see that someone is listening, and turn their
 /// accessibility on.
@@ -65,20 +83,21 @@ pub fn bus() -> Result<&'static Connection, String> {
     BUS.get_or_init(|| {
         let named = std::env::var("AT_SPI_BUS_ADDRESS").ok().filter(|a| !a.is_empty()).or_else(super::x::accessibility_bus);
         let address = match named {
-            Some(address) => address,
+            Some(address) => {
+                // Even when the bus address is already known, ensure IsEnabled and
+                // ScreenReaderEnabled are set so browsers/Electron expose full trees.
+                if let Ok(session) = Connection::session() {
+                    enable_session_a11y(&session);
+                }
+                address
+            }
             None => {
                 let session = Connection::session().map_err(|e| format!("no D-Bus session ({e}): start one with dbus-run-session, or run inside a desktop session"))?;
                 let address: String = session
                     .call_method(Some("org.a11y.Bus"), "/org/a11y/bus", Some("org.a11y.Bus"), "GetAddress", &())
                     .and_then(|m| m.body().deserialize())
                     .map_err(|e| format!("no accessibility bus ({e}): install at-spi2-core, or set AT_SPI_BUS_ADDRESS"))?;
-                let _ = session.call_method(
-                    Some("org.a11y.Bus"),
-                    "/org/a11y/bus",
-                    Some("org.freedesktop.DBus.Properties"),
-                    "Set",
-                    &("org.a11y.Status", "IsEnabled", zbus::zvariant::Value::from(true)),
-                );
+                enable_session_a11y(&session);
                 address
             }
         };
@@ -276,42 +295,87 @@ pub fn frames() -> Vec<(Obj, u32)> {
     out
 }
 
-/// The accessible window that is this X window: same process, then the same title or place.
+/// Visible popup windows, menus or dialogs belonging to the same process (excluding `main`).
+pub fn popup_frames(pid: u32, main: &Obj) -> Vec<Obj> {
+    if pid == 0 {
+        return Vec::new();
+    }
+    frames()
+        .into_iter()
+        .filter(|(f, p)| *p == pid && f != main)
+        .map(|(f, _)| f)
+        .filter(|f| {
+            let r = role_name(f);
+            let popup_role = matches!(r.as_str(), "window" | "dialog" | "alert" | "file chooser" | "menu" | "popup menu" | "panel");
+            if !popup_role {
+                return false;
+            }
+            let st = states(f);
+            !has(st, DEFUNCT) && (has(st, SHOWING) || has(st, VISIBLE))
+        })
+        .collect()
+}
+
+/// The accessible window that is this X window: same process first, then matching title or bounds
+/// (which also catches Flatpak/Snap PID namespaces, multi-process launchers and apps with no
+/// `_NET_WM_PID`).
 pub fn frame_for(pid: u32, title: &str, at: Bounds) -> Option<Obj> {
-    let mine: Vec<Obj> = frames().into_iter().filter(|(_, p)| *p == pid).map(|(f, _)| f).collect();
-    let showing: Vec<&Obj> = mine.iter().filter(|f| has(states(f), SHOWING) || has(states(f), VISIBLE)).collect();
-    if let Some(same) = showing.iter().find(|f| !title.is_empty() && name(f) == title) {
-        return Some((*same).clone());
+    let all = frames();
+    let near = |f: &&Obj| at.2 > 0 && at.3 > 0 && rect(f).is_some_and(|r| r.2 > 0 && r.3 > 0 && r.0.abs_diff(at.0) < 60 && r.1.abs_diff(at.1) < 60 && r.2.abs_diff(at.2) < 60);
+    let pick = |candidates: &[Obj], allow_single: bool| -> Option<Obj> {
+        let showing: Vec<&Obj> = candidates.iter().filter(|f| has(states(f), SHOWING) || has(states(f), VISIBLE)).collect();
+        if let Some(same) = showing.iter().find(|f| !title.is_empty() && name(f) == title) {
+            return Some((*same).clone());
+        }
+        if let Some(placed) = showing.iter().find(|f| near(f)) {
+            return Some((*placed).clone());
+        }
+        if allow_single {
+            return match showing.as_slice() {
+                [only] => Some((*only).clone()),
+                _ => candidates.first().cloned(),
+            };
+        }
+        None
+    };
+    if pid > 0 {
+        let mine: Vec<Obj> = all.iter().filter(|(_, p)| *p == pid).map(|(f, _)| f.clone()).collect();
+        if let Some(found) = pick(&mine, true) {
+            return Some(found);
+        }
     }
-    let near = |f: &&&Obj| rect(f).is_some_and(|r| r.0.abs_diff(at.0) < 60 && r.1.abs_diff(at.1) < 60 && r.2.abs_diff(at.2) < 60);
-    if let Some(placed) = showing.iter().find(near) {
-        return Some((*placed).clone());
-    }
-    match showing.as_slice() {
-        [only] => Some((*only).clone()),
-        _ => mine.into_iter().next(),
-    }
+    let everyone: Vec<Obj> = all.into_iter().map(|(f, _)| f).collect();
+    pick(&everyone, false)
 }
 
 /// A role for an AT-SPI role name, or None for containers that only matter for what they hold.
-fn role(role_name: &str) -> Option<&'static str> {
+/// `is_editable` distinguishes editable text inputs and contenteditable paragraphs from
+/// read-only/static text nodes in browsers, Electron, LibreOffice, Qt and GTK.
+fn role(role_name: &str, is_editable: bool) -> Option<&'static str> {
     Some(match role_name {
         "push button" | "toggle button" | "button" | "push button menu" => "button",
-        "combo box" => "combobox",
+        "combo box" | "autocomplete" => "combobox",
         "check box" | "check menu item" | "switch" => "checkbox",
         "radio button" | "radio menu item" => "radio",
-        "text" | "entry" | "password text" | "editbar" | "spin button" | "date editor" | "terminal" => "edit",
-        "label" | "static" | "caption" | "paragraph" => "",
+        "entry" | "password text" | "editbar" | "date editor" | "terminal" => "edit",
+        "text" | "paragraph" => if is_editable { "edit" } else { "" },
+        "spin button" | "spin box" => "spinner",
+        "label" | "static" | "caption" => "",
         "link" => "link",
         "image" | "icon" => "image",
         "drawing area" | "canvas" => "canvas",
         "table" | "tree table" => "table",
+        "list" | "list box" => "list",
+        "tree" => "tree",
         "menu item" | "menu" => "menuitem",
-        "page tab" => "tab",
+        "page tab" | "tab" => "tab",
+        "page tab list" => "tabs",
+        "tool bar" => "toolbar",
+        "scroll pane" => "pane",
         "slider" => "slider",
         "progress bar" | "level bar" => "progress",
-        "list item" | "tree item" | "table row" | "table cell" => "item",
-        "document web" | "document frame" | "document text" => "document",
+        "list item" | "tree item" | "table row" | "table cell" | "flow box child" => "item",
+        "document web" | "document frame" | "document text" | "document email" | "document presentation" | "document spreadsheet" => "document",
         "heading" | "table column header" | "column header" => "header",
         _ => return None,
     })
@@ -319,11 +383,49 @@ fn role(role_name: &str) -> Option<&'static str> {
 
 /// Parts that never help an agent, along with everything inside them.
 fn skipped(role_name: &str) -> bool {
-    matches!(role_name, "scroll bar" | "separator" | "tool tip" | "menu bar")
+    matches!(role_name, "scroll bar" | "separator" | "tool tip")
 }
 
 fn acts(role: &str) -> bool {
-    !matches!(role, "" | "image" | "progress" | "header" | "document" | "table")
+    !matches!(role, "" | "image" | "progress" | "header" | "document" | "table" | "pane" | "tabs" | "toolbar" | "list" | "tree")
+}
+
+/// Whether `outer` encloses `inner` (with a small slack for border padding).
+pub fn encloses(outer: Bounds, inner: Bounds) -> bool {
+    if outer.2 <= 0 || outer.3 <= 0 || inner.2 <= 0 || inner.3 <= 0 {
+        return false;
+    }
+    const SLACK: i32 = 4;
+    inner.0 >= outer.0 - SLACK
+        && inner.1 >= outer.1 - SLACK
+        && inner.0 + inner.2 <= outer.0 + outer.2 + SLACK
+        && inner.1 + inner.3 <= outer.1 + outer.3 + SLACK
+}
+
+/// Drop static text nodes whose text duplicates a named control enclosing them, returning
+/// `(kept, dropped_count, quiet_rects)` so `blind_spot` still treats those rects as covered.
+pub fn drop_labels(nodes: Vec<Node>) -> (Vec<Node>, usize, Vec<Bounds>) {
+    let boxes: Vec<(Bounds, String)> = nodes
+        .iter()
+        .filter(|n| !n.parts.role.is_empty() && !n.parts.name.is_empty())
+        .map(|n| (n.rect, n.parts.name.to_lowercase()))
+        .collect();
+    let mut kept = Vec::with_capacity(nodes.len());
+    let mut quiet = Vec::new();
+    let mut dropped = 0;
+    for node in nodes {
+        if node.parts.role.is_empty() {
+            let lower = node.parts.name.to_lowercase();
+            let duplicate = !lower.is_empty() && boxes.iter().any(|(b, name)| name == &lower && encloses(*b, node.rect));
+            if duplicate {
+                quiet.push(node.rect);
+                dropped += 1;
+                continue;
+            }
+        }
+        kept.push(node);
+    }
+    (kept, dropped, quiet)
 }
 
 fn outside(rect: Bounds, window: Bounds) -> bool {
@@ -354,19 +456,28 @@ impl Walk<'_> {
             return;
         }
         let state = states(obj);
-        if !self.all && depth > 0 && !has(state, SHOWING) {
+        if has(state, DEFUNCT) {
             return;
         }
-        let role = role(&role_name);
+        // Only prune subtrees that are neither VISIBLE nor SHOWING: Chromium, Electron, Qt and GTK
+        // containers routinely set VISIBLE without SHOWING while their child controls are SHOWING.
+        if !self.all && depth > 0 && !has(state, VISIBLE) && !has(state, SHOWING) {
+            return;
+        }
+        let need_ifaces = matches!(role_name.as_str(), "text" | "paragraph") || role(&role_name, false).is_some();
+        let ifaces = if need_ifaces { interfaces(obj) } else { Vec::new() };
+        let has_iface = |wanted: &str| ifaces.iter().any(|i| i == wanted);
+        let is_editable = (has(state, EDITABLE) || has_iface("org.a11y.atspi.EditableText")) && !has(state, READ_ONLY);
+        let role = role(&role_name, is_editable);
         let mut name = name(obj);
         if name.is_empty() {
             name = description(obj);
         }
-        let ifaces = if role.is_some() { interfaces(obj) } else { Vec::new() };
-        let has_iface = |wanted: &str| ifaces.iter().any(|i| i == wanted);
         let value = match role {
             Some("edit") if has_iface("org.a11y.atspi.Text") => text_of(obj).map(|t| t.replace('\n', " ")),
-            Some("slider" | "progress") if has_iface("org.a11y.atspi.Value") => property::<f64>(obj, "org.a11y.atspi.Value", "CurrentValue").ok().map(|v| format!("{v}")),
+            Some("document") if is_editable && has_iface("org.a11y.atspi.Text") => text_of(obj).filter(|t| !t.is_empty()).map(|t| t.replace('\n', " ")),
+            Some("slider" | "progress" | "spinner") if has_iface("org.a11y.atspi.Value") => property::<f64>(obj, "org.a11y.atspi.Value", "CurrentValue").ok().map(|v| format!("{v}")),
+            Some("spinner") if has_iface("org.a11y.atspi.Text") => text_of(obj).map(|t| t.replace('\n', " ")),
             Some("combobox") => {
                 // The chosen entry, then whatever the box shows; a GTK box often names itself by it.
                 selected_name(obj).or_else(|| text_of(obj).filter(|t| !t.is_empty())).or_else(|| (!name.is_empty()).then(|| name.clone()))
@@ -398,12 +509,14 @@ impl Walk<'_> {
         let listed = match role {
             Some("") => !name.is_empty() && name != parent,
             Some("image") => !name.is_empty() && depth > 0,
+            Some("pane") => role_name == "scroll pane" && depth > 0,
+            Some("list" | "tree" | "tabs" | "toolbar") => !name.is_empty() && depth > 0,
             Some(_) => true,
             None => false,
         };
         let mut own = row;
         if listed {
-            if outside(rect, self.window) && !self.all {
+            if !self.all && ((!has(state, SHOWING) && role != Some("pane")) || outside(rect, self.window)) {
                 *self.hidden += 1;
             } else {
                 let role = role.unwrap_or_default();
@@ -413,7 +526,7 @@ impl Walk<'_> {
                 }
                 match role {
                     "checkbox" | "radio" => flags.push(if has(state, CHECKED) { "on" } else if has(state, INDETERMINATE) { "mixed" } else { "off" }),
-                    "button" if has(state, CHECKABLE) || role_name == "toggle button" => flags.push(if has(state, CHECKED) { "on" } else { "off" }),
+                    "button" if has(state, CHECKABLE) || role_name == "toggle button" => flags.push(if has(state, CHECKED) || has(state, PRESSED) { "on" } else { "off" }),
                     _ => {}
                 }
                 if role == "combobox" || has(state, EXPANDABLE) {
@@ -432,6 +545,9 @@ impl Walk<'_> {
                 if role_name == "password text" {
                     flags.push("password");
                 }
+                if role_name == "scroll pane" {
+                    flags.push("scroll");
+                }
                 let value = if role_name == "password text" { None } else { value.clone() };
                 let identity = format!("{role}|{name}");
                 self.nodes.push(Node {
@@ -446,8 +562,9 @@ impl Walk<'_> {
                 }
             }
         }
-        // A combo box's list and an edit's text runs are read through the box itself.
-        if matches!(role, Some("combobox" | "edit")) {
+        // A collapsed combo box's list and an edit's text runs are read through the box itself;
+        // an expanded combo box or editable paragraph (which can hold inline links) is descended into.
+        if (role == Some("edit") && role_name != "paragraph") || (role == Some("combobox") && !has(state, EXPANDED)) {
             return;
         }
         let shown = if listed { name.as_str() } else { parent };
@@ -464,7 +581,8 @@ fn hash_of(bus: &str, path: &str) -> usize {
     hasher.finish() as usize
 }
 
-/// Every control in the window, and how many were left out for being off screen.
+/// Every control in the window (and any visible popup surfaces), and how many were left out for
+/// being off screen.
 pub fn read(frame: &Obj, window: Bounds, all: bool) -> (Vec<Node>, usize) {
     let mut nodes = Vec::new();
     let mut hidden = 0;
@@ -473,6 +591,25 @@ pub fn read(frame: &Obj, window: Bounds, all: bool) -> (Vec<Node>, usize) {
         walk.walk(&child, "", None, 1);
     }
     (nodes, hidden)
+}
+
+/// Read controls from a main frame plus any additional popup/dialog frames of the same window.
+pub fn read_surfaces(surfaces: &[Obj], window: Bounds, all: bool) -> (Vec<Node>, usize, Vec<Bounds>) {
+    let mut nodes = Vec::new();
+    let mut hidden = 0;
+    let mut seen_keys = std::collections::HashSet::new();
+    for (index, surface) in surfaces.iter().enumerate() {
+        let bounds = if index == 0 { window } else { rect(surface).unwrap_or(window) };
+        let (surface_nodes, surface_hidden) = read(surface, bounds, all);
+        hidden += surface_hidden;
+        for node in surface_nodes {
+            if seen_keys.insert(node.key) {
+                nodes.push(node);
+            }
+        }
+    }
+    let (kept, _, quiet) = drop_labels(nodes);
+    (kept, hidden, quiet)
 }
 
 pub fn text_of(obj: &Obj) -> Option<String> {
@@ -530,6 +667,82 @@ pub fn insert_text(obj: &Obj, text: &str) -> Result<(), String> {
         return Err("the app refused the text".into());
     }
     let _ = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetCaretOffset", &(end + text.chars().count() as i32,));
+    Ok(())
+}
+
+/// Append text to an editable control in the background: tries `EditableText.InsertText` first,
+/// then falls back to `SetTextContents(existing + text)` for toolkits (Qt, LibreOffice, Java ATK,
+/// Electron) that implement `SetTextContents` without `InsertText`.
+pub fn append_text(obj: &Obj, text: &str) -> Result<(), String> {
+    if insert_text(obj, text).is_ok() {
+        return Ok(());
+    }
+    let Some(existing) = text_of(obj) else {
+        return Err("could not read existing text to append safely".into());
+    };
+    set_text(obj, &(existing + text))
+}
+
+/// Read the first active selection range `(start, end)` from `org.a11y.atspi.Text`.
+fn selection_range(obj: &Obj) -> Option<(i32, i32)> {
+    let n: i32 = call(obj, "org.a11y.atspi.Text", "GetNSelections", &()).ok()?;
+    if n <= 0 {
+        return None;
+    }
+    let (start, end): (i32, i32) = call(obj, "org.a11y.atspi.Text", "GetSelection", &(0i32,)).ok()?;
+    let (lo, hi) = if start <= end { (start, end) } else { (end, start) };
+    (hi > lo).then_some((lo, hi))
+}
+
+/// Currently selected text in `obj` via `org.a11y.atspi.Text`, with no focus or shortcut needed.
+pub fn selected_text(obj: &Obj) -> Option<String> {
+    let (lo, hi) = selection_range(obj)?;
+    let text: String = call(obj, "org.a11y.atspi.Text", "GetText", &(lo, hi)).ok()?;
+    (!text.is_empty()).then_some(text)
+}
+
+/// Select all text in `obj` via `org.a11y.atspi.Text` without touching keyboard focus.
+pub fn select_all(obj: &Obj) -> bool {
+    let Ok(count) = property::<i32>(obj, "org.a11y.atspi.Text", "CharacterCount") else { return false };
+    if count <= 0 {
+        return false;
+    }
+    let replaced = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetSelection", &(0i32, 0i32, count)).unwrap_or(false);
+    if replaced {
+        return true;
+    }
+    call::<_, bool>(obj, "org.a11y.atspi.Text", "AddSelection", &(0i32, count)).unwrap_or(false)
+}
+
+/// Delete the active selection in `obj` and return the cut text, completely in the background.
+pub fn delete_selection(obj: &Obj) -> Option<String> {
+    let (lo, hi) = selection_range(obj)?;
+    let text: String = call(obj, "org.a11y.atspi.Text", "GetText", &(lo, hi)).ok()?;
+    if text.is_empty() {
+        return None;
+    }
+    let deleted: bool = call(obj, "org.a11y.atspi.EditableText", "DeleteText", &(lo, hi)).ok()?;
+    deleted.then_some(text)
+}
+
+/// Insert `text` at the current caret (replacing any active selection) via `EditableText`,
+/// leaving the window completely in the background.
+pub fn insert_at_caret(obj: &Obj, text: &str) -> Result<(), String> {
+    if !editable(obj) {
+        return Err("that control is not editable".into());
+    }
+    let count: i32 = property(obj, "org.a11y.atspi.Text", "CharacterCount").unwrap_or(0).max(0);
+    let pos = if let Some((lo, hi)) = selection_range(obj) {
+        let _ = call::<_, bool>(obj, "org.a11y.atspi.EditableText", "DeleteText", &(lo, hi));
+        lo.clamp(0, count)
+    } else {
+        property::<i32>(obj, "org.a11y.atspi.Text", "CaretOffset").unwrap_or(count).clamp(0, count)
+    };
+    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(pos, text, text.len() as i32))?;
+    if !done {
+        return append_text(obj, text);
+    }
+    let _ = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetCaretOffset", &(pos + text.chars().count() as i32,));
     Ok(())
 }
 
@@ -745,7 +958,9 @@ pub fn toggle_state(obj: &Obj, role: &str) -> Result<Option<&'static str>, Strin
     let state = try_states(obj)?;
     Ok(match role {
         "checkbox" | "radio" => Some(if has(state, CHECKED) { "on" } else if has(state, INDETERMINATE) { "mixed" } else { "off" }),
-        "button" if has(state, CHECKABLE) || role_name(obj) == "toggle button" => Some(if has(state, CHECKED) { "on" } else { "off" }),
+        "button" if has(state, CHECKABLE) || role_name(obj) == "toggle button" => {
+            Some(if has(state, CHECKED) || has(state, PRESSED) { "on" } else { "off" })
+        }
         _ => None,
     })
 }
@@ -792,4 +1007,52 @@ pub fn caret(obj: &Obj) -> Option<(i32, i32, i32)> {
 /// Whether this is the button a dialog presses when its Enter is pressed, as Open or Save is.
 pub fn is_default(obj: &Obj) -> bool {
     has(states(obj), IS_DEFAULT)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn node(key: usize, role: &str, name: &str, rect: Bounds) -> Node {
+        Node {
+            key,
+            identity: format!("{role}|{name}"),
+            parts: Parts { role: role.to_string(), name: name.to_string(), value: None, states: Vec::new(), cells: Vec::new() },
+            rect,
+            element: Obj { bus: ":1.1".into(), path: format!("/o/{key}") },
+        }
+    }
+
+    #[test]
+    fn text_role_distinguishes_editable_from_static() {
+        assert_eq!(role("text", true), Some("edit"));
+        assert_eq!(role("text", false), Some(""));
+        assert_eq!(role("paragraph", true), Some("edit"));
+        assert_eq!(role("paragraph", false), Some(""));
+        assert_eq!(role("spin button", false), Some("spinner"));
+        assert_eq!(role("spin box", false), Some("spinner"));
+        assert_eq!(role("autocomplete", false), Some("combobox"));
+        assert_eq!(role("flow box child", false), Some("item"));
+        assert_eq!(role("drawing area", false), Some("canvas"));
+        assert_eq!(role("document text", true), Some("document"));
+        assert_eq!(role("document spreadsheet", false), Some("document"));
+        assert_eq!(role("scroll pane", false), Some("pane"));
+        assert!(!skipped("menu bar"));
+        assert!(skipped("scroll bar"));
+    }
+
+    #[test]
+    fn duplicate_static_label_inside_button_is_dropped() {
+        let nodes = vec![
+            node(1, "button", "Save", (10, 10, 80, 30)),
+            node(2, "", "Save", (20, 15, 40, 20)),
+            node(3, "", "Status: ready", (10, 60, 120, 20)),
+        ];
+        let (kept, dropped, quiet) = drop_labels(nodes);
+        assert_eq!(dropped, 1);
+        assert_eq!(quiet, vec![(20, 15, 40, 20)]);
+        assert_eq!(kept.len(), 2);
+        assert_eq!(kept[0].parts.role, "button");
+        assert_eq!(kept[1].parts.name, "Status: ready");
+    }
 }

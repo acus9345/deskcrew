@@ -111,7 +111,8 @@ Every action replies with what changed, new dialogs and their text too: no need 
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the window forward for a moment and uses the keyboard or a pen: a last resort),
 --mouse (asks the person to borrow their cursor, if they allow asking: only if nothing else works).
-cursor [off|ask|session|always]   who may borrow the cursor; off by default, and the person confirms anything else."#;
+cursor [off|ask|session|always]   who may borrow the cursor; off by default, and the person confirms anything else.
+quiet [on|off|status]             hard background-only lock: refuses focus, --real, --mouse, --front, and down."#;
 
 /// Add text to the end of a control through the value it reports, for a control that takes no
 /// window messages. None if it has no value that can be set.
@@ -132,14 +133,15 @@ fn append_value(node: &Node, root: Hwnd, text: &str) -> Option<Reply> {
 fn replace_in_page(root: Hwnd, node: &Node, wanted: &str) -> Option<Reply> {
     let mut saved = apps::SavedClipboard::take().ok()?;
     saved.lend(wanted).ok()?;
-    let sent = real::chord("ctrl+a").ok().and_then(|all| act::post_key(root, &all, "ctrl+a").ok())
-        .and_then(|_| real::chord("ctrl+v").ok())
-        .and_then(|paste| act::post_key(root, &paste, "ctrl+v").ok());
+    let _wake = act::wake_page(root);
+    let _ = real::chord("ctrl+a").ok().and_then(|all| act::post_key(root, &all, "ctrl+a").ok());
+    let sent = real::chord("ctrl+v").ok().and_then(|paste| act::post_key(root, &paste, "ctrl+v").ok());
     let until = Instant::now() + TYPE_CHECK;
-    while sent.is_some() && node.element.value_text() != wanted && Instant::now() < until {
+    let matches = || node.element.field_text().as_deref() == Some(wanted);
+    while sent.is_some() && !matches() && Instant::now() < until {
         thread::sleep(SETTLE_STEP);
     }
-    let landed = sent.is_some() && node.element.value_text() == wanted;
+    let landed = sent.is_some() && matches();
     if let Err(error) = saved.put_back() {
         return Some(Err(error));
     }
@@ -168,6 +170,37 @@ fn press_at(root: Hwnd, x: i32, y: i32, flags: &Flags) -> Reply {
     }
     let pen = Pen::new().ok_or(act::NO_PEN)?;
     if pen.tap(x, y, flags.right, flags.double) { Ok("pen".into()) } else { Err(act::NO_PEN.into()) }
+}
+
+/// Read `DESKCREW_QUIET` at startup (`1`, `true`, `on`, `yes`).
+fn env_quiet() -> bool {
+    std::env::var("DESKCREW_QUIET")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+/// In quiet / background-only mode, refuse any command or flag that steals focus or borrows the
+/// person's real mouse/keyboard.
+fn quiet_blocked(verb: &str, args: &[String], flags: &Flags, steps: Option<&[Step]>) -> Option<&'static str> {
+    if verb == "focus" {
+        return Some("refused: quiet mode is on (focus is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if verb == "down" {
+        return Some("refused: quiet mode is on (down borrows real input; run 'deskcrew quiet off' to allow)");
+    }
+    if verb == "notifications" && args.first().map(String::as_str) != Some("close") {
+        return Some("refused: quiet mode is on (notifications opens Win+N in front; run 'deskcrew quiet off' to allow)");
+    }
+    if flags.real || steps.is_some_and(|s| s.iter().any(|st| st.flags.real)) {
+        return Some("refused: quiet mode is on (--real is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if flags.mouse || steps.is_some_and(|s| s.iter().any(|st| st.flags.mouse)) {
+        return Some("refused: quiet mode is on (--mouse is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if verb == "launch" && flags.front {
+        return Some("refused: quiet mode is on (launch --front is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    None
 }
 
 /// Run a classic menu entry without opening the menu, or list what is under it.
@@ -512,6 +545,7 @@ pub struct Service {
     home: Mutex<Home>,
     keeper: OnceLock<thread::Thread>,
     stop: Arc<AtomicBool>,
+    quiet: AtomicBool,
     last_request: Mutex<Instant>,
     active: AtomicUsize,
 }
@@ -710,7 +744,7 @@ impl Service {
     /// Chromium builds its tree on first request, so the first read comes back nearly empty.
     fn first_read(&self, tracked: &Tracked, view: &mut View, all: bool) -> Result<(), String> {
         self.read(tracked, view, all)?;
-        if !view.read_once && win::class(tracked.hwnd).starts_with("Chrome_") {
+        if !view.read_once && win::is_chromium(tracked.hwnd) {
             let mut steady = 0;
             for _ in 0..CHROMIUM_READS {
                 let count = view.lines.len();
@@ -908,7 +942,7 @@ impl Service {
                     if let Some(entry) = win::find_menu(win::menu_bar(tracked.hwnd), word) {
                         return Ok(Target::Menu(entry));
                     }
-                    let patience = if win::class(tracked.hwnd).starts_with("Chrome_") { CHROMIUM_NAME_WAIT } else { NAME_WAIT };
+                    let patience = if win::is_chromium(tracked.hwnd) { CHROMIUM_NAME_WAIT } else { NAME_WAIT };
                     if started.elapsed() >= patience {
                         return Err(format!("no control named '{word}': see"));
                     }
@@ -955,6 +989,18 @@ impl Service {
     /// Bring the window forward for this work. The cursor is only borrowed with `mouse`, which the
     /// person has to have allowed.
     fn front<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], loan: Loan, work: impl FnOnce() -> T) -> Result<T, String> {
+        self.front_inner(tracked, view, points, loan, true, work)
+    }
+
+    /// Run foreground-only work ONLY when the window is already in front — never brings it forward.
+    fn front_if_already<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], loan: Loan, work: impl FnOnce() -> T) -> Result<T, String> {
+        self.front_inner(tracked, view, points, loan, false, work)
+    }
+
+    fn front_inner<T>(&self, tracked: &Tracked, view: &View, points: &[(i32, i32)], loan: Loan, allow_bring_forward: bool, work: impl FnOnce() -> T) -> Result<T, String> {
+        if self.quiet.load(Ordering::Relaxed) {
+            return Err("refused: quiet mode is on (real keyboard/pointer input is disabled; run 'deskcrew quiet off' to allow)".into());
+        }
         // A point off the window, or off every screen, is refused before focus moves at all.
         let mut family = view.surfaces.clone();
         family.push(tracked.hwnd);
@@ -969,7 +1015,11 @@ impl Service {
             home.panel = None;
         }
         let result = (|| {
-            let _borrowed = real::borrow(tracked.hwnd, &view.pids, loan)?;
+            let _borrowed = if allow_bring_forward {
+                real::borrow(tracked.hwnd, &view.pids, loan)?
+            } else {
+                real::borrow_if_front(tracked.hwnd, &view.surfaces, &view.pids, loan)?
+            };
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::owns_point(&family, *x, *y)) {
                 return Err(format!("refused: {x},{y} on screen is not on this window, so a real press there would hit something else"));
             }
@@ -1082,7 +1132,7 @@ impl Service {
             return act::post_click(window, x, y, flags.right, flags.double);
         }
         let store_control = node.as_ref().is_some_and(|n| store_control(tracked.hwnd, n, &view.surfaces, (x, y)));
-        let by_message = win::is_chromium(tracked.hwnd)
+        let by_message = win::is_chromium_at(tracked.hwnd, x, y)
             || (win::pulls_forward(&view.pids)
                 && !win::draws_itself(tracked.hwnd)
                 && !store_control
@@ -1121,6 +1171,24 @@ impl Service {
             {
                 return pressed.map(|route| format!("{route} on '{}' under {word}", found.parts.name));
             }
+        }
+        // WinUI 3 / Store / Paint coordinate clicks: synthetic pen input activates the target window
+        // and borrows the cursor, so only inject without `--real` when the window (or one of its
+        // surfaces) is already in front and uncovered, routed through `front_if_already(..., Loan::Pen)`
+        // so `keep_focus`, `PEN_DRAIN`, and `quiet` mode stay completely synchronized.
+        if act::needs_pen_at(tracked.hwnd, x, y) && !act::posts_with_capture(tracked.hwnd) && !win::minimized(tracked.hwnd) && win::inside(tracked.hwnd, x, y) {
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (synthetic pen borrows the cursor; run 'deskcrew quiet off' to allow)".into());
+            }
+            let mut family = view.surfaces.clone();
+            family.push(tracked.hwnd);
+            if !win::front_is(tracked.hwnd, &view.surfaces) || !win::owns_point(&family, x, y) {
+                return Err(act::NEEDS_REAL.into());
+            }
+            return self.front_if_already(tracked, view, &[(x, y)], Loan::Pen, || {
+                let pen = Pen::new().ok_or(act::NO_PEN)?;
+                if pen.tap(x, y, flags.right, flags.double) { Ok("pen".into()) } else { Err(act::NEEDS_REAL.into()) }
+            })?;
         }
         act::post_click(qt.unwrap_or(tracked.hwnd), x, y, flags.right, flags.double)
     }
@@ -1181,44 +1249,106 @@ impl Service {
         }
         // A classic text box pastes when asked to, with no keyboard and no focus.
         let mut field = None;
+        let mut target_node: Option<(uia::Node, (i32, i32))> = None;
+        let mut target_chromium = win::is_chromium(tracked.hwnd);
         if let Some(word) = target
             && let Target::Control(id) = self.resolve(word, who, tracked, view)?
         {
             let (node, rect) = self.locate(id, tracked, view)?;
             self.cursor_on(who, flags, rect);
-            field = act::native_window(&node, tracked.hwnd).filter(|hwnd| !flags.real && !win::draws_itself(*hwnd) && !win::is_chromium(tracked.hwnd));
+            let (cx, cy) = act::centre(rect);
+            target_chromium = win::is_chromium_at(tracked.hwnd, cx, cy);
+            field = act::native_window(&node, tracked.hwnd).filter(|hwnd| !flags.real && !win::draws_itself(*hwnd) && !target_chromium);
             // A control the app draws itself gets the text added to the end of its own, with no
             // clipboard and no keyboard. A browser would come forward for that, so it does not.
-            if field.is_none() && !flags.real && !win::is_chromium(tracked.hwnd)
+            if field.is_none() && !flags.real && !target_chromium
                 && let Some(done) = append_value(&node, tracked.hwnd, text)
             {
                 return done;
             }
+            target_node = Some((node, (cx, cy)));
         }
         let mut saved = apps::SavedClipboard::take()?;
         saved.lend(text)?;
         let route = (|| {
             // A browser takes Ctrl+V as window messages too, once a click has put its page's focus in
-            // the field. The field is read back where it can be, and the keyboard is the fallback.
-            if !flags.real && win::is_chromium(tracked.hwnd)
-                && let Some(route) = self.paste_in_page(who, tracked, view, target)
-            {
-                return Ok(route);
+            // the field. The field is read back where it can be, and ValuePattern/keyboard is fallback.
+            if !flags.real && target_chromium {
+                if let Some(route) = self.paste_in_page(who, tracked, view, target) {
+                    return Ok(route);
+                }
+                if let Some((ref node, _)) = target_node
+                    && (!win::front_thread(tracked.hwnd) || win::foreground() == tracked.hwnd)
+                    && let Some(done) = append_value(node, tracked.hwnd, text)
+                {
+                    return done;
+                }
             }
             if let Some(hwnd) = field {
                 let route = act::post_paste(hwnd)?;
                 thread::sleep(PASTE_SETTLE);
                 return Ok(route);
             }
-            // Ctrl+V as window messages, where the keys go without a click: the control the app or
-            // an agent last put the keyboard in, or the one window a terminal reads keys from.
-            let keys_reach = target.is_none() || win::key_site(win::keyboard_target(tracked.hwnd));
-            if !flags.real && keys_reach && !win::is_chromium(tracked.hwnd)
-                && let Ok(chord) = real::chord("ctrl+v")
-                && let Ok(route) = act::post_key(tracked.hwnd, &chord, "ctrl+v")
-            {
-                thread::sleep(PASTE_SETTLE);
-                return Ok(route);
+            // Background Ctrl+V into non-classic apps (WPF, Qt, Firefox) without UIA SetFocus,
+            // which can trigger focus steals and taskbar flashing on Qt/WPF/WinUI windows.
+            // When a named target was requested, only post Ctrl+V if we actually focused it (WPF or
+            // posted-mouse target) so we never paste into an unrelated focused field.
+            if !flags.real && !target_chromium {
+                let before = target_node.as_ref().and_then(|(n, _)| n.element.field_text());
+                let focused_target = match target_node {
+                    None => true,
+                    Some((ref node, (cx, cy))) => {
+                        if win::is_wpf(tracked.hwnd) {
+                            act::focus_wpf_field(tracked.hwnd, node).is_ok()
+                        } else if win::reads_posted_mouse(tracked.hwnd) {
+                            let ok = act::post_click(tracked.hwnd, cx, cy, false, false).is_ok();
+                            if ok {
+                                thread::sleep(FIELD_SETTLE);
+                            }
+                            ok
+                        } else {
+                            false
+                        }
+                    }
+                };
+                if focused_target
+                    && let Ok(chord) = real::chord("ctrl+v")
+                {
+                    let check_changed = |before: &Option<String>| -> bool {
+                        let (Some(before), Some((node, _))) = (before, &target_node) else {
+                            return target_node.is_none() || before.is_none();
+                        };
+                        let until = Instant::now() + TYPE_CHECK;
+                        while node.element.field_text().as_deref() == Some(before.as_str()) && Instant::now() < until {
+                            thread::sleep(SETTLE_STEP);
+                        }
+                        node.element.field_text().as_deref() != Some(before.as_str())
+                    };
+                    if let Ok(route) = act::post_key(tracked.hwnd, &chord, "ctrl+v") {
+                        thread::sleep(PASTE_SETTLE);
+                        if check_changed(&before) {
+                            return Ok(route);
+                        }
+                    }
+                }
+            }
+            // If the window is already in front (and quiet mode is off), paste directly into it
+            // without moving focus, matching `type` and `key` on foreground windows.
+            if !flags.real && !self.quiet.load(Ordering::Relaxed) && win::front_is(tracked.hwnd, &view.surfaces) {
+                let points: Vec<(i32, i32)> = target_node.as_ref().map(|(_, p)| *p).into_iter().collect();
+                let chord = real::chord("ctrl+v")?;
+                return self.front_if_already(tracked, view, &points, Loan::Keys, || {
+                    if let Some((_, (cx, cy))) = target_node {
+                        press_at(tracked.hwnd, cx, cy, flags)?;
+                    }
+                    real::check_front(tracked.hwnd, &view.surfaces)?;
+                    real::press_chord(&chord);
+                    thread::sleep(PASTE_SETTLE);
+                    Ok::<String, String>("paste".into())
+                })?;
+            }
+            if !flags.real {
+                return Err(act::NEEDS_REAL.into());
             }
             if let Some(word) = target {
                 self.click(who, &Flags { real: true, ..Flags::default() }, tracked, view, word)?;
@@ -1239,6 +1369,7 @@ impl Service {
     /// Ctrl+End and Ctrl+V as window messages into a browser page, after a posted click in the
     /// field if one is named. None if the paste could not be sent or did not show in the field.
     fn paste_in_page(&self, who: &str, tracked: &Tracked, view: &mut View, target: Option<&String>) -> Option<String> {
+        let _wake = act::wake_page(tracked.hwnd);
         let mut node = None;
         if let Some(word) = target {
             let Ok(Target::Control(id)) = self.resolve(word, who, tracked, view) else { return None };
@@ -1248,20 +1379,20 @@ impl Service {
             thread::sleep(FIELD_SETTLE);
             node = Some(found);
         }
-        let before = node.as_ref().filter(|n| n.can.value).map(|n| n.element.value_text());
+        let before = node.as_ref().and_then(|n| n.element.field_text());
         if node.is_some() {
-            act::post_key(tracked.hwnd, &real::chord("ctrl+end").ok()?, "ctrl+end").ok()?;
+            let _ = real::chord("ctrl+end").ok().and_then(|end| act::post_key(tracked.hwnd, &end, "ctrl+end").ok());
         }
         let route = act::post_key(tracked.hwnd, &real::chord("ctrl+v").ok()?, "ctrl+v").ok()?;
         thread::sleep(PASTE_SETTLE);
         if let (Some(before), Some(node)) = (before, &node) {
             let until = Instant::now() + TYPE_CHECK;
-            while node.element.value_text() == before && Instant::now() < until {
+            while node.element.field_text().as_deref() == Some(before.as_str()) && Instant::now() < until {
                 thread::sleep(SETTLE_STEP);
             }
             // A field that changed at all took the paste, even if it reformats or masks what it
             // shows: pasting again by keyboard would put the text in twice.
-            if node.element.value_text() == before {
+            if node.element.field_text().as_deref() == Some(before.as_str()) {
                 return None;
             }
         }
@@ -1420,6 +1551,7 @@ impl Service {
             .map(|(at, _)| *at)
             .collect();
         let downs = entries.iter().position(|at| *at == id)?;
+        let _wake = act::wake_page(tracked.hwnd);
         let press = |spec: &str| real::chord(spec).and_then(|chord| act::post_key(tracked.hwnd, &chord, spec));
         let pressed = (|| {
             press("home")?;
@@ -1488,12 +1620,19 @@ impl Service {
         }
         // A browser raises its window when accessibility changes a field, so the field is filled
         // the way a person would, by window messages. Accessibility is only the last resort.
-        if win::is_chromium(tracked.hwnd) && (node.can.value || node.can.range) && !node.element.value_read_only() {
+        let (cx, cy) = act::centre(rect);
+        if win::is_chromium_at(tracked.hwnd, cx, cy)
+            && (node.can.value || node.can.range || node.element.field_text().is_some())
+            && !node.element.value_read_only()
+        {
             if let Some(done) = self.fill_in_page(tracked, &node, rect, value) {
                 return done;
             }
             if let Some(done) = replace_in_page(tracked.hwnd, &node, value) {
                 return done;
+            }
+            if win::front_thread(tracked.hwnd) && win::foreground() != tracked.hwnd {
+                return Err(NEEDS_REAL.into());
             }
         }
         act::set(&node, tracked.hwnd, value)
@@ -1502,18 +1641,24 @@ impl Service {
     /// Select everything in a browser field with a triple click, type over it, and read it back.
     /// None if the text did not land.
     fn fill_in_page(&self, tracked: &Tracked, node: &Node, rect: Bounds, value: &str) -> Option<Reply> {
+        let _wake = act::wake_page(tracked.hwnd);
         let (x, y) = act::centre(rect);
         act::post_press(tracked.hwnd, x, y, Button::Left, 3, 0, &[]).ok()?;
         thread::sleep(FIELD_SETTLE);
-        let field = win::child_at(tracked.hwnd, x, y).0;
-        if let Err(error) = act::post_text(field, value, &self.stop) {
+        let field = win::chromium_render_window(tracked.hwnd).unwrap_or_else(|| win::child_at(tracked.hwnd, x, y).0);
+        if value.is_empty() {
+            let bs = real::chord("backspace").ok()?;
+            if let Err(error) = act::post_key(tracked.hwnd, &bs, "backspace") {
+                return Some(Err(error));
+            }
+        } else if let Err(error) = act::post_text(field, value, &self.stop) {
             return Some(Err(error));
         }
         let until = Instant::now() + TYPE_CHECK;
-        while node.element.value_text() != value && Instant::now() < until {
+        while node.element.field_text().as_deref() != Some(value) && Instant::now() < until {
             thread::sleep(SETTLE_STEP);
         }
-        if node.element.value_text() != value {
+        if node.element.field_text().as_deref() != Some(value) {
             return None;
         }
         // A number field tells the page only when it loses focus, so focus moves on with Tab.
@@ -1548,17 +1693,17 @@ impl Service {
         let classic = hwnd.and_then(win::caret_in).is_some();
         let watched = (!classic).then(|| field.as_ref().map(|node| node.element.clone()));
         // An app that takes typing only with focus inside itself, in front already, has that focus
-        // and the keyboard: typing reaches it with nothing moving, as --real would.
-        let real = flags.real || (target.is_none() && win::keys_need_focus(tracked.hwnd) && win::front_is(tracked.hwnd, &view.surfaces));
+        // and the keyboard: typing reaches it with nothing moving, as --real would (unless quiet mode is on).
+        let already_front = !flags.real && !self.quiet.load(Ordering::Relaxed) && target.is_none() && win::keys_need_focus(tracked.hwnd) && win::front_is(tracked.hwnd, &view.surfaces);
         self.watching_caret(who, tracked.hwnd, watched, || {
             if hwnd.and_then(win::caret_in).is_none() {
                 self.overlay.typing(who, text.chars().count());
             }
-            if real {
+            if flags.real || already_front {
                 let points: Vec<(i32, i32)> = place.into_iter().collect();
                 let to_end = real::chord("ctrl+end")?;
                 let loan = if flags.mouse && place.is_some() { Loan::Mouse } else { Loan::Keys };
-                return self.front(tracked, view, &points, loan, || {
+                let send = || {
                     if let Some((x, y)) = place {
                         press_at(tracked.hwnd, x, y, flags)?;
                         // A click lands mid-text; typing adds to the end, as it does without --real.
@@ -1568,29 +1713,39 @@ impl Service {
                         return Err(STOPPED.to_string());
                     }
                     Ok("keyboard".to_string())
-                })?;
+                };
+                return if flags.real {
+                    self.front(tracked, view, &points, loan, send)?
+                } else {
+                    self.front_if_already(tracked, view, &points, loan, send)?
+                };
             }
-            if let (Some((x, y)), true) = (place, win::is_chromium(tracked.hwnd)) {
+            if let Some((x, y)) = place
+                && win::is_chromium_at(tracked.hwnd, x, y)
+            {
+                let _wake = act::wake_page(tracked.hwnd);
                 // The page has to know which field has focus, and a click inside it says so.
                 act::post_click(tracked.hwnd, x, y, false, false)?;
                 thread::sleep(FIELD_SETTLE);
-                // Every window of a browser shares a thread, so "the focused window" could be another
-                // agent's. This field's own window keeps the text here.
-                let before = field.as_ref().filter(|node| node.can.value).map(|node| node.element.value_text());
-                let route = act::post_text(win::child_at(tracked.hwnd, x, y).0, text, &self.stop)?;
+                let before = field.as_ref().and_then(|node| node.element.field_text());
+                let target_hwnd = win::chromium_render_window(tracked.hwnd).unwrap_or_else(|| win::child_at(tracked.hwnd, x, y).0);
+                let route = act::post_text(target_hwnd, text, &self.stop)?;
                 // Chromium can drop characters while its window is not active, and says nothing. A
-                // field that can be read is read back, and set directly if the text did not land.
+                // field that can be read (ValuePattern or contenteditable TextPattern) is read
+                // back, and pasted in the background if the text did not land.
                 if let (Some(before), Some(node)) = (before, &field) {
                     let wanted = format!("{before}{text}");
                     let until = Instant::now() + TYPE_CHECK;
-                    while node.element.value_text() != wanted && Instant::now() < until {
+                    while node.element.field_text().as_deref() != Some(wanted.as_str()) && Instant::now() < until {
                         thread::sleep(SETTLE_STEP);
                     }
-                    if node.element.value_text() != wanted {
+                    if node.element.field_text().as_deref() != Some(wanted.as_str()) {
                         if let Some(done) = replace_in_page(tracked.hwnd, node, &wanted) {
                             return done;
                         }
-                        return act::set(node, tracked.hwnd, &wanted);
+                        if !win::front_thread(tracked.hwnd) || win::foreground() == tracked.hwnd {
+                            return act::set(node, tracked.hwnd, &wanted);
+                        }
                     }
                 }
                 return Ok(route);
@@ -1618,8 +1773,8 @@ impl Service {
                         Some(node) => {
                             act::focus_wpf_field(tracked.hwnd, node)?;
                             match act::post_text_focused(tracked.hwnd, text, &self.stop) {
-                                Err(why) if why.contains(act::IN_FRONT) && win::front_is(tracked.hwnd, &view.surfaces) => {
-                                    self.with_front(tracked, view, &[], || {
+                                Err(why) if why.contains(act::IN_FRONT) && !self.quiet.load(Ordering::Relaxed) && win::front_is(tracked.hwnd, &view.surfaces) => {
+                                    self.front_if_already(tracked, view, &[], Loan::Keys, || {
                                         if !real::type_text(text, tracked.hwnd, &view.surfaces, &self.stop)? {
                                             return Err(STOPPED.to_string());
                                         }
@@ -1641,8 +1796,9 @@ impl Service {
                     act::post_text_watched(hwnd, text, &self.stop, follow)
                 }
                 (None, _) if win::is_chromium(tracked.hwnd) => {
-                    act::wake_page(tracked.hwnd);
-                    act::post_text(tracked.hwnd, text, &self.stop)
+                    let _wake = act::wake_page(tracked.hwnd);
+                    let target_hwnd = win::chromium_render_window(tracked.hwnd).unwrap_or(tracked.hwnd);
+                    act::post_text(target_hwnd, text, &self.stop)
                 }
                 (None, _) if win::keys_need_focus(tracked.hwnd) => act::post_text_focused(tracked.hwnd, text, &self.stop),
                 (None, _) => act::post_text_watched(win::keyboard_target(tracked.hwnd), text, &self.stop, follow),
@@ -1672,7 +1828,7 @@ impl Service {
                             let inside = |&(x, y, _): &(i32, i32, i32)| bounds.is_none_or(|(bx, by, bw, bh)| x >= bx && x <= bx + bw && y >= by - 2 && y <= by + bh);
                             element.caret().filter(inside).or_else(|| element.text_end()).map(|caret| clamp_caret(caret, bounds))
                         }
-                        None => self.uia.focused_in(window).and_then(|element| element.caret()),
+                        None => self.uia.focused_in(window, &[]).and_then(|element| element.caret()),
                     };
                     if let Some((x, y, h)) = place.filter(|&at| Some(at) != shown) {
                         self.overlay.caret(who, x, y, h);
@@ -1717,43 +1873,122 @@ impl Service {
         let chord = real::chord(spec)?;
         refuse_risky(&chord, spec, flags)?;
         let hold = flags.hold.map(|ms| Duration::from_millis(ms.min(HOLD_MOST_MS)));
-        let keyboard = || -> Reply {
+        let keyboard = |allow_bring: bool| -> Reply {
+            let run = |work: Box<dyn FnOnce() -> Result<(), String>>| -> Result<Result<(), String>, String> {
+                if allow_bring {
+                    self.front(tracked, view, &[], Loan::Keys, work)
+                } else {
+                    self.front_if_already(tracked, view, &[], Loan::Keys, work)
+                }
+            };
             match hold {
-                Some(hold) => self.with_front(tracked, view, &[], || {
+                Some(hold) => run(Box::new(|| {
                     refuse_risky(&chord, spec, flags)?;
                     real::hold_chord(&chord, hold);
-                    Ok::<(), String>(())
-                })??,
-                None => self.with_front(tracked, view, &[], || {
+                    Ok(())
+                }))??,
+                None => run(Box::new(|| {
                     refuse_risky(&chord, spec, flags)?;
                     real::check_front(tracked.hwnd, &view.surfaces).map(|_| real::press_chord(&chord))
-                })??,
+                }))??,
             }
             Ok("keyboard".into())
         };
         if flags.real {
-            return keyboard();
+            return keyboard(true);
         }
-        if hold.is_none()
-            && let Some(direct) = act::win_shortcut(&chord, Some(tracked.hwnd))
-        {
-            return direct;
+        if hold.is_none() {
+            if act::is_shell_win_shortcut(&chord) && self.quiet.load(Ordering::Relaxed) {
+                return Err(format!("refused: quiet mode is on ({spec} opens foreground shell UI; run 'deskcrew quiet off' to allow)"));
+            }
+            if let Some(direct) = act::win_shortcut(&chord, Some(tracked.hwnd)) {
+                return direct;
+            }
         }
         if hold.is_none()
             && let Some(pressed) = self.key_by_button(tracked, &chord)
         {
             return pressed;
         }
-        act::wake_page(tracked.hwnd);
+        let _wake = act::wake_page(tracked.hwnd);
+        let ctrl_letter = (hold.is_none()
+            && chord.modified
+            && chord.keys.len() == 2
+            && chord.keys[0].0 == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL)
+            .then_some(chord.keys[1].0 as u8);
+        let clip_before = matches!(ctrl_letter, Some(b'C' | b'X')).then(apps::clipboard_seq);
+        let focused_before = matches!(ctrl_letter, Some(b'C' | b'X' | b'A' | b'V'))
+            .then(|| self.uia.focused_in(tracked.hwnd, &view.surfaces))
+            .flatten();
+        let val_before = (ctrl_letter == Some(b'V'))
+            .then(|| focused_before.as_ref().filter(|el| !el.value_read_only()).map(|el| el.value_text()))
+            .flatten();
         let posted = match hold {
             Some(hold) => act::post_hold(tracked.hwnd, &chord, hold, &self.stop),
             None => act::post_key(tracked.hwnd, &chord, spec),
         };
+        // UIA fallbacks for copy, cut, select-all, and paste (only when `focused_in` proves the
+        // focused control belongs to this exact window/surface, never another window of the app).
+        if let Some(letter) = ctrl_letter {
+            match letter {
+                b'C' | b'X' => {
+                    if posted.is_ok() {
+                        thread::sleep(PASTE_SETTLE);
+                    }
+                    if let Some(seq_before) = clip_before
+                        && apps::clipboard_seq() == seq_before
+                        && let Some(focused) = focused_before.or_else(|| self.uia.focused_in(tracked.hwnd, &view.surfaces))
+                        && let Some(selected) = focused.selected_text()
+                    {
+                        if letter == b'X' {
+                            let full = focused.value_text();
+                            if !focused.value_read_only() && selected == full {
+                                apps::set_clipboard(&selected)?;
+                                act::behind(tracked.hwnd, || focused.set_value(""))?;
+                                return Ok("cut selection".into());
+                            }
+                        } else {
+                            apps::set_clipboard(&selected)?;
+                            return Ok("text selection".into());
+                        }
+                    }
+                }
+                b'A' => {
+                    if posted.is_ok() {
+                        thread::sleep(FIELD_SETTLE);
+                    }
+                    if let Some(focused) = focused_before.or_else(|| self.uia.focused_in(tracked.hwnd, &view.surfaces))
+                        && (posted.is_err() || focused.selected_text().is_none())
+                        && act::behind(tracked.hwnd, || focused.select_all())
+                    {
+                        return Ok("select all".into());
+                    }
+                }
+                b'V' => {
+                    if posted.is_ok() {
+                        thread::sleep(PASTE_SETTLE);
+                    }
+                    if let Some(focused) = focused_before.or_else(|| self.uia.focused_in(tracked.hwnd, &view.surfaces))
+                        && !focused.value_read_only()
+                        && (posted.is_err() || val_before.as_deref() == Some(focused.value_text().as_str()))
+                        && let Ok(clip) = apps::clipboard_text()
+                        && clip != apps::NO_CLIPBOARD_TEXT
+                    {
+                        let current = focused.value_text();
+                        let replace_all = current.is_empty() || focused.selected_text().as_deref() == Some(current.as_str());
+                        if replace_all && act::behind(tracked.hwnd, || focused.set_value(&clip)).is_ok() {
+                            return Ok("value paste".into());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
         // A window the person has in front shares their keyboard, so its keys cannot be posted with
         // the app's own keyboard state. It already has the keyboard, which reaches it with nothing
-        // moving, as --real would.
+        // moving; `allow_bring = false` guarantees we never steal focus if the person switched away.
         match posted {
-            Err(why) if why.contains(act::IN_FRONT) && win::front_is(tracked.hwnd, &view.surfaces) => keyboard(),
+            Err(why) if why.contains(act::IN_FRONT) && !self.quiet.load(Ordering::Relaxed) && win::front_is(tracked.hwnd, &view.surfaces) => keyboard(false),
             other => other,
         }
     }
@@ -1842,14 +2077,28 @@ impl Service {
             let done = self.front(tracked, view, &points, Loan::Mouse, || strokes.iter().all(|path| real::stroke(path, button, modifiers, &self.stop, jump)))?;
             ("mouse", done)
         } else if act::needs_pen_at(tracked.hwnd, x, y) && (flags.real || !act::posts_with_capture(tracked.hwnd)) {
-            // The pen has a tip and a barrel button, and holding Shift for it would mean pressing
-            // the person's own keyboard.
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (synthetic pen borrows the cursor; run 'deskcrew quiet off' to allow)".into());
+            }
             if !modifiers.is_empty() || button == MouseButton::Middle {
                 return Err(PEN_LIMITS.into());
             }
-            let pen = Pen::new().ok_or(act::NO_PEN)?;
-            let draw = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && pen.stroke(path, button, &self.stop, jump)?));
-            let done = self.front(tracked, view, &points, Loan::Pen, draw)??;
+            let draw = || -> Result<bool, String> {
+                let pen = Pen::new().ok_or(act::NO_PEN)?;
+                strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && pen.stroke(path, button, &self.stop, jump)?))
+            };
+            let mut family = view.surfaces.clone();
+            family.push(tracked.hwnd);
+            let done = if flags.real {
+                self.front(tracked, view, &points, Loan::Pen, draw)??
+            } else if win::front_is(tracked.hwnd, &view.surfaces) && points.iter().all(|&(px, py)| win::owns_point(&family, px, py)) {
+                self.front_if_already(tracked, view, &points, Loan::Pen, draw)??
+            } else {
+                if win::minimized(tracked.hwnd) {
+                    return Err(MINIMIZED_POINT.into());
+                }
+                return Err(act::NEEDS_REAL.into());
+            };
             ("pen", done)
         } else {
             if let Some((x, y)) = points.iter().find(|(x, y)| !win::inside(tracked.hwnd, *x, *y)) {
@@ -1858,7 +2107,12 @@ impl Service {
                 }
                 return Err(format!("refused: {x},{y} on screen is not on this window"));
             }
-            let send = || strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, button, modifiers, &self.stop, jump)?));
+            let send = || {
+                let _lock = (!flags.real && win::is_background(tracked.hwnd)).then(win::ForegroundLock::take);
+                let out = strokes.iter().try_fold(true, |done, path| Ok::<bool, String>(done && act::post_stroke(tracked.hwnd, path, button, modifiers, &self.stop, jump)?));
+                win::stop_flashing(tracked.hwnd);
+                out
+            };
             let done = if flags.real { self.with_front(tracked, view, &points, send)?? } else { send()? };
             ("message", done)
         };
@@ -1907,6 +2161,7 @@ impl Service {
         self.overlay.over(who, tracked.hwnd);
         self.overlay.move_to(who, first.0 as i32, first.1 as i32);
         self.focus_in(&pids);
+        let _draw_lock = win::is_background(tracked.hwnd).then(win::ForegroundLock::take);
         tracked.drawers.fetch_add(1, Ordering::Relaxed);
         let mut result = Ok(true);
         let button = flags.mouse_button();
@@ -1940,6 +2195,7 @@ impl Service {
             }
         }
         tracked.drawers.fetch_sub(1, Ordering::Relaxed);
+        drop(_draw_lock);
         self.focus_out();
         win::stop_flashing(tracked.hwnd);
         match result? {
@@ -2605,7 +2861,11 @@ impl Service {
         let mut names: Vec<&String> = agents.keys().collect();
         names.sort();
         let names: Vec<&str> = names.iter().map(|n| n.as_str()).collect();
-        Ok(format_status(self.stop.load(Ordering::Relaxed), &names, self.overlay.stop_keys_error()))
+        let mut out = format_status(self.stop.load(Ordering::Relaxed), &names, self.overlay.stop_keys_error());
+        if self.quiet.load(Ordering::Relaxed) {
+            out.push_str("; quiet: on");
+        }
+        Ok(out)
     }
 
     fn handle(&self, who: &str, client_pid: Option<u32>, words: &[String]) -> Reply {
@@ -2620,6 +2880,11 @@ impl Service {
         let args = rest.get(1..).unwrap_or(&[]);
         if stopped_command(verb, args, &flags) && self.stop.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
+        }
+        if self.quiet.load(Ordering::Relaxed) && verb != "do"
+            && let Some(msg) = quiet_blocked(verb, args, &flags, None)
+        {
+            return Err(msg.into());
         }
         if !(verb == "do" && flags.dry) && matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
             return Err("declared risky: ask the person, then add --force".into());
@@ -2648,6 +2913,22 @@ impl Service {
             },
             "is" => self.is(who, &flags, args),
             "cursor" => self.borrow.set(args.first().map(String::as_str)),
+            "quiet" | "background-only" => match args.first().map(String::as_str) {
+                None | Some("status") => Ok(if self.quiet.load(Ordering::Relaxed) {
+                    "quiet: on (focus, --real, --mouse, --front, and down are refused)".into()
+                } else {
+                    "quiet: off".into()
+                }),
+                Some("on") => {
+                    self.quiet.store(true, Ordering::Relaxed);
+                    Ok("quiet: on (focus, --real, --mouse, --front, and down are refused)".into())
+                }
+                Some("off") => {
+                    self.quiet.store(false, Ordering::Relaxed);
+                    Ok("quiet: off".into())
+                }
+                _ => Err("quiet [on|off|status]".into()),
+            },
             "up" => {
                 let count = real::release_of(who);
                 let mut home = self.home.lock().unwrap();
@@ -2704,6 +2985,18 @@ impl Service {
                     let step_verb = step.words.first().map_or("", String::as_str);
                     reject_step_flags(step_verb, &flags, Some(&step.flags))?;
                 }
+                if self.quiet.load(Ordering::Relaxed) {
+                    if let Some(msg) = quiet_blocked("do", args, &flags, Some(&steps)) {
+                        return Err(msg.into());
+                    }
+                    for step in &steps {
+                        let step_verb = step.words.first().map_or("", String::as_str);
+                        let step_args = step.words.get(1..).unwrap_or(&[]);
+                        if let Some(msg) = quiet_blocked(step_verb, step_args, &step.flags, None) {
+                            return Err(msg.into());
+                        }
+                    }
+                }
                 if flags.mouse || steps.iter().any(|step| step.flags.mouse) {
                     self.borrow.allow(who, caller.resolve())?;
                 }
@@ -2732,6 +3025,9 @@ impl Service {
                 if act::is_shell_win_shortcut(&chord) {
                     if self.stop.load(Ordering::Relaxed) {
                         return Err(STOPPED.into());
+                    }
+                    if self.quiet.load(Ordering::Relaxed) {
+                        return Err(format!("refused: quiet mode is on ({spec} opens foreground shell UI; run 'deskcrew quiet off' to allow)"));
                     }
                     refuse_risky(&chord, spec, &flags)?;
                     return act::win_shortcut(&chord, None).unwrap().map(|route| format!("ok {route}"));
@@ -2860,6 +3156,7 @@ pub fn run() {
         home: Mutex::new(Home::default()),
         keeper: OnceLock::new(),
         stop,
+        quiet: AtomicBool::new(env_quiet()),
         last_request: Mutex::new(Instant::now()),
         active: AtomicUsize::new(0),
     });
@@ -2914,6 +3211,7 @@ fn stopped_command(verb: &str, args: &[String], flags: &Flags) -> bool {
     changes_things(verb, args)
         || (verb == "do" && !flags.dry)
         || (verb == "cursor" && args.first().is_some_and(|w| matches!(w.as_str(), "ask" | "session" | "always")))
+        || (matches!(verb, "quiet" | "background-only") && args.first().map(String::as_str) == Some("off"))
         || matches!(
             verb,
             "launch"
@@ -3088,5 +3386,24 @@ mod tests {
         assert!(stopped_command("cursor", &["always".into()], &flags));
         assert!(!stopped_command("cursor", &["off".into()], &flags));
         assert!(!stopped_command("cursor", &[], &flags));
+        assert!(stopped_command("quiet", &["off".into()], &flags));
+        assert!(!stopped_command("quiet", &["on".into()], &flags));
+        assert!(!stopped_command("quiet", &[], &flags));
+    }
+
+    #[test]
+    fn quiet_mode_blocks_focus_and_real_input() {
+        let plain = Flags::default();
+        assert!(quiet_blocked("focus", &[], &plain, None).is_some());
+        assert!(quiet_blocked("down", &[], &plain, None).is_some());
+        assert!(quiet_blocked("notifications", &[], &plain, None).is_some());
+        assert!(quiet_blocked("notifications", &["close".into()], &plain, None).is_none());
+        assert!(quiet_blocked("click", &[], &Flags { real: true, ..Flags::default() }, None).is_some());
+        assert!(quiet_blocked("click", &[], &Flags { mouse: true, ..Flags::default() }, None).is_some());
+        assert!(quiet_blocked("launch", &[], &Flags { front: true, ..Flags::default() }, None).is_some());
+        assert!(quiet_blocked("click", &[], &plain, None).is_none());
+        assert!(quiet_blocked("type", &[], &Flags { paste: true, ..Flags::default() }, None).is_none());
+        let step_real = vec![Step { flags: Flags { real: true, ..Flags::default() }, words: vec!["click".into(), "e1".into()] }];
+        assert!(quiet_blocked("do", &[], &plain, Some(&step_real)).is_some());
     }
 }

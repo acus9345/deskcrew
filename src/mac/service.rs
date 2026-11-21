@@ -31,19 +31,21 @@ windows [filter]                      list windows
 see [window] [-f] [-a] [--find word] [--from N]
                                       controls; later reads show only changes (-f for all, -a off-screen too)
 get e3                                a control's full text
+table e3 [--from N]                   a table or list as tab-separated rows
 shot [window|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
                                       PNG path; \"unchanged\" if it matches the last one
-click e3 [e4 ...] | \"Name\" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift]
+click e3 [e4 ...] | \"Name\" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift] [--hold ms]
 hover e3 | x,y     check e3     uncheck e3     toggle e3     expand e3     collapse e3     clear e3
 is e3 on|off|open|closed|selected|enabled|disabled
 down shift     up (lets go; 30 s limit)
 set e3 \"value\"     type [e3] \"text\" [--paste]     key enter [--hold ms]     select e3 \"Item\"
-scroll [e3] up|down [n]     show e3     wait \"text\" [--gone] [--ms N]
-drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth]
+scroll [e3] up|down|left|right [n]     show e3     wait \"text\"|ms [--gone] [--ms N]
+drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth] [--fill] [--close]
+pick-file \"path\"                      choose a file in an open file dialog
 do \"click e1; set e2 hi; key enter\" [--dry] [--risk low|medium|high]   many steps, one reply
 Any action: --expect \"text\" fails unless the text shows afterwards.
-launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
-apps     screens     clip     clip set \"text\"     clip clear     status     resume     quit     setup (installs for your coding agents)     mcp (the same as MCP tools, over stdio)
+launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore|left|right|monitor N
+notifications [close]     apps     screens     clip     clip set \"text\"     clip clear     status     cursor     quiet [on|off]     resume     quit     setup     mcp
 Every action replies with what changed, in the picture too. x,y are points in the last shot, or text see read. Ctrl+Option+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
 --real (brings the app forward for a moment and uses the system keyboard: a last resort).
@@ -62,6 +64,11 @@ const WAIT_MOST_MS: u64 = 60_000;
 const WAIT_STEP: Duration = Duration::from_millis(200);
 const MAX_WINDOWS: usize = 40;
 const MAX_GET_CHARS: usize = 20_000;
+const TABLE_CHARS: usize = 6000;
+const MAX_TABLE_ROWS: usize = 500;
+const MAX_TABLE_COLUMNS: usize = 20;
+const MAX_CELL_CHARS: usize = 60;
+const DIALOG_CLOSE: Duration = Duration::from_secs(3);
 const HOLD_MOST: Duration = Duration::from_secs(30);
 const FRONT_SETTLE: Duration = Duration::from_millis(80);
 const PASTE_SETTLE: Duration = Duration::from_millis(150);
@@ -121,6 +128,7 @@ struct View {
     nodes: BTreeMap<u32, Node>,
     lines: Seen,
     hidden: usize,
+    quiet: Vec<Bounds>,
     element: Option<Owned>,
     read_once: bool,
     blind: Option<(u64, Vec<String>)>,
@@ -352,7 +360,30 @@ struct Service {
     agents: Mutex<HashMap<String, AgentState>>,
     overlay: Overlay,
     last_used: Mutex<Instant>,
+    quiet: AtomicBool,
     quit: AtomicBool,
+}
+
+fn env_quiet() -> bool {
+    std::env::var("DESKCREW_QUIET")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+fn quiet_blocked(verb: &str, flags: &Flags, steps: Option<&[Step]>) -> Option<&'static str> {
+    if verb == "focus" {
+        return Some("refused: quiet mode is on (focus is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if verb == "down" {
+        return Some("refused: quiet mode is on (down borrows real input; run 'deskcrew quiet off' to allow)");
+    }
+    if flags.real || steps.is_some_and(|s| s.iter().any(|st| st.flags.real)) {
+        return Some("refused: quiet mode is on (--real is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if verb == "launch" && flags.front {
+        return Some("refused: quiet mode is on (launch --front is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    None
 }
 
 impl Service {
@@ -443,7 +474,8 @@ impl Service {
             view.element = apps::element(&window);
         }
         let element = view.element.as_ref().ok_or("that window does not answer accessibility requests")?;
-        let (nodes, hidden) = ax::read(element, window.rect, all);
+        let (nodes, hidden, quiet) = ax::read(tracked.pid, element, window.rect, all);
+        view.quiet = quiet;
         view.nodes = view.refs.assign(nodes);
         view.lines = view.nodes.iter().map(|(id, node)| (*id, lines::line(&node.parts))).collect();
         view.hidden = hidden;
@@ -478,6 +510,10 @@ impl Service {
     }
 
     fn resolve(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<Target, String> {
+        self.resolve_for(word, who, tracked, view, |_| true)
+    }
+
+    fn resolve_for(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View, fits: impl Fn(&Node) -> bool) -> Result<Target, String> {
         if let Some((x, y)) = is_point(word) {
             let frames = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.window).map(|s| s.frames));
             let frames = frames.ok_or("x,y are points in a shot: take one first")?;
@@ -495,20 +531,51 @@ impl Service {
             if attempt == 1 || !view.read_once {
                 self.read(tracked, view, false)?;
             }
-            let exact: Vec<u32> = view.nodes.iter().filter(|(_, n)| n.parts.name.to_lowercase() == wanted).map(|(id, _)| *id).collect();
-            let found = if exact.is_empty() {
-                view.nodes.iter().filter(|(_, n)| n.parts.name.to_lowercase().contains(&wanted)).map(|(id, _)| *id).collect()
-            } else {
-                exact
+            let named = |exact: bool| -> Vec<u32> {
+                view.nodes
+                    .iter()
+                    .filter(|(_, n)| {
+                        let name = n.parts.name.to_lowercase();
+                        if exact { name == wanted } else { name.contains(&wanted) }
+                    })
+                    .map(|(id, _)| *id)
+                    .collect()
             };
-            match found.as_slice() {
+            let mut hits = named(true);
+            if hits.is_empty() {
+                hits = named(false);
+            } else if !hits.iter().any(|id| fits(&view.nodes[id])) {
+                let able: Vec<u32> = named(false).into_iter().filter(|id| fits(&view.nodes[id])).collect();
+                if !able.is_empty() {
+                    hits = able;
+                }
+            }
+            if hits.len() > 1 {
+                let able: Vec<u32> = hits.iter().copied().filter(|id| fits(&view.nodes[id])).collect();
+                if !able.is_empty() {
+                    hits = able;
+                }
+            }
+            if hits.len() > 1 {
+                let acting: Vec<u32> = hits.iter().copied().filter(|id| MARKED.contains(&view.nodes[id].parts.role.as_str())).collect();
+                if !acting.is_empty() {
+                    hits = acting;
+                }
+            }
+            if hits.len() > 1 {
+                let inner: Vec<u32> = hits
+                    .iter()
+                    .copied()
+                    .filter(|id| !hits.iter().any(|other| other != id && ax::encloses(view.nodes[id].rect, view.nodes[other].rect)))
+                    .collect();
+                if inner.len() == 1 {
+                    hits = inner;
+                }
+            }
+            match hits.as_slice() {
                 [] => continue,
                 [one] => return Ok(Target::Control(*one)),
                 many => {
-                    let acting: Vec<u32> = many.iter().copied().filter(|id| MARKED.contains(&view.nodes[id].parts.role.as_str())).collect();
-                    if let [one] = acting.as_slice() {
-                        return Ok(Target::Control(*one));
-                    }
                     let shown: Vec<String> = many.iter().take(6).map(|id| format!("e{id} {}", view.lines[id])).collect();
                     return Err(format!("'{word}' matches {} controls:\n{}", many.len(), shown.join("\n")));
                 }
@@ -531,12 +598,15 @@ impl Service {
         } else {
             self.overlay.move_to(who, x, y);
         }
-        self.overlay.over(who, tracked.window);
     }
 
     /// A control's box now, and its element, for acting on it.
     fn control(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<(u32, Bounds, Owned), String> {
-        match self.resolve(word, who, tracked, view)? {
+        self.control_for(word, who, tracked, view, |_| true)
+    }
+
+    fn control_for(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View, fits: impl Fn(&Node) -> bool) -> Result<(u32, Bounds, Owned), String> {
+        match self.resolve_for(word, who, tracked, view, fits)? {
             Target::Control(id) => {
                 let node = &view.nodes[&id];
                 Ok((id, ax::rect(&node.element).unwrap_or(node.rect), node.element.clone()))
@@ -547,6 +617,24 @@ impl Service {
 
     fn pressed(&self, who: &str, rect: Bounds) {
         self.overlay.press(who, Rect { x: rect.0, y: rect.1, w: rect.2, h: rect.3 });
+    }
+
+    /// Run a background action while ensuring the target app does not keep focus if it tried to
+    /// self-activate on a posted event or accessibility call. Skips restoration if the person
+    /// interacted with the mouse/keyboard during the call so intentional app switches stay put.
+    fn keep_behind<T>(&self, tracked: &Tracked, flags: &Flags, work: impl FnOnce() -> T) -> T {
+        let before = (!flags.real).then(apps::front_pid).flatten();
+        let started = Instant::now();
+        let result = work();
+        let elapsed = started.elapsed().as_secs_f64();
+        if let Some(prev) = before
+            && prev != tracked.pid
+            && apps::front_pid() == Some(tracked.pid)
+            && apps::idle_seconds() >= elapsed
+        {
+            apps::activate(prev);
+        }
+        result
     }
 
     /// Bring the app forward for `work`, then give the front back to whatever had it. Agents take
@@ -600,6 +688,7 @@ impl Service {
     fn click(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let button = flags.mouse_button()?;
         let count = if flags.triple { 3 } else if flags.double { 2 } else { 1 };
+        let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
         let with = match &flags.with {
             Some(spec) => input::modifiers(spec)?,
             None => 0,
@@ -615,9 +704,19 @@ impl Service {
         self.cursor_on(who, flags, tracked, x, y);
         self.pressed(who, rect);
         // An action the app performs itself works behind other windows and takes no focus.
-        if let Some(element) = &element
+        // For coordinate clicks without a named control, try background AX hit-testing on the
+        // target app first so covered Electron/SwiftUI/AppKit controls still press silently.
+        let ax_target = element.clone().or_else(|| {
+            if with == 0 && count == 1 && hold.is_zero() && !flags.real {
+                ax::element_at(tracked.pid, x as f32, y as f32)
+            } else {
+                None
+            }
+        });
+        if let Some(element) = &ax_target
             && with == 0
             && count == 1
+            && hold.is_zero()
             && !flags.real
         {
             let action = match button {
@@ -626,17 +725,17 @@ impl Service {
                 _ => None,
             };
             if let Some(action) = action
-                && ax::perform(element, action).is_ok()
+                && self.keep_behind(tracked, flags, || ax::perform(element, action).is_ok())
             {
                 return Ok(if button == Button::Right { "menu".into() } else { "press".into() });
             }
         }
-        let send = || input::click(tracked.pid, tracked.window, x as f64, y as f64, button, count, with);
+        let send = || input::click(tracked.pid, tracked.window, (x as f64, y as f64), button, count, with, hold);
         if flags.real {
             self.front(tracked, send)?;
             Ok("real".into())
         } else {
-            send()?;
+            self.keep_behind(tracked, flags, send)?;
             Ok("event".into())
         }
     }
@@ -644,7 +743,7 @@ impl Service {
     fn hover(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let (x, y) = self.point_of(word, who, tracked, view)?;
         self.cursor_on(who, flags, tracked, x, y);
-        input::hover(tracked.pid, tracked.window, x as f64, y as f64)?;
+        self.keep_behind(tracked, flags, || input::hover(tracked.pid, tracked.window, x as f64, y as f64))?;
         Ok("hover".into())
     }
 
@@ -652,13 +751,38 @@ impl Service {
         let (_, rect, element) = self.control(word, who, tracked, view)?;
         let (x, y) = centre(rect);
         self.cursor_on(who, flags, tracked, x, y);
-        if !ax::settable(&element, "AXValue") {
-            return Err("that control's text can't be set: try type".into());
+        if ax::settable(&element, "AXValue") {
+            self.overlay.typing(who, value.chars().count());
+            self.keep_behind(tracked, flags, || ax::set_text(&element, value))?;
+            self.pressed(who, rect);
+            return Ok("value".into());
         }
-        self.overlay.typing(who, value.chars().count());
-        ax::set_text(&element, value)?;
-        self.pressed(who, rect);
-        Ok("value".into())
+        if ax::settable(&element, "AXSelectedText") {
+            self.overlay.typing(who, value.chars().count());
+            self.keep_behind(tracked, flags, || -> Result<(), String> {
+                let _ = ax::focus(&element);
+                let mut selected_all = ax::select_all_text(&element);
+                if !selected_all && ax::text(&element, "AXValue").is_some_and(|t| t.is_empty()) {
+                    selected_all = true;
+                }
+                if !selected_all
+                    && let Ok(all) = input::chord("cmd+a")
+                {
+                    let _ = input::press(input::To::App(tracked.pid), &all, 0, Duration::ZERO);
+                    thread::sleep(SETTLE_FIRST);
+                    if let Some(full) = ax::text(&element, "AXValue") {
+                        selected_all = full.is_empty() || ax::selected_text(&element).as_deref() == Some(full.as_str());
+                    }
+                }
+                if !selected_all {
+                    return Err("could not select all text in that control: try type or --real".into());
+                }
+                ax::insert_selected_text(&element, value)
+            })?;
+            self.pressed(who, rect);
+            return Ok("selected text".into());
+        }
+        Err("that control's text can't be set: try type".into())
     }
 
     /// Leave a checkbox or switch alone if it is already that way, or press it once.
@@ -672,7 +796,7 @@ impl Service {
         let (x, y) = centre(rect);
         self.cursor_on(who, flags, tracked, x, y);
         self.pressed(who, rect);
-        ax::perform(&element, "AXPress")?;
+        self.keep_behind(tracked, flags, || ax::perform(&element, "AXPress"))?;
         Ok("toggle".into())
     }
 
@@ -685,19 +809,22 @@ impl Service {
         let (x, y) = centre(rect);
         self.cursor_on(who, flags, tracked, x, y);
         self.pressed(who, rect);
-        if ax::settable(&element, "AXExpanded") {
-            ax::set_bool(&element, "AXExpanded", open)?;
-        } else if open && view.nodes[&id].parts.role == "combobox" {
-            ax::perform(&element, "AXShowMenu").or_else(|_| ax::perform(&element, "AXPress"))?;
-        } else {
-            ax::perform(&element, "AXPress").map_err(|_| format!("that control cannot be {}", if open { "expanded" } else { "collapsed" }))?;
-        }
+        self.keep_behind(tracked, flags, || {
+            if ax::settable(&element, "AXExpanded") {
+                ax::set_bool(&element, "AXExpanded", open)
+            } else if open && view.nodes[&id].parts.role == "combobox" {
+                ax::perform(&element, "AXShowMenu").or_else(|_| ax::perform(&element, "AXPress"))
+            } else {
+                ax::perform(&element, "AXPress").map_err(|_| format!("that control cannot be {}", if open { "expanded" } else { "collapsed" }))
+            }
+        })?;
         Ok("expand".into())
     }
 
     fn show(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let (_, _, element) = self.control(word, who, tracked, view)?;
-        ax::perform(&element, "AXScrollToVisible").map_err(|_| "that control cannot scroll into view".to_string())?;
+        self.keep_behind(tracked, &Flags::default(), || ax::perform(&element, "AXScrollToVisible"))
+            .map_err(|_| "that control cannot scroll into view".to_string())?;
         Ok("scroll".into())
     }
 
@@ -709,17 +836,17 @@ impl Service {
         self.pressed(who, rect);
         let ax_role = view.nodes[&id].ax_role.clone();
         if ax_role == "AXComboBox" && ax::settable(&element, "AXValue") {
-            ax::set_text(&element, item)?;
+            self.keep_behind(tracked, flags, || ax::set_text(&element, item))?;
             return Ok("value".into());
         }
         if ax_role == "AXPopUpButton" || ax_role == "AXMenuButton" {
-            ax::perform(&element, "AXPress").map_err(|_| "that dropdown did not answer".to_string())?;
+            self.keep_behind(tracked, flags, || ax::perform(&element, "AXPress")).map_err(|_| "that dropdown did not answer".to_string())?;
             thread::sleep(MENU_OPEN);
             if let Some(entry) = ax::find_named(&element, item, MENU_DEPTH) {
-                ax::perform(&entry, "AXPress")?;
+                self.keep_behind(tracked, flags, || ax::perform(&entry, "AXPress"))?;
                 return Ok("select".into());
             }
-            let _ = input::press(input::To::App(tracked.pid), &input::chord("esc")?, 0, Duration::ZERO);
+            let _ = self.keep_behind(tracked, flags, || input::press(input::To::App(tracked.pid), &input::chord("esc")?, 0, Duration::ZERO));
             return Err(format!("no entry named '{item}'"));
         }
         let entry = ax::find_named(&element, item, LIST_DEPTH).ok_or(format!("no entry named '{item}'"))?;
@@ -732,10 +859,10 @@ impl Service {
                 _ => break,
             }
         }
-        match row.filter(|at| ax::settable(at, "AXSelected")) {
-            Some(at) => ax::set_bool(&at, "AXSelected", true)?,
-            None => ax::perform(&entry, "AXPress")?,
-        }
+        self.keep_behind(tracked, flags, || match row.filter(|at| ax::settable(at, "AXSelected")) {
+            Some(at) => ax::set_bool(&at, "AXSelected", true),
+            None => ax::perform(&entry, "AXPress"),
+        })?;
         Ok("select".into())
     }
 
@@ -750,12 +877,25 @@ impl Service {
             let (_, rect, element) = self.control(word, who, tracked, view)?;
             let (x, y) = centre(rect);
             self.cursor_on(who, flags, tracked, x, y);
-            let _ = ax::focus(&element);
+            let _ = self.keep_behind(tracked, flags, || ax::focus(&element));
             field = Some(element);
         }
         self.overlay.typing(who, text.chars().count());
+        // For rich editors in the background (contenteditable, Monaco, Slack, Discord, Notion)
+        // that expose AXSelectedText without AXValue, insert directly through AXSelectedText so
+        // we never double-paste or depend on background CGEvent key acceptance.
+        if !flags.real
+            && let Some(field) = &field
+            && ax::text(field, "AXValue").is_none()
+            && apps::front_pid() != Some(tracked.pid)
+            && ax::settable(field, "AXSelectedText")
+            && self.keep_behind(tracked, flags, || ax::insert_selected_text(field, text).is_ok())
+        {
+            return Ok("selected text".into());
+        }
         if flags.paste {
-            let before = field.as_ref().and_then(|f| ax::text(f, "AXValue"));
+            let focused_or_field = field.clone().or_else(|| ax::focused_element(tracked.pid, tracked.window, view.element.as_ref()));
+            let before = focused_or_field.as_ref().and_then(|f| ax::text(f, "AXValue"));
             let mut saved = apps::SavedClipboard::take();
             if let Err(error) = saved.lend(text) {
                 let _ = saved.put_back();
@@ -766,21 +906,34 @@ impl Service {
                 if flags.real {
                     self.front(tracked, || input::press(input::To::Front, &paste, 0, Duration::ZERO))
                 } else {
-                    input::press(input::To::App(tracked.pid), &paste, 0, Duration::ZERO)
+                    // Prefer the app's own Edit -> Paste menu item via AXPress when this window is
+                    // the app's main (or only) window, so multi-window apps never paste into the
+                    // wrong window.
+                    if ax::is_main_or_only_window(tracked.pid, tracked.window)
+                        && let Some(Ok(_)) = self.keep_behind(tracked, flags, || ax::press_menu_shortcut(tracked.pid, Some('v'), paste.key, paste.flags))
+                    {
+                        Ok(())
+                    } else {
+                        self.keep_behind(tracked, flags, || input::press(input::To::App(tracked.pid), &paste, 0, Duration::ZERO))
+                    }
                 }
             });
             thread::sleep(PASTE_SETTLE);
             saved.put_back()?;
             sent?;
-            // Chromium and Electron apps ignore Cmd+V while they are behind other windows: a field
-            // that did not get the text gets it through accessibility, which needs no focus.
-            if let (Some(field), Some(before)) = (&field, before)
+            // If the background app ignored both menu Paste and Cmd+V, insert directly via AX.
+            if let (Some(target_el), Some(before)) = (&focused_or_field, before)
                 && !flags.real
-                && ax::text(field, "AXValue").as_deref() == Some(before.as_str())
-                && ax::settable(field, "AXValue")
+                && ax::text(target_el, "AXValue").as_deref() == Some(before.as_str())
             {
-                ax::set_text(field, &(before + text))?;
-                return Ok("value".into());
+                if ax::settable(target_el, "AXSelectedText") {
+                    self.keep_behind(tracked, flags, || ax::insert_selected_text(target_el, text))?;
+                    return Ok("selected text".into());
+                }
+                if ax::settable(target_el, "AXValue") {
+                    self.keep_behind(tracked, flags, || ax::set_text(target_el, &(before + text)))?;
+                    return Ok("value".into());
+                }
             }
             return Ok("paste".into());
         }
@@ -790,43 +943,55 @@ impl Service {
         // the first. A field that did not get every letter gets the rest letter by letter through
         // accessibility, which needs no focus, at the same speed as typing.
         let mut rest = text;
-        if let Some(field) = &field
+        if let (Some(field), Some(before_val)) = (&field, &before)
             && !flags.real
             && let Some(first) = text.chars().next()
         {
-            input::type_text(input::To::App(tracked.pid), &first.to_string(), &stop)?;
+            self.keep_behind(tracked, flags, || input::type_text(input::To::App(tracked.pid), &first.to_string(), &stop))?;
             thread::sleep(SETTLE_FIRST);
-            let wanted = before.clone().unwrap_or_default() + text;
-            if ax::text(field, "AXValue") == before && ax::settable(field, "AXValue") {
-                return fill(field, before.clone().unwrap_or_default(), &wanted, &stop);
+            let wanted = before_val.clone() + text;
+            if ax::text(field, "AXValue").as_deref() == Some(before_val.as_str()) {
+                if ax::settable(field, "AXValue") {
+                    return self.keep_behind(tracked, flags, || fill(field, before_val.clone(), &wanted, &stop));
+                }
+                if ax::settable(field, "AXSelectedText") {
+                    self.keep_behind(tracked, flags, || ax::insert_selected_text(field, text))?;
+                    return Ok("selected text".into());
+                }
             }
             rest = &text[first.len_utf8()..];
         }
         let typed = if flags.real {
             self.front(tracked, || input::type_text(input::To::Front, rest, &stop))?
         } else {
-            input::type_text(input::To::App(tracked.pid), rest, &stop)?
+            self.keep_behind(tracked, flags, || input::type_text(input::To::App(tracked.pid), rest, &stop))?
         };
         if typed < rest.chars().count() {
             let first = text.chars().count() - rest.chars().count();
             return Err(format!("{STOPPED} (typed {} of {} characters)", first + typed, text.chars().count()));
         }
-        if let Some(field) = field
+        if let (Some(field), Some(before_val)) = (field, before)
             && !flags.real
         {
             thread::sleep(SETTLE_FIRST);
-            let wanted = before.clone().unwrap_or_default() + text;
+            let wanted = before_val.clone() + text;
             let now = ax::text(&field, "AXValue").unwrap_or_default();
-            if now != wanted && ax::settable(&field, "AXValue") {
-                // Keep what did land, as far as it matches, and put the rest in.
-                let kept: String = now.chars().zip(wanted.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a).collect();
-                return fill(&field, kept, &wanted, &stop);
+            if now != wanted {
+                if ax::settable(&field, "AXValue") {
+                    // Keep what did land, as far as it matches, and put the rest in.
+                    let kept: String = now.chars().zip(wanted.chars()).take_while(|(a, b)| a == b).map(|(a, _)| a).collect();
+                    return self.keep_behind(tracked, flags, || fill(&field, kept, &wanted, &stop));
+                }
+                if now == before_val && ax::settable(&field, "AXSelectedText") {
+                    self.keep_behind(tracked, flags, || ax::insert_selected_text(&field, text))?;
+                    return Ok("selected text".into());
+                }
             }
         }
         Ok(if flags.real { "keyboard".into() } else { "keys".into() })
     }
 
-    fn key(&self, who: &str, flags: &Flags, tracked: &Tracked, spec: &str) -> Reply {
+    fn key(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &View, spec: &str) -> Reply {
         let chord = input::chord(spec)?;
         if input::is_risky(&chord) && !flags.force {
             return Err(format!("'{spec}' can quit or close things: ask the person, then add --force"));
@@ -835,11 +1000,101 @@ impl Service {
         let held = self.held_flags(who, tracked.pid);
         if flags.real {
             self.front(tracked, || input::press(input::To::Front, &chord, held, hold))?;
-            Ok("keyboard".into())
-        } else {
-            input::press(input::To::App(tracked.pid), &chord, held, hold)?;
-            Ok("keys".into())
+            return Ok("keyboard".into());
         }
+        let all_flags = chord.flags | held;
+        let key_ch = chord.key.and_then(input::key_char);
+        let cmd_only = all_flags == kCGEventFlagMaskCommand;
+        // Background shortcut delivery: prefer triggering the app's own AXMenuBar item via AXPress,
+        // which executes in the app's responder chain without bringing the window to front.
+        if hold.is_zero() && all_flags != 0 {
+            let clip_before = (cmd_only && matches!(key_ch, Some('c' | 'x'))).then(apps::clipboard);
+            let focused = (cmd_only && matches!(key_ch, Some('c' | 'x' | 'v' | 'a')))
+                .then(|| ax::focused_element(tracked.pid, tracked.window, view.element.as_ref()))
+                .flatten();
+            let val_before = if cmd_only && key_ch == Some('v') {
+                focused.as_ref().and_then(|el| ax::text(el, "AXValue"))
+            } else {
+                None
+            };
+            if ax::is_main_or_only_window(tracked.pid, tracked.window)
+                && let Some(Ok(route)) = self.keep_behind(tracked, flags, || ax::press_menu_shortcut(tracked.pid, key_ch, chord.key, all_flags))
+            {
+                if let Some(before) = clip_before {
+                    thread::sleep(PASTE_SETTLE);
+                    if apps::clipboard() != before {
+                        return Ok(route);
+                    }
+                    // Menu Copy/Cut fired but clipboard didn't change: fall back to AXSelectedText.
+                    if let Some(ref el) = focused
+                        && let Some(sel) = ax::selected_text(el)
+                    {
+                        if key_ch == Some('x') {
+                            if ax::settable(el, "AXSelectedText") {
+                                apps::set_clipboard(Some(&sel))?;
+                                self.keep_behind(tracked, flags, || ax::insert_selected_text(el, ""))?;
+                                return Ok("cut selection".into());
+                            }
+                        } else {
+                            apps::set_clipboard(Some(&sel))?;
+                            return Ok("selected text".into());
+                        }
+                    }
+                } else if cmd_only && key_ch == Some('v') {
+                    thread::sleep(PASTE_SETTLE);
+                    if let (Some(el), Some(before)) = (&focused, &val_before)
+                        && ax::text(el, "AXValue").as_deref() == Some(before.as_str())
+                        && let Some(clip) = apps::clipboard()
+                        && ax::settable(el, "AXSelectedText")
+                    {
+                        self.keep_behind(tracked, flags, || ax::insert_selected_text(el, &clip))?;
+                        return Ok("selected text".into());
+                    }
+                }
+                return Ok(route);
+            }
+            // No matching menu item: try direct AX fallbacks for Copy, Cut, Paste, and Select All
+            // before/after CGEventPostToPid so unfocused apps never need to come forward.
+            if cmd_only && key_ch == Some('a')
+                && let Some(ref el) = focused
+                && self.keep_behind(tracked, flags, || ax::select_all_text(el))
+            {
+                return Ok("select all".into());
+            }
+            self.keep_behind(tracked, flags, || input::press(input::To::App(tracked.pid), &chord, held, hold))?;
+            if let Some(before) = clip_before {
+                thread::sleep(PASTE_SETTLE);
+                if apps::clipboard() == before
+                    && let Some(ref el) = focused
+                    && let Some(sel) = ax::selected_text(el)
+                {
+                    if key_ch == Some('x') {
+                        if ax::settable(el, "AXSelectedText") {
+                            apps::set_clipboard(Some(&sel))?;
+                            self.keep_behind(tracked, flags, || ax::insert_selected_text(el, ""))?;
+                            return Ok("cut selection".into());
+                        }
+                    } else {
+                        apps::set_clipboard(Some(&sel))?;
+                        return Ok("selected text".into());
+                    }
+                }
+            } else if cmd_only && key_ch == Some('v')
+                && let (Some(el), Some(before)) = (&focused, &val_before)
+            {
+                thread::sleep(PASTE_SETTLE);
+                if ax::text(el, "AXValue").as_deref() == Some(before.as_str())
+                    && let Some(clip) = apps::clipboard()
+                    && ax::settable(el, "AXSelectedText")
+                {
+                    self.keep_behind(tracked, flags, || ax::insert_selected_text(el, &clip))?;
+                    return Ok("selected text".into());
+                }
+            }
+            return Ok("keys".into());
+        }
+        self.keep_behind(tracked, flags, || input::press(input::To::App(tracked.pid), &chord, held, hold))?;
+        Ok("keys".into())
     }
 
     /// Hold modifier keys for this agent's later clicks and keys in this app, until `up`.
@@ -864,24 +1119,42 @@ impl Service {
     }
 
     fn scroll(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        let (target, direction, amount) = match words {
-            [direction] => (None, direction.as_str(), 3),
-            [target, direction] if direction == "up" || direction == "down" => (Some(target.as_str()), direction.as_str(), 3),
-            [direction, amount] => (None, direction.as_str(), amount.parse().unwrap_or(3)),
-            [target, direction, amount] => (Some(target.as_str()), direction.as_str(), amount.parse().unwrap_or(3)),
-            _ => return Err("scroll [control] up|down [n]".into()),
-        };
-        let (x, y) = match target {
-            Some(word) => self.point_of(word, who, tracked, view)?,
-            None => centre(self.window_of(tracked)?.rect),
-        };
-        let lines = match direction {
-            "up" => amount,
-            "down" => -amount,
-            _ => return Err("scroll [control] up|down [n]".into()),
+        let is_dir = |w: &String| matches!(w.as_str(), "up" | "down" | "left" | "right");
+        let at = words.iter().position(is_dir).ok_or("scroll [control] up|down|left|right [n]")?;
+        let direction = words[at].as_str();
+        let sideways = matches!(direction, "left" | "right");
+        let down = matches!(direction, "down" | "right");
+        let amount: i32 = words.get(at + 1).and_then(|n| n.parse().ok()).unwrap_or(3);
+        let target_word = words[..at].first().map(String::as_str);
+        let (element, (x, y)) = match target_word {
+            Some(word) => match self.resolve(word, who, tracked, view)? {
+                Target::Control(id) => {
+                    let node = &view.nodes[&id];
+                    (Some(node.element.clone()), centre(ax::rect(&node.element).unwrap_or(node.rect)))
+                }
+                Target::Point(x, y) => (None, (x, y)),
+            },
+            None => {
+                if let Some((_, node)) = view.nodes.iter().find(|(_, n)| n.parts.states.contains(&"scroll")) {
+                    (Some(node.element.clone()), centre(ax::rect(&node.element).unwrap_or(node.rect)))
+                } else {
+                    (None, centre(self.window_of(tracked)?.rect))
+                }
+            }
         };
         self.cursor_on(who, flags, tracked, x, y);
-        input::scroll(tracked.pid, x as f64, y as f64, lines)?;
+        if !flags.real
+            && let Some(el) = &element
+            && ax::scroll_bar(el, sideways, down, amount).unwrap_or(false)
+        {
+            return Ok("scroll".into());
+        }
+        let lines = match direction {
+            "up" | "left" => amount,
+            "down" | "right" => -amount,
+            _ => return Err("scroll [control] up|down|left|right [n]".into()),
+        };
+        self.keep_behind(tracked, flags, || input::scroll(tracked.pid, tracked.window, x as f64, y as f64, lines, sideways))?;
         Ok("event".into())
     }
 
@@ -898,18 +1171,29 @@ impl Service {
         let first = strokes.iter().flatten().next().ok_or("nothing to draw")?;
         self.cursor_on(who, flags, tracked, first.0 as i32, first.1 as i32);
         let stop = || STOP.load(Ordering::Relaxed);
-        for stroke in strokes {
-            let points: Vec<(f64, f64)> = stroke.iter().map(|p| (p.0 as f64, p.1 as f64)).collect();
-            let mut moved = |at: usize, x: f64, y: f64| {
-                if at.is_multiple_of(3) {
-                    self.overlay.jump(who, x as i32, y as i32);
+        let draw_all = || -> Result<bool, String> {
+            for stroke in strokes {
+                let points: Vec<(f64, f64)> = stroke.iter().map(|p| (p.0 as f64, p.1 as f64)).collect();
+                let mut moved = |at: usize, x: f64, y: f64| {
+                    if at.is_multiple_of(3) {
+                        self.overlay.jump(who, x as i32, y as i32);
+                    }
+                };
+                if !input::stroke(tracked.pid, tracked.window, &points, button, with, &stop, &mut moved)? {
+                    return Ok(false);
                 }
-            };
-            if !input::stroke(tracked.pid, tracked.window, &points, button, with, &stop, &mut moved)? {
-                return Err(STOPPED.into());
             }
+            Ok(true)
+        };
+        let finished = if flags.real {
+            self.front(tracked, draw_all)?
+        } else {
+            self.keep_behind(tracked, flags, draw_all)?
+        };
+        if !finished {
+            return Err(STOPPED.into());
         }
-        Ok("event".into())
+        Ok(if flags.real { "real".into() } else { "event".into() })
     }
 
     fn drag(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
@@ -980,7 +1264,18 @@ impl Service {
         self.strokes(who, flags, tracked, &strokes, button, with)
     }
 
-    fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
+    fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str, allow_ms: bool) -> Reply {
+        if allow_ms && !flags.gone && let Ok(ms) = text.parse::<u64>() {
+            let limit = Duration::from_millis(ms.min(WAIT_MOST_MS));
+            let started = Instant::now();
+            while started.elapsed() < limit {
+                if STOP.load(Ordering::Relaxed) {
+                    return Err(STOPPED.into());
+                }
+                thread::sleep(Duration::from_millis(50).min(limit.saturating_sub(started.elapsed())));
+            }
+            return Ok("waited".into());
+        }
         let limit = Duration::from_millis(flags.ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MOST_MS));
         let wanted = text.to_lowercase();
         let started = Instant::now();
@@ -998,6 +1293,75 @@ impl Service {
             }
             thread::sleep(WAIT_STEP);
         }
+    }
+
+    fn pick_file(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, path: &str) -> Reply {
+        // Support both Open (existing file) and Save (non-existent destination in an existing folder).
+        let input_path = std::path::Path::new(path);
+        let resolved = if let Ok(canon) = std::fs::canonicalize(input_path) {
+            canon
+        } else if let (Some(parent), Some(name)) = (input_path.parent(), input_path.file_name()) {
+            let parent_dir = if parent.as_os_str().is_empty() { std::path::Path::new(".") } else { parent };
+            std::fs::canonicalize(parent_dir)
+                .map(|dir| dir.join(name))
+                .map_err(|_| format!("no file or parent folder for '{path}'"))?
+        } else {
+            return Err(format!("no file at '{path}'"));
+        };
+        let full = resolved.to_string_lossy().into_owned();
+        let window = self.window_of(tracked)?;
+        let win_el = view.element.clone().or_else(|| apps::element(&window)).ok_or("that window does not answer accessibility requests")?;
+        let before_surfaces = ax::popup_surfaces(tracked.pid, &win_el);
+        let before_hashes: std::collections::HashSet<usize> = before_surfaces.iter().map(|s| unsafe { CFHash(s.0) }).collect();
+        let dialog = before_surfaces
+            .into_iter()
+            .find(|s| {
+                let r = ax::text(s, "AXRole").unwrap_or_default();
+                let sub = ax::text(s, "AXSubrole").unwrap_or_default();
+                matches!(r.as_str(), "AXSheet" | "AXDialog") || matches!(sub.as_str(), "AXDialog" | "AXSheet" | "AXSystemDialog")
+            })
+            .ok_or("no file dialog is open in this window")?;
+        // Open macOS "Go to the folder" sheet inside NSOpenPanel/NSSavePanel via Cmd+Shift+G,
+        // and ONLY write into a newly opened sheet/dialog so a dropped Cmd+Shift+G can never
+        // overwrite the panel's Search bar or Save-As filename box.
+        let go_to_folder = input::chord("cmd+shift+g")?;
+        let _ = self.keep_behind(tracked, flags, || input::press(input::To::App(tracked.pid), &go_to_folder, 0, Duration::ZERO));
+        thread::sleep(Duration::from_millis(250));
+        let after_surfaces = ax::popup_surfaces(tracked.pid, &win_el);
+        let path_field = after_surfaces
+            .into_iter()
+            .filter(|s| !before_hashes.contains(&unsafe { CFHash(s.0) }))
+            .rev()
+            .find_map(|surface| ax::editable_in_surface(&surface, 8));
+        let Some(field) = path_field else {
+            return Err("the 'Go to the folder' sheet did not open in the file dialog (try --real)".into());
+        };
+        self.keep_behind(tracked, flags, || ax::set_text(&field, &full))?;
+        thread::sleep(Duration::from_millis(120));
+        let enter = input::chord("enter")?;
+        let _ = self.keep_behind(tracked, flags, || input::press(input::To::App(tracked.pid), &enter, 0, Duration::ZERO));
+        thread::sleep(Duration::from_millis(250));
+        // Press the dialog's default Open / Save / Choose button if the panel is still open.
+        if let Some(default_btn) = ax::attribute(&dialog, "AXDefaultButton") {
+            let _ = self.keep_behind(tracked, flags, || ax::perform(&default_btn, "AXPress"));
+        } else {
+            self.read(tracked, view, false)?;
+            if let Some(btn) = view.nodes.values().find(|n| {
+                n.parts.role == "button"
+                    && matches!(n.parts.name.to_lowercase().as_str(), "open" | "save" | "choose" | "ok" | "select")
+            }) {
+                let _ = self.keep_behind(tracked, flags, || ax::perform(&btn.element, "AXPress"));
+            }
+        }
+        let started = Instant::now();
+        while started.elapsed() < DIALOG_CLOSE {
+            if ax::popup_surfaces(tracked.pid, &win_el).is_empty() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(80));
+        }
+        let _ = who;
+        Ok("pick-file".into())
     }
 
     fn step(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, step: &Step) -> Reply {
@@ -1026,24 +1390,26 @@ impl Service {
             ("show", [word]) => self.show(who, tracked, view, word),
             ("select", [word, item]) => self.select(who, &merged, tracked, view, word, item),
             ("type", rest) => self.type_text(who, &merged, tracked, view, rest),
-            ("key", [spec]) => self.key(who, &merged, tracked, spec),
+            ("key", [spec]) => self.key(who, &merged, tracked, view, spec),
             ("down", rest) => self.down(who, tracked, rest),
             ("scroll", rest) => self.scroll(who, &merged, tracked, view, rest),
             ("drag", [from, to]) => self.drag(who, &merged, tracked, view, from, to),
             ("draw", rest) => self.draw(who, &merged, tracked, view, rest),
-            ("wait", [text]) => self.wait(&merged, tracked, view, text),
+            ("wait", [text]) => self.wait(&merged, tracked, view, text, true),
+            ("expect", [text]) => self.wait(&merged, tracked, view, text, false),
+            ("pick-file", [path]) => self.pick_file(who, &merged, tracked, view, path),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
         }?;
         if let Some(text) = &step.flags.expect {
             let waiting = Flags { ms: merged.ms, ..Flags::default() };
-            self.wait(&waiting, tracked, view, text)?;
+            self.wait(&waiting, tracked, view, text, false)?;
         }
         Ok(route)
     }
 
     /// Where the window's picture changed since `before`, in window points, ignoring a caret.
-    fn picture_change(&self, tracked: &Tracked, width: i32, (before, units): &(Frame, f32)) -> Option<String> {
-        let (after, _) = capture::window(tracked.window, width).ok()?;
+    fn picture_change(&self, tracked: &Tracked, size: (i32, i32), (before, units): &(Frame, f32)) -> Option<String> {
+        let (after, _) = capture::window(tracked.window, size).ok()?;
         let (x, y, w, h) = after.changed_from(before)?;
         let at = |value: u32| (value as f32 * units).round() as i32;
         if at(w) < LEAST_CHANGE as i32 || at(h) < LEAST_CHANGE as i32 {
@@ -1064,8 +1430,9 @@ impl Service {
             self.read(&tracked, view, false)?;
         }
         let before = self.seen(who, tracked.window).unwrap_or_else(|| view.lines.clone());
-        let width = self.window_of(&tracked)?.rect.2;
-        let picture_before = if unsafe { CGPreflightScreenCaptureAccess() } { capture::window(tracked.window, width).ok().filter(|(f, _)| !f.is_blank()) } else { None };
+        let rect = self.window_of(&tracked)?.rect;
+        let size = (rect.2, rect.3);
+        let picture_before = if unsafe { CGPreflightScreenCaptureAccess() } { capture::window(tracked.window, size).ok().filter(|(f, _)| !f.is_blank()) } else { None };
         let mut routes = Vec::new();
         let mut failure = None;
         for step in steps {
@@ -1093,7 +1460,7 @@ impl Service {
                 if complete {
                     self.remember(who, tracked.window, view.lines.clone());
                 }
-                let picture = if nothing && !waited_only { picture_before.as_ref().map(|b| self.picture_change(&tracked, width, b)) } else { None };
+                let picture = if nothing && !waited_only { picture_before.as_ref().map(|b| self.picture_change(&tracked, size, b)) } else { None };
                 match picture {
                     Some(Some(note)) => out.push(note),
                     Some(None) => out.push("nothing changed, on screen either".into()),
@@ -1164,9 +1531,14 @@ impl Service {
             return Vec::new();
         }
         let rect = window.rect;
-        let rects: Vec<_> = view.nodes.values().map(|n| (n.rect, CONTAINERS.contains(&n.parts.role.as_str()) && n.parts.name.is_empty())).collect();
+        let rects: Vec<_> = view
+            .nodes
+            .values()
+            .map(|n| (n.rect, CONTAINERS.contains(&n.parts.role.as_str()) && n.parts.name.is_empty()))
+            .chain(view.quiet.iter().map(|r| (*r, false)))
+            .collect();
         let Some((x, y, w, h)) = look::empty_area(rect, &rects) else { return Vec::new() };
-        let Ok((frame, units)) = capture::window(tracked.window, rect.2) else { return Vec::new() };
+        let Ok((frame, units)) = capture::window(tracked.window, (rect.2, rect.3)) else { return Vec::new() };
         let inside = |value: i32| (value as f32 / units) as u32;
         let part = frame.crop(inside(x - rect.0), inside(y - rect.1), inside(w).max(1), inside(h).max(1));
         if !part.busy() {
@@ -1224,6 +1596,58 @@ impl Service {
         Ok(ax::full_text(&view.nodes[&id].element).chars().take(MAX_GET_CHARS).collect())
     }
 
+    fn table(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
+        let word = words.first().ok_or("table needs a control")?;
+        let tracked = self.pick(who, flags.window.as_deref())?;
+        let mut view = tracked.view.lock().unwrap();
+        if !view.read_once {
+            self.read(&tracked, &mut view, false)?;
+        }
+        let (_, _, element) = self.control_for(word, who, &tracked, &mut view, |n| matches!(n.parts.role.as_str(), "table" | "list" | "item"))?;
+        let skip = flags.from.saturating_sub(1);
+        let grid = ax::table(&element, skip, MAX_TABLE_ROWS, MAX_TABLE_COLUMNS)?;
+        let cell = |text: &str| lines::clip(text, MAX_CELL_CHARS).replace('\t', " ");
+        let mut out = vec![format!("{} rows, {} columns", grid.total_rows, grid.total_columns)];
+        if !grid.headers.is_empty() {
+            out.push(grid.headers.iter().map(|h| cell(h)).collect::<Vec<_>>().join("\t"));
+        }
+        let mut chars: usize = out.iter().map(String::len).sum();
+        let mut shown = 0;
+        for row in &grid.rows {
+            let line = row.iter().map(|c| cell(c)).collect::<Vec<_>>().join("\t");
+            if shown > 0 && chars + line.len() > TABLE_CHARS {
+                break;
+            }
+            chars += line.len() + 1;
+            out.push(line);
+            shown += 1;
+        }
+        let last = skip + shown;
+        if last < grid.total_rows {
+            out.push(format!("rows {}-{last} of {} shown: table {word} --from {} reads on", skip + 1, grid.total_rows, last + 1));
+        }
+        Ok(out.join("\n"))
+    }
+
+    fn notifications(&self, close: bool) -> Reply {
+        let Some(pid) = apps::pid_of_app("NotificationCenter") else {
+            return Ok(if close { "ok".into() } else { "no notifications".into() });
+        };
+        let items = ax::notifications(pid);
+        if close {
+            for (_, btn) in items {
+                if let Some(btn) = btn {
+                    let _ = ax::perform(&btn, "AXPress");
+                }
+            }
+            return Ok("ok".into());
+        }
+        if items.is_empty() {
+            return Ok("no notifications".into());
+        }
+        Ok(items.into_iter().map(|(text, _)| text).collect::<Vec<_>>().join("\n"))
+    }
+
     fn shot(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let edge = flags.edge.unwrap_or(shot::DEFAULT_EDGE);
         if let Some(region) = &flags.region {
@@ -1266,8 +1690,8 @@ impl Service {
         let control = word.and_then(|w| is_ref(w));
         let tracked = self.pick(who, if control.is_some() { flags.window.as_deref() } else { word.map(String::as_str).or(flags.window.as_deref()) })?;
         let window = self.window_of(&tracked)?;
-        let (left, top, width, _) = window.rect;
-        let (mut frame, units) = capture::window(tracked.window, width)?;
+        let (left, top, width, height) = window.rect;
+        let (mut frame, units) = capture::window(tracked.window, (width, height))?;
         let mut origin = (left, top);
         if let Some(id) = control {
             let mut view = tracked.view.lock().unwrap();
@@ -1345,8 +1769,9 @@ impl Service {
         let mut agents = agents;
         agents.sort();
         let stopped = if STOP.load(Ordering::Relaxed) { "; stopped by Ctrl+Option+Esc" } else { "" };
+        let quiet = if self.quiet.load(Ordering::Relaxed) { "; quiet: on" } else { "" };
         let access = if ax::trusted(false) { "" } else { "; needs Accessibility permission" };
-        Ok(format!("deskcrew {} running; agents: {}{stopped}{access}", env!("CARGO_PKG_VERSION"), agents.join(", ")))
+        Ok(format!("deskcrew {} running; agents: {}{stopped}{quiet}{access}", env!("CARGO_PKG_VERSION"), agents.join(", ")))
     }
 
     fn is(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
@@ -1367,7 +1792,7 @@ impl Service {
         let tracked = self.pick(who, flags.window.as_deref())?;
         let window = self.window_of(&tracked)?;
         let element = apps::element(&window).ok_or("that window does not answer accessibility requests")?;
-        let word = words.first().ok_or("place x,y,w,h|min|max|restore")?;
+        let word = words.first().ok_or("place x,y,w,h|min|max|restore|left|right|monitor N")?;
         match word.as_str() {
             "min" => ax::set_bool(&element, "AXMinimized", true)?,
             "restore" | "show" => {
@@ -1379,9 +1804,29 @@ impl Service {
                 ax::set_position(&element, x, y)?;
                 ax::set_size(&element, w, h)?;
             }
+            "left" | "right" => {
+                let (x, y, w, h) = apps::work_area();
+                let half = w / 2;
+                let nx = if word == "right" { x + half } else { x };
+                let nw = if word == "right" { w - half } else { half };
+                ax::set_position(&element, nx, y)?;
+                ax::set_size(&element, nw, h)?;
+            }
+            "monitor" => {
+                let index: usize = words.get(1).and_then(|n| n.parse().ok()).ok_or("place monitor N (see deskcrew screens)")?;
+                let screens = apps::screens();
+                let (dst, _) = screens.get(index).ok_or(format!("no monitor {index}: run deskcrew screens"))?;
+                let (_, _, cur_w, cur_h) = window.rect;
+                let w = cur_w.min(dst.2).max(100);
+                let h = cur_h.min(dst.3).max(100);
+                let x = dst.0 + (dst.2 - w) / 2;
+                let y = dst.1 + (dst.3 - h) / 2;
+                ax::set_position(&element, x, y)?;
+                ax::set_size(&element, w, h)?;
+            }
             box_text => {
                 let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-                let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
+                let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into()) };
                 ax::set_position(&element, x, y)?;
                 ax::set_size(&element, w, h)?;
             }
@@ -1409,12 +1854,23 @@ impl Service {
             return Err(error.clone());
         }
         let (command, args) = rest.split_first().ok_or(HELP)?;
+        let changes = matches!(command.as_str(), "focus" | "close" | "place")
+            || (command == "clip" && !args.is_empty())
+            || (matches!(command.as_str(), "quiet" | "background-only") && args.first().map(String::as_str) == Some("off"));
+        if changes && STOP.load(Ordering::Relaxed) {
+            return Err(STOPPED.into());
+        }
+        if self.quiet.load(Ordering::Relaxed) && command != "do"
+            && let Some(msg) = quiet_blocked(command, &flags, None)
+        {
+            return Err(msg.into());
+        }
         if !(command == "do" && flags.dry) && matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
             return Err("declared risky: ask the person, then add --force".into());
         }
         let with_expect = |mut steps: Vec<Step>| {
             if let Some(text) = &flags.expect {
-                steps.push(Step { flags: Flags::default(), words: vec!["wait".to_string(), text.clone()] });
+                steps.push(Step { flags: Flags::default(), words: vec!["expect".to_string(), text.clone()] });
             }
             steps
         };
@@ -1424,6 +1880,7 @@ impl Service {
             "windows" => self.windows_list(who, args.first()),
             "see" => self.see(who, &flags, args),
             "get" => self.get(who, &flags, args),
+            "table" => self.table(who, &flags, args),
             "is" => self.is(who, &flags, args),
             "shot" => self.shot(who, &flags, args),
             "launch" => self.launch(who, &flags, args),
@@ -1468,9 +1925,27 @@ impl Service {
                 let gone = self.release_where(|holder| holder == who);
                 Ok(if gone.iter().any(|holder| holder == who) { "let go".into() } else { "nothing was held".into() })
             }
-            "cursor" => Err("the Mac version never borrows the cursor, so there is nothing to set".into()),
-            "notifications" => Err("notifications are not on the Mac version yet".into()),
-            "table" | "pick-file" => Err(format!("{command} is not on the Mac version yet")),
+            "cursor" => match args {
+                [] => Ok("cursor: off (the Mac version never borrows the person's cursor)".into()),
+                _ => Err("the Mac version never borrows the cursor, so there is nothing to set".into()),
+            },
+            "quiet" | "background-only" => match args.first().map(String::as_str) {
+                None | Some("status") => Ok(if self.quiet.load(Ordering::Relaxed) {
+                    "quiet: on (focus, --real, --front, and down are refused)".into()
+                } else {
+                    "quiet: off".into()
+                }),
+                Some("on") => {
+                    self.quiet.store(true, Ordering::Relaxed);
+                    Ok("quiet: on (focus, --real, --front, and down are refused)".into())
+                }
+                Some("off") => {
+                    self.quiet.store(false, Ordering::Relaxed);
+                    Ok("quiet: off".into())
+                }
+                _ => Err("quiet [on|off|status]".into()),
+            },
+            "notifications" => self.notifications(args.first().map(String::as_str) == Some("close")),
             "resume" => {
                 STOP.store(false, Ordering::Relaxed);
                 Ok("ok".into())
@@ -1512,6 +1987,17 @@ impl Service {
                         return Err("declared risky: ask the person, then add --force".into());
                     }
                 }
+                if self.quiet.load(Ordering::Relaxed) {
+                    if let Some(msg) = quiet_blocked("do", &flags, Some(&steps)) {
+                        return Err(msg.into());
+                    }
+                    for step in &steps {
+                        let step_verb = step.words.first().map_or("", String::as_str);
+                        if let Some(msg) = quiet_blocked(step_verb, &step.flags, None) {
+                            return Err(msg.into());
+                        }
+                    }
+                }
                 self.act(who, &flags, &with_expect(steps))
             }
             "click" if args.len() > 1 => {
@@ -1519,7 +2005,7 @@ impl Service {
                 self.act(who, &flags, &with_expect(steps))
             }
             "click" | "hover" | "set" | "clear" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "show" | "select" | "type" | "key"
-            | "down" | "scroll" | "drag" | "draw" | "wait" => {
+            | "down" | "scroll" | "drag" | "draw" | "wait" | "pick-file" => {
                 let mut words = vec![command.clone()];
                 words.extend(args.iter().cloned());
                 self.act(who, &flags, &with_expect(vec![Step { flags: Flags::default(), words }]))
@@ -1594,6 +2080,7 @@ pub fn run() {
         agents: Mutex::new(HashMap::new()),
         overlay,
         last_used: Mutex::new(Instant::now()),
+        quiet: AtomicBool::new(env_quiet()),
         quit: AtomicBool::new(false),
     });
     let server = service.clone();

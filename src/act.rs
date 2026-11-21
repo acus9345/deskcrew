@@ -81,31 +81,99 @@ pub fn press(node: &Node) -> Option<Result<String, String>> {
     None
 }
 
-/// Give a Chromium page in the back the keyboard, as a click in it would. Chromium routes keys by its
-/// own focus, not Windows', and gives it to the page when its window is told it is active: that
-/// message changes nothing on the screen but the title bar, and does not bring the window forward.
-/// Telling it after that it is inactive again takes the page's focus away, so it is left active.
-pub fn wake_page(root: Hwnd) {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{WA_ACTIVE, WM_ACTIVATE};
-    if win::is_chromium(root) && !win::front_thread(root) {
-        let mut ignored = 0;
-        unsafe { SendMessageTimeoutW(root as HWND, WM_ACTIVATE, WA_ACTIVE as usize, 0, SMTO_ABORTIFHUNG, 500, &mut ignored) };
+static PAGE_WAKE_DEPTH: std::sync::Mutex<std::collections::BTreeMap<Hwnd, usize>> = std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+/// Keeps a background Chromium/Electron/WebView2 window awake for posted clicks/keys, and hands
+/// Chromium's internal active state back to the person's foreground Chromium window (if another
+/// window of the same browser, e.g. AI Studio covering a Gemini PWA, was in front) once the
+/// outermost `PageWake` guard for that foreground window drops.
+#[must_use = "bind PageWake to `let _wake = act::wake_page(...)` so the background page stays awake across the action"]
+pub struct PageWake {
+    prev_chromium_front: Hwnd,
+}
+
+impl Drop for PageWake {
+    fn drop(&mut self) {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{WA_ACTIVE, WM_ACTIVATE};
+        if self.prev_chromium_front == 0 {
+            return;
+        }
+        let restore = {
+            let mut depths = PAGE_WAKE_DEPTH.lock().unwrap();
+            match depths.get_mut(&self.prev_chromium_front) {
+                Some(count) if *count > 1 => {
+                    *count -= 1;
+                    false
+                }
+                Some(_) => {
+                    depths.remove(&self.prev_chromium_front);
+                    true
+                }
+                None => false,
+            }
+        };
+        if restore && win::foreground() == self.prev_chromium_front {
+            let host = win::chromium_host(self.prev_chromium_front).unwrap_or(self.prev_chromium_front);
+            let mut ignored = 0;
+            unsafe {
+                SendMessageTimeoutW(
+                    host as HWND,
+                    WM_ACTIVATE,
+                    WA_ACTIVE as usize,
+                    0,
+                    SMTO_ABORTIFHUNG,
+                    300,
+                    &mut ignored,
+                );
+            }
+        }
     }
+}
+
+/// Give a Chromium/Electron/WebView2/CEF page in the back the keyboard/click target state.
+/// Chromium routes keys and mouse events by its own internal Aura focus, not Windows', and gives
+/// it to the page when its `Chrome_WidgetWin_1` host receives `WM_ACTIVATE(WA_ACTIVE)`: that
+/// message does not change Windows' foreground window or Z-order. Works even when another window
+/// of the same browser (e.g. AI Studio covering a Gemini PWA) is in front.
+pub fn wake_page(root: Hwnd) -> PageWake {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{WA_ACTIVE, WM_ACTIVATE};
+    let front = win::foreground();
+    if !win::is_chromium(root) || front == root {
+        return PageWake { prev_chromium_front: 0 };
+    }
+    let host = win::chromium_host(root).unwrap_or(root);
+    if front == host {
+        return PageWake { prev_chromium_front: 0 };
+    }
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
+    let mut ignored = 0;
+    unsafe { SendMessageTimeoutW(host as HWND, WM_ACTIVATE, WA_ACTIVE as usize, 0, SMTO_ABORTIFHUNG, 500, &mut ignored) };
+    let prev_chromium_front = if front != 0 && win::is_chromium(front) {
+        *PAGE_WAKE_DEPTH.lock().unwrap().entry(front).or_insert(0) += 1;
+        front
+    } else {
+        0
+    };
+    PageWake { prev_chromium_front }
 }
 
 /// How long a Store or WinUI app takes to bring its window forward after an accessibility action
 /// runs, which it does on Invoke, Toggle, SelectionItem and ExpandCollapse.
 const STORE_ACTIVATION: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// Run an accessibility action on `root`, keeping its app behind. A Store or WinUI app such as
-/// Calculator, Settings, Photos or the new Notepad comes forward a moment after accessibility acts
-/// on one of its controls, and WPF can for an instant: Windows' foreground lock, held through that
-/// moment, stops both.
+/// Run an accessibility action on `root`, keeping its app behind regardless of toolkit. A Store or
+/// WinUI app such as Calculator, Settings, Photos or the new Notepad comes forward a moment after
+/// accessibility acts on one of its controls, and WPF/Chromium/classic apps can try to activate as
+/// well: Windows' foreground lock + immediate foreground restoration stops focus steals across all
+/// app types, while never yanking focus if the person intentionally switched windows.
 pub fn behind<T>(root: Hwnd, work: impl FnOnce() -> T) -> T {
-    let store = win::is_store(root);
-    if !store && !win::draws_itself(root) {
+    let front = win::foreground();
+    if front == root {
         return work();
     }
+    let _keep = KeepBehind::new(root);
+    let store = win::is_store(root);
     let lock = win::ForegroundLock::try_take();
     let result = work();
     if lock.is_some() && store {
@@ -159,9 +227,18 @@ pub fn is_classic_row(node: &Node, root: Hwnd) -> bool {
     node.parts.role == "item" && ["LISTBOX", "SYSLISTVIEW32", "SYSTREEVIEW32"].iter().any(|name| class.contains(name))
 }
 
+/// True when posted mouse messages do nothing at `child` inside `root`. An embedded Chromium /
+/// WebView2 / CEF child takes posted mouse messages directly even when hosted inside WinUI or WPF.
+fn mouse_ignored_at(root: Hwnd, child: Hwnd) -> bool {
+    if win::is_chromium_class(&win::class(child)) {
+        return false;
+    }
+    win::ignores_posted_mouse(child) || win::ignores_posted_mouse(root)
+}
+
 /// True for a point where posted mouse messages do nothing, so only pen input can reach it.
 pub fn needs_pen_at(root: Hwnd, x: i32, y: i32) -> bool {
-    win::ignores_posted_mouse(win::child_at(root, x, y).0) || win::ignores_posted_mouse(root)
+    mouse_ignored_at(root, win::child_at(root, x, y).0)
 }
 
 pub fn post_command(root: Hwnd, id: usize) -> Result<String, String> {
@@ -185,7 +262,11 @@ fn with_state_held<T>(hwnd: Hwnd, keys: &[u16], work: impl FnOnce() -> T) -> T {
     unsafe {
         let theirs = GetWindowThreadProcessId(hwnd as HWND, std::ptr::null_mut());
         let mine = GetCurrentThreadId();
-        if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) || AttachThreadInput(mine, theirs, 1) == 0 {
+        if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
+            return work();
+        }
+        let _lock = win::ForegroundLock::take();
+        if AttachThreadInput(mine, theirs, 1) == 0 {
             return work();
         }
         let result = held_down(keys, work);
@@ -266,18 +347,22 @@ pub fn post_stroke(
     moved: impl FnMut(i32, i32),
 ) -> Result<bool, String> {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
     let Some(first) = path.first() else { return Ok(true) };
     let hwnd = win::child_at(root, first.0 as i32, first.1 as i32).0;
+    let chromium = win::is_chromium_class(&win::class(hwnd)) || win::is_chromium_class(&win::class(root));
+    let _wake = chromium.then(|| wake_page(root));
     let button_vk = match button {
         Button::Right => VK_RBUTTON,
         Button::Middle => VK_MBUTTON,
         _ => VK_LBUTTON,
     };
-    // Qt and Firefox read the button from the message, and would read a held state as the button
-    // still down when they get the release, joining one stroke to the next. WinForms needs it.
+    // Chromium/Electron/WebView2, Qt and Firefox read the button directly from wParam (MK_*).
+    // Skipping AttachThreadInput on them avoids activation/titlebar flicker and missed releases.
     let mut held = if win::reads_posted_mouse(hwnd) || win::reads_posted_mouse(root) { Vec::new() } else { vec![button_vk] };
     held.extend(modifiers.virtual_keys());
-    if win::is_wpf(root) {
+    if win::is_wpf(root) && !chromium {
         // WPF wakes its mouse on the first message and looks for what is under it on the real
         // screen, where another window covers it: a press then has nothing to go to. A move first,
         // one pixel off, takes that, and the stroke's own first move finds the canvas by itself.
@@ -286,9 +371,10 @@ pub fn post_stroke(
             post(hwnd, WM_MOUSEMOVE, modifiers.mouse_keys(), win::lparam(cx + 1, cy))?;
             post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved)
         };
-        return with_capture(hwnd, &held, stroke).unwrap_or_else(|| Err(NEEDS_REAL.into()));
+        with_capture(hwnd, &held, stroke).unwrap_or_else(|| Err(NEEDS_REAL.into()))
+    } else {
+        with_state_held(hwnd, &held, || post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved))
     }
-    with_state_held(hwnd, &held, || post_stroke_now(root, path, button, modifiers.mouse_keys(), stop, moved))
 }
 
 fn post_stroke_now(
@@ -320,10 +406,20 @@ fn post_stroke_now(
     Ok(finished)
 }
 
+/// Brief frame pause between posted move, press, and release on Chromium so Blink's async
+/// hit-testing and Angular/React pointer listeners register background clicks cleanly.
+const CHROMIUM_CLICK_STEP: std::time::Duration = std::time::Duration::from_millis(15);
+
 /// A click as window messages, into the innermost window under the point.
 pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Result<String, String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_RBUTTON};
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
+    let chromium = win::is_chromium_class(&win::class(hwnd)) || win::is_chromium_class(&win::class(root));
+    let _wake = chromium.then(|| wake_page(root));
+    let wpf_bg = posts_with_capture(root) && !chromium;
+    if !wpf_bg && mouse_ignored_at(root, hwnd) {
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);
@@ -334,17 +430,36 @@ pub fn post_click(root: Hwnd, x: i32, y: i32, right: bool, double: bool) -> Resu
     };
     let click = || {
         post(hwnd, WM_MOUSEMOVE, 0, at)?;
+        if chromium {
+            std::thread::sleep(CHROMIUM_CLICK_STEP);
+        }
         post(hwnd, down, held, at)?;
+        if chromium {
+            std::thread::sleep(CHROMIUM_CLICK_STEP);
+        }
         post(hwnd, up, 0, at)?;
         if double {
+            if chromium {
+                std::thread::sleep(CHROMIUM_CLICK_STEP);
+            }
             post(hwnd, again, held, at)?;
+            if chromium {
+                std::thread::sleep(CHROMIUM_CLICK_STEP);
+            }
             post(hwnd, up, 0, at)?;
         }
         Ok::<(), String>(())
     };
-    // WinForms raises Click only where its window really shows, so a covered one is moved off
-    // every screen, where nothing covers it, until it has read the click.
-    if win::is_winforms(hwnd) && !win::minimized(root) && !win::owns_point(&[root], x, y) {
+    if wpf_bg {
+        let vk = if right { VK_RBUTTON } else { VK_LBUTTON };
+        with_capture(hwnd, &[vk], || {
+            post(hwnd, WM_MOUSEMOVE, 0, win::lparam(cx + 1, cy))?;
+            click()
+        })
+        .unwrap_or_else(|| Err(NEEDS_REAL.into()))?;
+    } else if win::is_winforms(hwnd) && !win::minimized(root) && !win::owns_point(&[root], x, y) {
+        // WinForms raises Click only where its window really shows, so a covered one is moved off
+        // every screen, where nothing covers it, until it has read the click.
         win::uncovered(root, || {
             let sent = click();
             std::thread::sleep(UNCOVERED_READ);
@@ -363,11 +478,17 @@ const UNCOVERED_READ: std::time::Duration = std::time::Duration::from_millis(120
 /// A middle click or a triple click, which have no accessibility equivalent, or a click with Shift,
 /// Ctrl or Alt held: those are set down in the app's keyboard state too, for apps that ask it.
 pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: usize, modifiers: &[u16]) -> Result<String, String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_MBUTTON, VK_RBUTTON};
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_MBUTTONDBLCLK, WM_MBUTTONDOWN, WM_MBUTTONUP, WM_XBUTTONDBLCLK, WM_XBUTTONDOWN, WM_XBUTTONUP};
     const MK_XBUTTON1: usize = 0x20;
     const MK_XBUTTON2: usize = 0x40;
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
+    let chromium = win::is_chromium_class(&win::class(hwnd)) || win::is_chromium_class(&win::class(root));
+    let _wake = chromium.then(|| wake_page(root));
+    let wpf_bg = posts_with_capture(root) && !chromium;
+    if !wpf_bg && mouse_ignored_at(root, hwnd) {
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);
@@ -378,29 +499,103 @@ pub fn post_press(root: Hwnd, x: i32, y: i32, button: Button, times: u32, keys: 
         Button::Back => (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK, MK_XBUTTON1, 1usize << 16),
         Button::Forward => (WM_XBUTTONDOWN, WM_XBUTTONUP, WM_XBUTTONDBLCLK, MK_XBUTTON2, 2usize << 16),
     };
-    with_state_held(hwnd, modifiers, || {
-        post(hwnd, WM_MOUSEMOVE, 0, at)?;
+    let send = || {
+        post(hwnd, WM_MOUSEMOVE, keys, at)?;
         for time in 0..times {
+            if chromium {
+                std::thread::sleep(CHROMIUM_CLICK_STEP);
+            }
             post(hwnd, if time == 1 { again } else { down }, button_bit | which | keys, at)?;
+            if chromium {
+                std::thread::sleep(CHROMIUM_CLICK_STEP);
+            }
             post(hwnd, up, which | keys, at)?;
         }
         Ok("message".into())
-    })
+    };
+    if wpf_bg {
+        let mut held = vec![match button {
+            Button::Right => VK_RBUTTON,
+            Button::Middle => VK_MBUTTON,
+            _ => VK_LBUTTON,
+        }];
+        held.extend_from_slice(modifiers);
+        with_capture(hwnd, &held, || {
+            post(hwnd, WM_MOUSEMOVE, keys, win::lparam(cx + 1, cy))?;
+            send()
+        })
+        .unwrap_or_else(|| Err(NEEDS_REAL.into()))
+    } else if win::is_winforms(hwnd) && !win::minimized(root) && !win::owns_point(&[root], x, y) {
+        win::uncovered(root, || {
+            let sent = with_state_held(hwnd, modifiers, send);
+            std::thread::sleep(UNCOVERED_READ);
+            sent
+        })
+    } else {
+        with_state_held(hwnd, modifiers, send)
+    }
 }
 
 /// The pointer resting on a spot, without pressing.
 pub fn post_hover(root: Hwnd, x: i32, y: i32) -> Result<String, String> {
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
+    if mouse_ignored_at(root, hwnd) {
         return Err(NEEDS_REAL.into());
     }
     post(hwnd, WM_MOUSEMOVE, 0, win::lparam(cx, cy))?;
     Ok("message".into())
 }
 
+/// Guard that restores the previous foreground window if `root` sneaks to the front during a
+/// background action — unless the person moved/clicked/typed or is actively switching apps.
+struct KeepBehind {
+    root: Hwnd,
+    front: Hwnd,
+    input_before: u32,
+}
+
+impl KeepBehind {
+    fn new(hwnd: Hwnd) -> Self {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+        let resolved = unsafe { GetAncestor(hwnd as HWND, GA_ROOT) } as Hwnd;
+        let root = if resolved != 0 { resolved } else { hwnd };
+        Self { root, front: win::foreground(), input_before: real::last_input_tick() }
+    }
+}
+
+impl Drop for KeepBehind {
+    fn drop(&mut self) {
+        restore_if_stole(self.root, self.front, self.input_before);
+    }
+}
+
+/// If a background app sneaked into the foreground during a posted message or shortcut, put the
+/// person's window right back in front, lower the intruder behind it, and cancel any taskbar flash.
+/// Skips restoration if the person interacted (clicked, typed, or held Alt/Win) during the action,
+/// so intentional app switches are never undone.
+fn restore_if_stole(root: Hwnd, front: Hwnd, input_before: u32) {
+    if front != 0 && !win::person_switching() && real::last_input_tick() == input_before {
+        let now = win::foreground();
+        if now != front && win::same_app(now, root) {
+            if !win::bring_forward(front) {
+                win::stop_flashing(front);
+            }
+            win::lower_behind(root, front);
+            if now != root {
+                win::lower_behind(now, front);
+            }
+        }
+    }
+    win::stop_flashing(root);
+}
+
 /// Ask a text box to paste, which needs no keyboard and no focus.
 pub fn post_paste(hwnd: Hwnd) -> Result<String, String> {
     const WM_PASTE: u32 = 0x0302;
+    let _keep = KeepBehind::new(hwnd);
+    let _lock = win::is_background(hwnd).then(win::ForegroundLock::take);
     post(hwnd, WM_PASTE, 0, 0)?;
     Ok("paste message".into())
 }
@@ -408,8 +603,12 @@ pub fn post_paste(hwnd: Hwnd) -> Result<String, String> {
 /// Wheel notches: positive is up, or right for a sideways wheel.
 pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32, sideways: bool) -> Result<String, String> {
     const WM_MOUSEHWHEEL: u32 = 0x020E;
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
     let (hwnd, _, _) = win::child_at(root, x, y);
-    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
+    let chromium = win::is_chromium_class(&win::class(hwnd)) || win::is_chromium_class(&win::class(root));
+    let _wake = chromium.then(|| wake_page(root));
+    if mouse_ignored_at(root, hwnd) {
         return Err(NEEDS_REAL.into());
     }
     let wheel = ((notches * WHEEL_DELTA) as u32 & 0xFFFF) << 16;
@@ -419,16 +618,38 @@ pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32, sideways: bool) -> R
 
 /// A long press: the button stays down for `hold` before it lets go.
 pub fn post_long_press(root: Hwnd, x: i32, y: i32, right: bool, hold: std::time::Duration) -> Result<String, String> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_LBUTTON, VK_RBUTTON};
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
     let (hwnd, cx, cy) = win::child_at(root, x, y);
-    if win::ignores_posted_mouse(hwnd) || win::ignores_posted_mouse(root) {
+    let chromium = win::is_chromium_class(&win::class(hwnd)) || win::is_chromium_class(&win::class(root));
+    let _wake = chromium.then(|| wake_page(root));
+    let wpf_bg = posts_with_capture(root) && !chromium;
+    if !wpf_bg && mouse_ignored_at(root, hwnd) {
         return Err(NEEDS_REAL.into());
     }
     let at = win::lparam(cx, cy);
     let (down, up, held) = if right { (WM_RBUTTONDOWN, WM_RBUTTONUP, MK_RBUTTON) } else { (WM_LBUTTONDOWN, WM_LBUTTONUP, MK_LBUTTON) };
-    post(hwnd, WM_MOUSEMOVE, 0, at)?;
-    post(hwnd, down, held, at)?;
-    std::thread::sleep(hold);
-    post(hwnd, up, 0, at)?;
+    let send = || {
+        post(hwnd, WM_MOUSEMOVE, 0, at)?;
+        if chromium {
+            std::thread::sleep(CHROMIUM_CLICK_STEP);
+        }
+        post(hwnd, down, held, at)?;
+        std::thread::sleep(hold);
+        post(hwnd, up, 0, at)?;
+        Ok::<(), String>(())
+    };
+    if wpf_bg {
+        let vk = if right { VK_RBUTTON } else { VK_LBUTTON };
+        with_capture(hwnd, &[vk], || {
+            post(hwnd, WM_MOUSEMOVE, 0, win::lparam(cx + 1, cy))?;
+            send()
+        })
+        .unwrap_or_else(|| Err(NEEDS_REAL.into()))?;
+    } else {
+        send()?;
+    }
     Ok("message".into())
 }
 
@@ -528,6 +749,8 @@ pub fn post_text(hwnd: Hwnd, text: &str, stop: &AtomicBool) -> Result<String, St
 
 /// Type as window messages, telling `next` before each key which window takes it and what it is.
 pub fn post_text_watched(hwnd: Hwnd, text: &str, stop: &AtomicBool, next: impl FnMut(Hwnd, u16)) -> Result<String, String> {
+    let _keep = KeepBehind::new(hwnd);
+    let _lock = win::is_background(hwnd).then(win::ForegroundLock::take);
     if !win::takes_posted_keys(hwnd) {
         return Err(NEEDS_REAL.into());
     }
@@ -569,8 +792,37 @@ fn post_chars(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: impl FnMut(Hw
     Ok("message".into())
 }
 
+/// Direct classic Edit/RichEdit clipboard and selection messages that work completely in the
+/// background with zero `AttachThreadInput`, zero keyboard-state mutation, and zero focus change.
+fn direct_edit_shortcut(target: Hwnd, chord: &Chord) -> Option<Result<String, String>> {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL;
+    const WM_CUT: u32 = 0x0300;
+    const WM_COPY: u32 = 0x0301;
+    const WM_PASTE: u32 = 0x0302;
+    const WM_UNDO: u32 = 0x0304;
+    const EM_SETSEL: u32 = 0x00B1;
+    if !chord.modified || chord.keys.len() != 2 || chord.keys[0].0 != VK_CONTROL {
+        return None;
+    }
+    let raw_class = win::class(target);
+    let class = raw_class.to_uppercase();
+    if win::draws_itself(target) || win::is_chromium_class(&raw_class) || !(class.contains("EDIT") || class.contains("COMBO")) {
+        return None;
+    }
+    match chord.keys[1].0 as u8 {
+        b'C' => Some(send(target, WM_COPY, 0, 0).map(|_| "copy message".into())),
+        b'X' => Some(send(target, WM_CUT, 0, 0).map(|_| "cut message".into())),
+        b'V' => Some(post(target, WM_PASTE, 0, 0).map(|_| "paste message".into())),
+        b'Z' => Some(send(target, WM_UNDO, 0, 0).map(|_| "undo message".into())),
+        b'A' if class.contains("EDIT") => Some(send(target, EM_SETSEL, 0, -1).map(|_| "select-all message".into())),
+        _ => None,
+    }
+}
+
 /// One key or shortcut as window messages, to the control with focus in the app's window.
 pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String> {
+    let _keep = KeepBehind::new(root);
+    let _lock = win::is_background(root).then(win::ForegroundLock::take);
     if chord.has_win() {
         return Err(format!("{spec} needs the real keyboard: add --real"));
     }
@@ -582,6 +834,9 @@ pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
         return post_chord(win::key_window(root), chord, spec, true);
     }
     let target = win::keyboard_target(root);
+    if let Some(direct) = direct_edit_shortcut(target, chord) {
+        return direct;
+    }
     if !win::takes_posted_keys(target) {
         return Err(NEEDS_REAL.into());
     }
@@ -654,6 +909,7 @@ const REPEAT_EVERY: std::time::Duration = std::time::Duration::from_millis(33);
 /// A key held down for a while as window messages: down, repeats as a keyboard sends them, then up,
 /// with it set down in the app's keyboard state the whole time for apps that ask that state.
 pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
+    let _keep = KeepBehind::new(root);
     if chord.has_win() {
         return Err("holding the Windows key needs the real keyboard: add --real".into());
     }
@@ -664,13 +920,14 @@ pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &At
     // WPF, Qt and Firefox take keys only with focus inside their own app, held for the whole time.
     if win::keys_need_focus(root) {
         let window = win::key_window(root);
-        return attached(window, "a held key", true, || held_down(&all, || hold_keys(window, chord, hold, stop)));
+        attached(window, "a held key", true, || held_down(&all, || hold_keys(window, chord, hold, stop)))
+    } else {
+        let target = win::keyboard_target(root);
+        if !win::takes_posted_keys(target) {
+            return Err(NEEDS_REAL.into());
+        }
+        with_state_held(target, &all, || hold_keys(target, chord, hold, stop))
     }
-    let target = win::keyboard_target(root);
-    if !win::takes_posted_keys(target) {
-        return Err(NEEDS_REAL.into());
-    }
-    with_state_held(target, &all, || hold_keys(target, chord, hold, stop))
 }
 
 fn hold_keys(target: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
@@ -801,7 +1058,8 @@ fn attached<T>(target: Hwnd, spec: &str, focus: bool, work: impl FnOnce() -> Res
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetForegroundWindow, GetWindowThreadProcessId};
     unsafe {
         let theirs = GetWindowThreadProcessId(target as HWND, std::ptr::null_mut());
-        // An app the person is using shares its keyboard state with them: leave that one alone.
+        // An app the person is using shares its thread keyboard state with them (including
+        // other browser/PWA windows on the same UI thread): never mutate its keyboard state.
         if theirs == 0 || theirs == GetWindowThreadProcessId(GetForegroundWindow(), std::ptr::null_mut()) {
             return Err(format!("{spec} {IN_FRONT}: add --real"));
         }

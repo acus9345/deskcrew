@@ -137,8 +137,31 @@ fn processes(filter: Option<&str>) -> Result<String, String> {
     all.sort_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
     #[cfg(windows)]
     let titles: std::collections::HashMap<u32, String> = crate::win::list().into_iter().map(|w| (crate::win::content_pid(w.hwnd), w.title)).collect();
-    #[cfg(not(windows))]
-    let titles: std::collections::HashMap<u32, String> = std::collections::HashMap::new();
+    #[cfg(target_os = "macos")]
+    let titles: std::collections::HashMap<u32, String> = crate::mac::apps::list()
+        .into_iter()
+        .filter(|w| w.pid > 0 && !w.title.is_empty())
+        .map(|w| (w.pid as u32, w.title))
+        .collect();
+    #[cfg(target_os = "linux")]
+    let titles: std::collections::HashMap<u32, String> = {
+        let mut map = std::collections::HashMap::new();
+        if crate::linux::x::has_display() {
+            for w in crate::linux::x::list() {
+                if w.pid > 0 && !w.title.is_empty() {
+                    map.entry(w.pid).or_insert(w.title);
+                }
+            }
+        }
+        if let Ok(frames) = crate::linux::atspi::windows() {
+            for f in frames {
+                if f.pid > 0 && !f.title.is_empty() {
+                    map.entry(f.pid).or_insert(f.title);
+                }
+            }
+        }
+        map
+    };
     let shown: Vec<String> = all
         .iter()
         .filter(|(pid, name)| wanted.as_ref().is_none_or(|w| name.contains(w) || titles.get(pid).is_some_and(|t| t.to_lowercase().contains(w))))

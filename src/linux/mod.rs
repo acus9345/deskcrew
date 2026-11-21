@@ -4,5 +4,6 @@
 pub mod atspi;
 pub mod notifications;
 pub mod overlay;
+pub mod portal;
 pub mod service;
 pub mod x;

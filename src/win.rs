@@ -19,7 +19,7 @@ use windows_sys::{
         },
         UI::HiDpi::{GetDpiForMonitor, GetDpiForWindow, MDT_EFFECTIVE_DPI},
         UI::WindowsAndMessaging::{
-            BringWindowToTop, ChildWindowFromPointEx, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, EnumChildWindows,
+            BringWindowToTop, ChildWindowFromPointEx, CWP_SKIPDISABLED, CWP_SKIPINVISIBLE, CWP_SKIPTRANSPARENT, EnumChildWindows,
             EnumWindows, GUITHREADINFO, GWL_EXSTYLE, GetClassNameW, GetForegroundWindow, GetGUIThreadInfo,
             GA_ROOT, GW_HWNDPREV, GW_OWNER, GetAncestor, GetDlgCtrlID, GetMenu, GetMenuItemCount, GetMenuItemID, GetMenuState, GetMenuStringW,
             GetParent, GetSubMenu, GetWindow, GetWindowLongPtrW, HMENU, MF_BYPOSITION, MF_DISABLED, MF_GRAYED, MF_SEPARATOR, GetWindowRect, GetWindowTextLengthW, GetWindowTextW,
@@ -346,6 +346,9 @@ fn draws_covered_by_policy(hwnd: Hwnd) -> bool {
         "msedge" => "Microsoft\\Edge",
         "chrome" => "Google\\Chrome",
         "brave" => "BraveSoftware\\Brave",
+        "vivaldi" => "Vivaldi",
+        "opera" => "Opera Software\\Opera Stable",
+        "chromium" => "Chromium",
         _ => return false,
     };
     let wide = |text: &str| text.encode_utf16().chain(Some(0)).collect::<Vec<u16>>();
@@ -858,6 +861,18 @@ pub fn front_thread(hwnd: Hwnd) -> bool {
     thread(raw(hwnd)) == thread(unsafe { GetForegroundWindow() })
 }
 
+/// Whether `hwnd` (or its top-level owner window) is currently NOT the foreground window.
+/// Unlike `!front_thread(hwnd)`, this stays `true` when two windows share a browser UI thread
+/// (e.g. a Gemini PWA covered by AI Studio in the same Chrome/Edge process).
+pub fn is_background(hwnd: Hwnd) -> bool {
+    if hwnd == 0 {
+        return false;
+    }
+    let root = unsafe { GetAncestor(raw(hwnd), GA_ROOT) } as Hwnd;
+    let target = if root != 0 { root } else { hwnd };
+    foreground() != target
+}
+
 pub fn is_winforms(hwnd: Hwnd) -> bool {
     class(hwnd).starts_with("WindowsForms10.")
 }
@@ -867,6 +882,9 @@ pub fn is_winforms(hwnd: Hwnd) -> bool {
 /// it takes the press and drops the click. Its own coordinates do not change on the way.
 pub fn uncovered<T>(hwnd: Hwnd, work: impl FnOnce() -> T) -> T {
     use windows_sys::Win32::UI::WindowsAndMessaging::SWP_ASYNCWINDOWPOS;
+    let was_front = foreground();
+    let input_before = crate::real::last_input_tick();
+    let _lock = is_background(hwnd).then(ForegroundLock::take);
     let mut was: RECT = unsafe { zeroed() };
     if unsafe { GetWindowRect(raw(hwnd), &mut was) } == 0 {
         return work();
@@ -888,6 +906,19 @@ pub fn uncovered<T>(hwnd: Hwnd, work: impl FnOnce() -> T) -> T {
             unsafe { SetWindowPos(raw(opened), null_mut(), at.left + dx, at.top + dy, 0, 0, back) };
         }
     }
+    if was_front != 0 && was_front != hwnd && !person_switching() && crate::real::last_input_tick() == input_before {
+        let now = foreground();
+        if now != was_front && same_app(now, hwnd) {
+            if !bring_forward(was_front) {
+                stop_flashing(was_front);
+            }
+            lower_behind(hwnd, was_front);
+            if now != hwnd {
+                lower_behind(now, was_front);
+            }
+        }
+    }
+    stop_flashing(hwnd);
     result
 }
 
@@ -903,9 +934,7 @@ enum ShownOffScreen {
 }
 
 fn show_off_screen(hwnd: Hwnd) -> ShownOffScreen {
-    use windows_sys::Win32::UI::WindowsAndMessaging::{
-        GetWindowPlacement, HWND_BOTTOM, SW_SHOWNOACTIVATE, SetWindowPlacement, WINDOWPLACEMENT, WS_EX_TOPMOST,
-    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowPlacement, HWND_BOTTOM, SW_SHOWNOACTIVATE, SetWindowPlacement, WINDOWPLACEMENT, WS_EX_TOPMOST};
     let lock = if is_wpf(hwnd) {
         ForegroundLock::try_take()
     } else {
@@ -928,11 +957,12 @@ fn show_off_screen(hwnd: Hwnd) -> ShownOffScreen {
         away.showCmd = SW_SHOWNOACTIVATE as u32;
         away.rcNormalPosition = far_from_screens(normal, width, height);
         animations(hwnd, false);
+        let ex_style = GetWindowLongPtrW(raw(hwnd), GWL_EXSTYLE);
         if SetWindowPlacement(raw(hwnd), &away) == 0 {
             animations(hwnd, true);
             return ShownOffScreen::Failed;
         }
-        if GetWindowLongPtrW(raw(hwnd), GWL_EXSTYLE) as u32 & WS_EX_TOPMOST == 0 {
+        if ex_style as u32 & WS_EX_TOPMOST == 0 {
             SetWindowPos(raw(hwnd), HWND_BOTTOM, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
         let ready = std::sync::Arc::new((std::sync::Mutex::new(None), std::sync::Condvar::new()));
@@ -950,15 +980,14 @@ fn show_off_screen(hwnd: Hwnd) -> ShownOffScreen {
 
 impl Drop for OffScreen {
     fn drop(&mut self) {
-        if !self.restore_minimized {
-            return;
-        }
         use windows_sys::Win32::UI::WindowsAndMessaging::{SW_SHOWMINNOACTIVE, SetWindowPlacement, WPF_RESTORETOMAXIMIZED};
-        let mut back = self.placement;
-        back.flags &= WPF_RESTORETOMAXIMIZED;
-        back.showCmd = SW_SHOWMINNOACTIVE as u32;
-        unsafe { SetWindowPlacement(raw(self.hwnd), &back) };
-        animations(self.hwnd, true);
+        if self.restore_minimized {
+            let mut back = self.placement;
+            back.flags &= WPF_RESTORETOMAXIMIZED;
+            back.showCmd = SW_SHOWMINNOACTIVE as u32;
+            unsafe { SetWindowPlacement(raw(self.hwnd), &back) };
+            animations(self.hwnd, true);
+        }
         stop_flashing(self.hwnd);
     }
 }
@@ -1333,6 +1362,11 @@ pub fn keyboard_target(hwnd: Hwnd) -> Hwnd {
         if GetGUIThreadInfo(thread, &mut info) != 0 && !info.hwndFocus.is_null() {
             return info.hwndFocus as Hwnd;
         }
+        // Chromium/Electron/WebView2 routes keys through its Aura HWNDMessageHandler
+        // (Chrome_WidgetWin_1), not through child accessibility/GPU windows.
+        if let Some(input) = chromium_render_window(hwnd) {
+            return input;
+        }
         // A window in the back has no focused control, so keys go where an agent last clicked or
         // typed in it, as they would after a real click there.
         let field = FIELDS.lock().unwrap().get(&hwnd).copied();
@@ -1342,7 +1376,6 @@ pub fn keyboard_target(hwnd: Hwnd) -> Hwnd {
         {
             return field;
         }
-        // An app with its own engine takes keys in one window of its own.
         children(hwnd).into_iter().find(|child| key_site(*child)).unwrap_or(hwnd)
     }
 }
@@ -1357,10 +1390,10 @@ pub fn key_site(hwnd: Hwnd) -> bool {
     name == "Windows.UI.Core.CoreWindow" || name.contains("InputSite")
 }
 
-/// Windows that take posted keys and characters: every classic window, and the key windows of
-/// apps that draw themselves. Their pointer input is another matter.
+/// Windows that take posted keys and characters: every classic window, Chromium/WebView2/CEF
+/// widgets, and the key/bridge windows (`CoreWindow`/`InputSite`) of WinUI/XAML/Store apps.
 pub fn takes_posted_keys(hwnd: Hwnd) -> bool {
-    !draws_itself(hwnd) || key_site(hwnd)
+    !draws_itself(hwnd) || key_site(hwnd) || is_chromium_class(&class(hwnd))
 }
 
 /// The control in each window that an agent last clicked or typed in.
@@ -1397,6 +1430,28 @@ pub fn app_scale(hwnd: Hwnd) -> f32 {
     }
 }
 
+/// Place `hwnd` immediately behind `after` in Z-order without activating or moving it.
+pub fn lower_behind(hwnd: Hwnd, after: Hwnd) {
+    if hwnd == 0 || after == 0 || hwnd == after {
+        return;
+    }
+    unsafe {
+        SetWindowPos(raw(hwnd), raw(after), 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
+    }
+}
+
+/// Child helper windows inside Chromium/WebView2 that never process posted mouse/key input:
+/// `Intermediate D3D Window` is a disabled GPU swapchain surface and `Chrome_RenderWidgetHostHWND`
+/// is Chromium's legacy accessibility/trackpad proxy. Real input goes to `Chrome_WidgetWin_1`.
+fn is_chromium_non_input_child(name: &str) -> bool {
+    name == "Intermediate D3D Window" || name == "Chrome_RenderWidgetHostHWND"
+}
+
+/// Window classes that run Chromium's `HWNDMessageHandler` and process posted mouse/key input.
+pub fn is_chromium_input_class(name: &str) -> bool {
+    name.starts_with("Chrome_WidgetWin_") || name.contains("CefBrowserWindow")
+}
+
 /// The innermost child window under a screen point, and that point in its client area. Windows
 /// has already converted it to the app's own units, so a message can carry it as it is.
 pub fn child_at(root: Hwnd, x: i32, y: i32) -> (Hwnd, i32, i32) {
@@ -1405,8 +1460,17 @@ pub fn child_at(root: Hwnd, x: i32, y: i32) -> (Hwnd, i32, i32) {
         let mut point = POINT { x, y };
         unsafe {
             ScreenToClient(raw(at), &mut point);
-            let child = ChildWindowFromPointEx(raw(at), point, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT) as Hwnd;
+            let child = ChildWindowFromPointEx(raw(at), point, CWP_SKIPINVISIBLE | CWP_SKIPDISABLED | CWP_SKIPTRANSPARENT) as Hwnd;
             if child == 0 || child == at {
+                return (at, point.x, point.y);
+            }
+            let child_class = class(child);
+            if is_chromium_non_input_child(&child_class) {
+                return (at, point.x, point.y);
+            }
+            // Once we reach a Chromium HWNDMessageHandler (e.g. Chrome_WidgetWin_1), stop unless
+            // descending into a nested Chromium input host (e.g. WebView2 Chrome_WidgetWin_0 -> _1).
+            if is_chromium_input_class(&class(at)) && !is_chromium_input_class(&child_class) {
                 return (at, point.x, point.y);
             }
             at = child;
@@ -1414,18 +1478,66 @@ pub fn child_at(root: Hwnd, x: i32, y: i32) -> (Hwnd, i32, i32) {
     }
 }
 
-/// Browsers and Electron apps. They draw themselves, but they do read posted mouse and character
-/// messages, even while covered, so several can be worked at once.
-pub fn is_chromium(hwnd: Hwnd) -> bool {
-    class(hwnd).starts_with("Chrome_")
+/// Window classes belonging to Chromium, Electron, CEF and WebView2 hosts or render widgets.
+pub fn is_chromium_class(name: &str) -> bool {
+    name.starts_with("Chrome_") || name.contains("CefBrowser") || name.contains("WebView")
 }
 
-/// Apps that draw their own controls but read posted mouse messages like a classic window, with
-/// the button taken from the message itself: Qt (Krita's canvas draws and its buttons press from
-/// them, in the back) and Firefox (a page canvas gets whole strokes). Holding the button in their
-/// key state as well makes them miss the release.
+/// The Chromium/Electron/WebView2/CEF `HWNDMessageHandler` window that processes posted mouse and
+/// keyboard messages (`Chrome_WidgetWin_1` first, then `Chrome_WidgetWin_0` / `CefBrowserWindow`,
+/// falling back to `Chrome_RenderWidgetHostHWND` only when no `Chrome_WidgetWin_*` exists).
+pub fn chromium_render_window(root: Hwnd) -> Option<Hwnd> {
+    if root == 0 {
+        return None;
+    }
+    let root_class = class(root);
+    if root_class == "Chrome_WidgetWin_1" {
+        return Some(root);
+    }
+    let kids = children(root);
+    let mut widget0 = None;
+    let mut legacy = None;
+    for child in kids {
+        let name = class(child);
+        if name == "Chrome_WidgetWin_1" || name.contains("CefBrowserWindow") {
+            return Some(child);
+        }
+        if widget0.is_none() && name.starts_with("Chrome_WidgetWin_") {
+            widget0 = Some(child);
+        }
+        if legacy.is_none() && name == "Chrome_RenderWidgetHostHWND" {
+            legacy = Some(child);
+        }
+    }
+    widget0
+        .or_else(|| is_chromium_input_class(&root_class).then_some(root))
+        .or(legacy)
+        .or_else(|| is_chromium_class(&root_class).then_some(root))
+}
+
+/// The Chromium/Electron/WebView2/CEF host window to wake with `WM_ACTIVATE`.
+pub fn chromium_host(root: Hwnd) -> Option<Hwnd> {
+    chromium_render_window(root)
+}
+
+/// Browsers, Electron apps, and embedded Chromium apps (WebView2, Tauri, CEF). They draw
+/// themselves, but they read posted mouse and character messages, even while covered.
+pub fn is_chromium(hwnd: Hwnd) -> bool {
+    hwnd != 0 && (is_chromium_class(&class(hwnd)) || chromium_render_window(hwnd).is_some())
+}
+
+/// True when the specific screen point `(x, y)` inside `root` lands in a Chromium/Electron/WebView2/CEF
+/// surface (distinguishing embedded WebView2 panels from native WinUI/WPF controls in the same window).
+pub fn is_chromium_at(root: Hwnd, x: i32, y: i32) -> bool {
+    root != 0 && (is_chromium_class(&class(root)) || is_chromium_class(&class(child_at(root, x, y).0)))
+}
+
+/// Apps that read the mouse button directly from posted mouse messages (wParam MK_* flags):
+/// Chromium/Electron/WebView2/CEF surfaces, Qt (Krita's canvas draws and its buttons press from
+/// them, in the back), and Firefox. Avoiding AttachThreadInput + held button state on these
+/// prevents activation/titlebar flicker during drawing and prevents missed button releases.
 pub fn reads_posted_mouse(hwnd: Hwnd) -> bool {
-    is_qt(hwnd) || is_firefox(hwnd)
+    is_chromium_class(&class(hwnd)) || is_qt(hwnd) || is_firefox(hwnd)
 }
 
 pub fn is_firefox(hwnd: Hwnd) -> bool {
@@ -1690,6 +1802,9 @@ impl FocusGuard {
         if !bring_forward(self.front) {
             stop_flashing(self.front);
         }
+        let intruder = if outer != 0 { outer } else { now };
+        self.keep_behind(intruder);
+        stop_flashing(intruder);
         true
     }
 }
@@ -1741,7 +1856,7 @@ impl FocusGuard {
 static PRESS_BEGAN_ON: std::sync::Mutex<Option<Hwnd>> = std::sync::Mutex::new(None);
 
 /// The person is pressing a mouse button, or holding Alt or the Windows key to switch apps.
-fn person_switching() -> bool {
+pub fn person_switching() -> bool {
     use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
     [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_MENU, VK_LWIN, VK_RWIN].iter().any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0)
 }
@@ -1983,5 +2098,27 @@ mod tests {
         assert_eq!(move_monitor_rect((-320, 400, 1600, 900), src, dst), (0, 0, 1280, 720));
         let empty = RECT { left: 100, top: 200, right: 100, bottom: 150 };
         assert_eq!(move_monitor_rect((-1820, 100, 600, 400), src, empty), (100, 200, 1, 1));
+    }
+
+    #[test]
+    fn chromium_classes_cover_browsers_electron_cef_and_webview2() {
+        for name in [
+            "Chrome_WidgetWin_1",
+            "Chrome_WidgetWin_0",
+            "Chrome_RenderWidgetHostHWND",
+            "CefBrowserWindow",
+            "WebView2Host",
+        ] {
+            assert!(is_chromium_class(name), "{name} should match is_chromium_class");
+        }
+        for name in ["Notepad", "HwndWrapper[App;;123]", "ApplicationFrameWindow", "MozillaWindowClass", "Qt620QWindowIcon"] {
+            assert!(!is_chromium_class(name), "{name} should not match is_chromium_class");
+        }
+        assert!(is_chromium_input_class("Chrome_WidgetWin_1"));
+        assert!(is_chromium_input_class("CefBrowserWindow"));
+        assert!(!is_chromium_input_class("Chrome_RenderWidgetHostHWND"));
+        assert!(!is_chromium_input_class("Intermediate D3D Window"));
+        assert!(is_chromium_non_input_child("Intermediate D3D Window"));
+        assert!(is_chromium_non_input_child("Chrome_RenderWidgetHostHWND"));
     }
 }

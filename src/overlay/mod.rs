@@ -525,16 +525,27 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
                     }
                 }
                 Command::Jump { agent, to } => {
+                    let mut created = false;
                     if !agents.iter().any(|a| a.name == agent) {
                         let taken: Vec<Rgb> = agents.iter().map(|a| a.colour).collect();
                         agents.extend(Agent::new(&agent, to, &taken, scale));
+                        created = true;
                     }
                     if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
+                        let was_hidden = found.alpha == 0;
+                        let mut over_changed = false;
                         if let Some(at) = waiting.iter().position(|(name, _)| *name == agent) {
-                            found.over = Some(waiting.swap_remove(at).1);
+                            let target = waiting.swap_remove(at).1;
+                            over_changed = found.over != Some(target);
+                            found.over = Some(target);
                         }
                         found.jump(to);
-                        found.stack(false);
+                        // Avoid hammering SetWindowPos on every stroke point (~55 Hz): only
+                        // restack immediately when showing or retargeting; STACK_EVERY keeps
+                        // ongoing z-order in sync without visual flicker.
+                        if created || was_hidden || over_changed {
+                            found.stack(false);
+                        }
                     }
                 }
                 Command::Press { agent, target } => {

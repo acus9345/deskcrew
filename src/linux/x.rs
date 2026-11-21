@@ -12,8 +12,9 @@ use std::{
 use x11rb::{
     connection::Connection,
     protocol::{
+        composite::ConnectionExt as _,
         randr::ConnectionExt as _,
-        xproto::{self, Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, ImageFormat, StackMode, Window as XWindow},
+        xproto::{self, Atom, AtomEnum, ClientMessageEvent, ConfigureWindowAux, ConnectionExt as _, EventMask, ImageFormat, KeyButMask, StackMode, Window as XWindow},
         xtest::ConnectionExt as _,
     },
     rust_connection::RustConnection,
@@ -35,8 +36,12 @@ pub struct Window {
 
 struct X {
     conn: RustConnection,
+    screen: usize,
     root: XWindow,
     atoms: Mutex<HashMap<&'static str, Atom>>,
+    started: Instant,
+    last_time: Mutex<u32>,
+    composite_ok: OnceLock<bool>,
 }
 
 static X: OnceLock<Result<X, String>> = OnceLock::new();
@@ -69,7 +74,15 @@ fn x() -> Result<&'static X, String> {
         }
         let (conn, screen) = x11rb::connect(None).map_err(|e| format!("could not open the X display: {e}"))?;
         let root = conn.setup().roots[screen].root;
-        Ok(X { conn, root, atoms: Mutex::new(HashMap::new()) })
+        Ok(X {
+            conn,
+            screen,
+            root,
+            atoms: Mutex::new(HashMap::new()),
+            started: Instant::now(),
+            last_time: Mutex::new(1),
+            composite_ok: OnceLock::new(),
+        })
     })
     .as_ref()
     .map_err(Clone::clone)
@@ -123,6 +136,13 @@ pub fn ready() -> Result<(), String> {
 }
 
 impl X {
+    fn timestamp(&self) -> u32 {
+        let mut last = self.last_time.lock().unwrap();
+        let next = next_timestamp(*last, self.started.elapsed().as_millis() as u64);
+        *last = next;
+        next
+    }
+
     fn atom(&self, name: &'static str) -> Atom {
         if let Some(atom) = self.atoms.lock().unwrap().get(name) {
             return *atom;
@@ -289,9 +309,44 @@ pub fn close(id: u32) -> Result<(), String> {
     x.conn.flush().map_err(|e| e.to_string())
 }
 
+/// Walk up from `id` to the WM frame sitting directly under the root window.
+fn wm_frame(x: &X, id: u32) -> u32 {
+    let mut at = id;
+    for _ in 0..8 {
+        let Some(tree) = x.conn.query_tree(at).ok().and_then(|c| c.reply().ok()) else { return at };
+        if tree.parent == x.root || tree.parent == x11rb::NONE {
+            return at;
+        }
+        at = tree.parent;
+    }
+    at
+}
+
+/// Keep `id` stacked behind `front_id` without activating or stealing focus.
+pub fn lower_behind(id: u32, front_id: u32) {
+    let Ok(x) = x() else { return };
+    if id == front_id {
+        return;
+    }
+    let target = wm_frame(x, id);
+    let sibling = wm_frame(x, front_id);
+    if target == sibling {
+        return;
+    }
+    let aux = ConfigureWindowAux::new().sibling(sibling).stack_mode(StackMode::BELOW);
+    let _ = x.conn.configure_window(target, &aux);
+    let _ = x.conn.flush();
+}
+
 pub fn place(id: u32, how: &str) -> Result<(), String> {
     let x = x()?;
     let state = |add: bool, a: &'static str, b: &'static str| x.message(id, "_NET_WM_STATE", [add as u32, x.atom(a), x.atom(b), 2, 0]);
+    let unmax = || {
+        if x.has_wm() {
+            let _ = state(false, "_NET_WM_STATE_MAXIMIZED_VERT", "_NET_WM_STATE_MAXIMIZED_HORZ");
+        }
+    };
+    let how = how.trim();
     match how {
         "min" => x.message(id, "WM_CHANGE_STATE", [3, 0, 0, 0, 0]),
         "max" if x.has_wm() => state(true, "_NET_WM_STATE_MAXIMIZED_VERT", "_NET_WM_STATE_MAXIMIZED_HORZ"),
@@ -306,12 +361,40 @@ pub fn place(id: u32, how: &str) -> Result<(), String> {
             }
             x.conn.flush().map_err(|e| e.to_string())
         }
+        "left" | "right" => {
+            let (sx, sy, sw, sh) = monitor_of(x, id);
+            unmax();
+            let half = sw / 2;
+            let bx = if how == "left" { sx } else { sx + half };
+            configure(x, id, (bx, sy, half, sh))
+        }
+        other if other.starts_with("monitor ") => {
+            let index: usize = other["monitor ".len()..].trim().parse().map_err(|_| "place monitor N needs a monitor number from deskcrew screens".to_string())?;
+            let list = screens();
+            let (sx, sy, sw, sh) = list.get(index).ok_or_else(|| format!("no monitor {index}: run deskcrew screens"))?.0;
+            unmax();
+            let (bw, bh) = x.rect(id).map_or((sw, sh), |r| (r.2.min(sw).max(200), r.3.min(sh).max(200)));
+            configure(x, id, (sx + (sw - bw) / 2, sy + (sh - bh) / 2, bw, bh))
+        }
         box_text => {
             let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-            let [bx, by, bw, bh] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
+            let [bx, by, bw, bh] = parts[..] else { return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into()) };
+            unmax();
             configure(x, id, (bx, by, bw, bh))
         }
     }
+}
+
+/// The monitor currently containing the center of `id`, or the primary monitor.
+fn monitor_of(x: &X, id: u32) -> Bounds {
+    let list = screens();
+    if let Some((wx, wy, ww, wh)) = x.rect(id) {
+        let (cx, cy) = (wx + ww / 2, wy + wh / 2);
+        if let Some((bounds, _)) = list.iter().find(|((sx, sy, sw, sh), _)| cx >= *sx && cy >= *sy && cx < *sx + *sw && cy < *sy + *sh) {
+            return *bounds;
+        }
+    }
+    list.into_iter().find(|s| s.1).map_or((0, 0, 1024, 768), |s| s.0)
 }
 
 fn configure(x: &X, id: u32, (bx, by, bw, bh): Bounds) -> Result<(), String> {
@@ -378,9 +461,61 @@ pub fn capture(rect: Bounds) -> Result<Frame, String> {
     Ok(Frame { w: w as u32, h: h as u32, pixels })
 }
 
-/// A window's picture, from the screen where it is shown.
+/// Capture a window's redirected backing pixmap via `XCompositeNameWindowPixmap` when an X11
+/// compositor (`_NET_WM_CM_S0`) is active, so covered or partially off-screen background windows
+/// can be read without overlapping windows or cursor overlays.
+fn capture_window_pixmap(x: &X, id: u32) -> Option<Frame> {
+    let cm_name = format!("_NET_WM_CM_S{}", x.screen);
+    let cm = x.conn.intern_atom(false, cm_name.as_bytes()).ok()?.reply().ok()?.atom;
+    let owner = x.conn.get_selection_owner(cm).ok()?.reply().ok()?.owner;
+    if owner == x11rb::NONE {
+        return None;
+    }
+    let has_composite = *x.composite_ok.get_or_init(|| {
+        x.conn
+            .composite_query_version(0, 4)
+            .ok()
+            .and_then(|c| c.reply().ok())
+            .is_some_and(|v| v.major_version > 0 || v.minor_version >= 2)
+    });
+    if !has_composite {
+        return None;
+    }
+    let geom = x.conn.get_geometry(id).ok()?.reply().ok()?;
+    let (w, h) = (geom.width as i32, geom.height as i32);
+    if w < 1 || h < 1 {
+        return None;
+    }
+    let byte_len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
+    let pixmap = x.conn.generate_id().ok()?;
+    if x.conn.composite_name_window_pixmap(id, pixmap).ok()?.check().is_err() {
+        return None;
+    }
+    let image = x.conn.get_image(ImageFormat::Z_PIXMAP, pixmap, 0, 0, geom.width, geom.height, !0).ok().and_then(|c| c.reply().ok());
+    let _ = x.conn.free_pixmap(pixmap);
+    let _ = x.conn.flush();
+    let image = image?;
+    if image.depth < 24 || image.data.len() < byte_len {
+        return None;
+    }
+    let mut pixels = image.data;
+    pixels.truncate(byte_len);
+    for pixel in pixels.as_chunks_mut::<4>().0 {
+        pixel[3] = 255;
+    }
+    let frame = Frame { w: w as u32, h: h as u32, pixels };
+    (!frame.is_blank()).then_some(frame)
+}
+
+/// A window's picture: prefers its composited backing pixmap (so covered windows stay readable),
+/// falling back to the screen region where it is shown.
 pub fn window_picture(id: u32) -> Result<(Frame, f32), String> {
     let window = find(id).ok_or("that window closed: run deskcrew windows")?;
+    if let Ok(x) = x()
+        && let Some(frame) = capture_window_pixmap(x, id)
+    {
+        return Ok((frame, 1.0));
+    }
     Ok((capture(window.rect)?, 1.0))
 }
 
@@ -481,6 +616,281 @@ pub fn stroke(by: By, path: &[(f32, f32)], button: Button, stop: &dyn Fn() -> bo
         thread::sleep(Duration::from_millis(4));
     }
     button_by(by, button.number(), false)?;
+    Ok(finished)
+}
+
+// ---- Background XSendEvent input: zero WM raise, zero focus steal, zero drawing flicker. ----
+
+fn mod_mask(modifiers: &[u32]) -> KeyButMask {
+    let mut mask = KeyButMask::default();
+    for &sym in modifiers {
+        match sym {
+            0xffe1 | 0xffe2 => mask |= KeyButMask::SHIFT,
+            0xffe3 | 0xffe4 => mask |= KeyButMask::CONTROL,
+            0xffe9 | 0xffea => mask |= KeyButMask::MOD1,
+            0xffeb | 0xffec => mask |= KeyButMask::MOD4,
+            _ => {}
+        }
+    }
+    mask
+}
+
+fn button_mask(button: Button) -> KeyButMask {
+    match button {
+        Button::Left => KeyButMask::BUTTON1,
+        Button::Middle => KeyButMask::BUTTON2,
+        Button::Right => KeyButMask::BUTTON3,
+        Button::Back | Button::Forward => KeyButMask::default(),
+    }
+}
+
+/// Monotonic non-zero X11 event timestamp (milliseconds). Unlike real server events, the X server
+/// does NOT rewrite `CurrentTime` (0) on `XSendEvent`, causing GTK, Qt, Chromium, Firefox and Java
+/// to drop events or miscalculate double-click/drag timing.
+fn next_timestamp(prev: u32, elapsed_ms: u64) -> u32 {
+    let elapsed = (elapsed_ms as u32).max(1);
+    let candidate = if elapsed > prev { elapsed } else { prev.wrapping_add(1) };
+    if candidate == 0 { 1 } else { candidate }
+}
+
+/// Find the deepest child window inside `window` under root coordinates `(px, py)` and the
+/// local coordinates inside that child.
+fn child_at(x: &X, window: XWindow, px: i32, py: i32) -> (XWindow, i16, i16) {
+    let Ok(initial) = x.conn.translate_coordinates(x.root, window, px as i16, py as i16).map(|c| c.reply()) else {
+        return (window, 0, 0);
+    };
+    let Ok(mut cur_reply) = initial else { return (window, 0, 0) };
+    let mut cur = window;
+    let mut lx = cur_reply.dst_x;
+    let mut ly = cur_reply.dst_y;
+    for _ in 0..16 {
+        let next_child = cur_reply.child;
+        if next_child == x11rb::NONE {
+            break;
+        }
+        let Ok(step) = x.conn.translate_coordinates(cur, next_child, lx, ly).map(|c| c.reply()) else {
+            break;
+        };
+        let Ok(reply) = step else { break };
+        cur = next_child;
+        lx = reply.dst_x;
+        ly = reply.dst_y;
+        cur_reply = reply;
+    }
+    (cur, lx, ly)
+}
+
+/// Send an EnterNotify to `target` with `focus: false` and `EventMask::NO_EVENT` so toolkits that
+/// track pointer presence (Qt, GTK, Tk, FLTK, Java/Swing, Electron) accept subsequent clicks and
+/// motions without moving the real pointer or notifying the WM frame.
+fn send_enter(x: &X, target: XWindow, px: i32, py: i32, lx: i16, ly: i16, state: KeyButMask) -> Result<(), String> {
+    let event = xproto::EnterNotifyEvent {
+        response_type: xproto::ENTER_NOTIFY_EVENT,
+        detail: xproto::NotifyDetail::NONLINEAR,
+        sequence: 0,
+        time: x.timestamp(),
+        root: x.root,
+        event: target,
+        child: x11rb::NONE,
+        root_x: px as i16,
+        root_y: py as i16,
+        event_x: lx,
+        event_y: ly,
+        state,
+        mode: xproto::NotifyMode::NORMAL,
+        same_screen_focus: 1, // same_screen = true (bit 0), focus = false (bit 1)
+    };
+    x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+/// Send a synthetic FocusIn/FocusOut directly to `target` without calling `XSetInputFocus`.
+/// OS/WM focus never moves, while toolkits that require internal focus to process KeyPress
+/// (Qt, GTK, Firefox, Electron, LibreOffice, Java, Tk) accept the synthetic keys.
+fn send_focus(x: &X, target: XWindow, focus_in: bool) -> Result<(), String> {
+    if focus_in {
+        let event = xproto::FocusInEvent {
+            response_type: xproto::FOCUS_IN_EVENT,
+            detail: xproto::NotifyDetail::NONLINEAR,
+            sequence: 0,
+            event: target,
+            mode: xproto::NotifyMode::NORMAL,
+        };
+        x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    } else {
+        let event = xproto::FocusOutEvent {
+            response_type: xproto::FOCUS_OUT_EVENT,
+            detail: xproto::NotifyDetail::NONLINEAR,
+            sequence: 0,
+            event: target,
+            mode: xproto::NotifyMode::NORMAL,
+        };
+        x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+fn send_motion(x: &X, target: XWindow, px: i32, py: i32, lx: i16, ly: i16, state: KeyButMask) -> Result<(), String> {
+    let event = xproto::MotionNotifyEvent {
+        response_type: xproto::MOTION_NOTIFY_EVENT,
+        detail: xproto::Motion::NORMAL,
+        sequence: 0,
+        time: x.timestamp(),
+        root: x.root,
+        event: target,
+        child: x11rb::NONE,
+        root_x: px as i16,
+        root_y: py as i16,
+        event_x: lx,
+        event_y: ly,
+        state,
+        same_screen: true,
+    };
+    // `propagate: false` + `EventMask::NO_EVENT` delivers unconditionally to the client that
+    // created `target` (even when it selects XInput 2 instead of core masks) and never bubbles up
+    // to the WM frame, preventing click-to-focus raises.
+    x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn send_button(x: &X, target: XWindow, button_num: u8, down: bool, root_at: (i32, i32), local_at: (i16, i16), state: KeyButMask) -> Result<(), String> {
+    let ((px, py), (lx, ly)) = (root_at, local_at);
+    if down {
+        let event = xproto::ButtonPressEvent {
+            response_type: xproto::BUTTON_PRESS_EVENT,
+            detail: button_num,
+            sequence: 0,
+            time: x.timestamp(),
+            root: x.root,
+            event: target,
+            child: x11rb::NONE,
+            root_x: px as i16,
+            root_y: py as i16,
+            event_x: lx,
+            event_y: ly,
+            state,
+            same_screen: true,
+        };
+        x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    } else {
+        let event = xproto::ButtonReleaseEvent {
+            response_type: xproto::BUTTON_RELEASE_EVENT,
+            detail: button_num,
+            sequence: 0,
+            time: x.timestamp(),
+            root: x.root,
+            event: target,
+            child: x11rb::NONE,
+            root_x: px as i16,
+            root_y: py as i16,
+            event_x: lx,
+            event_y: ly,
+            state,
+            same_screen: true,
+        };
+        x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Click a point inside `window` via XSendEvent without raising it, moving the cursor, or
+/// stealing focus.
+pub fn send_click(window: u32, px: i32, py: i32, which: Button, count: u32, hold: Duration, modifiers: &[u32]) -> Result<(), String> {
+    let x = x()?;
+    let (target, lx, ly) = child_at(x, window, px, py);
+    let mods = mod_mask(modifiers);
+    let pressed = mods | button_mask(which);
+    send_enter(x, target, px, py, lx, ly, mods)?;
+    send_motion(x, target, px, py, lx, ly, mods)?;
+    x.conn.flush().map_err(|e| e.to_string())?;
+    for _ in 0..count.max(1) {
+        send_button(x, target, which.number(), true, (px, py), (lx, ly), mods)?;
+        x.conn.flush().map_err(|e| e.to_string())?;
+        thread::sleep(hold.max(KEY_GAP));
+        send_button(x, target, which.number(), false, (px, py), (lx, ly), pressed)?;
+        x.conn.flush().map_err(|e| e.to_string())?;
+        thread::sleep(KEY_GAP);
+    }
+    Ok(())
+}
+
+/// Press or release a mouse button at `(px, py)` inside `window` via XSendEvent without raising
+/// it or taking focus (used for `down left|right|middle` / `up`).
+pub fn send_button_at(window: u32, px: i32, py: i32, which: Button, down: bool, modifiers: &[u32]) -> Result<(), String> {
+    let x = x()?;
+    let (target, lx, ly) = child_at(x, window, px, py);
+    let mods = mod_mask(modifiers);
+    let state = if down { mods } else { mods | button_mask(which) };
+    if down {
+        send_enter(x, target, px, py, lx, ly, mods)?;
+        send_motion(x, target, px, py, lx, ly, mods)?;
+    }
+    send_button(x, target, which.number(), down, (px, py), (lx, ly), state)?;
+    x.conn.flush().map_err(|e| e.to_string())
+}
+
+/// Hover a point inside `window` via XSendEvent without raising it or touching the cursor.
+pub fn send_hover(window: u32, px: i32, py: i32) -> Result<(), String> {
+    let x = x()?;
+    let (target, lx, ly) = child_at(x, window, px, py);
+    send_enter(x, target, px, py, lx, ly, KeyButMask::default())?;
+    send_motion(x, target, px, py, lx, ly, KeyButMask::default())?;
+    x.conn.flush().map_err(|e| e.to_string())
+}
+
+/// Scroll at a point inside `window` via XSendEvent without raising it or touching the cursor.
+pub fn send_wheel(window: u32, px: i32, py: i32, notches: i32, sideways: bool) -> Result<(), String> {
+    let x = x()?;
+    let (target, lx, ly) = child_at(x, window, px, py);
+    let number = match (sideways, notches > 0) {
+        (false, true) => 4,
+        (false, false) => 5,
+        (true, true) => 7,
+        (true, false) => 6,
+    };
+    send_enter(x, target, px, py, lx, ly, KeyButMask::default())?;
+    send_motion(x, target, px, py, lx, ly, KeyButMask::default())?;
+    for _ in 0..notches.unsigned_abs() {
+        send_button(x, target, number, true, (px, py), (lx, ly), KeyButMask::default())?;
+        send_button(x, target, number, false, (px, py), (lx, ly), KeyButMask::default())?;
+    }
+    x.conn.flush().map_err(|e| e.to_string())
+}
+
+/// Draw or drag a stroke inside `window` via XSendEvent: never raises the window, never steals
+/// focus, and never triggers bring-to-front flicker.
+pub fn send_stroke(window: u32, path: &[(f32, f32)], button: Button, modifiers: &[u32], stop: &dyn Fn() -> bool, moved: &mut dyn FnMut(usize, i32, i32)) -> Result<bool, String> {
+    let Some(first) = path.first() else { return Ok(true) };
+    let x = x()?;
+    let (fx, fy) = (first.0 as i32, first.1 as i32);
+    let (target, flx, fly) = child_at(x, window, fx, fy);
+    let origin_dx = fx - flx as i32;
+    let origin_dy = fy - fly as i32;
+    let mods = mod_mask(modifiers);
+    let held_state = mods | button_mask(button);
+    send_enter(x, target, fx, fy, flx, fly, mods)?;
+    send_motion(x, target, fx, fy, flx, fly, mods)?;
+    send_button(x, target, button.number(), true, (fx, fy), (flx, fly), mods)?;
+    x.conn.flush().map_err(|e| e.to_string())?;
+    let mut finished = true;
+    let (mut last_x, mut last_y) = (fx, fy);
+    for (at, point) in path.iter().enumerate().skip(1) {
+        if stop() {
+            finished = false;
+            break;
+        }
+        let (px, py) = (point.0 as i32, point.1 as i32);
+        let (lx, ly) = ((px - origin_dx) as i16, (py - origin_dy) as i16);
+        send_motion(x, target, px, py, lx, ly, held_state)?;
+        x.conn.flush().map_err(|e| e.to_string())?;
+        moved(at, px, py);
+        last_x = px;
+        last_y = py;
+        thread::sleep(Duration::from_millis(4));
+    }
+    let (llx, lly) = ((last_x - origin_dx) as i16, (last_y - origin_dy) as i16);
+    send_button(x, target, button.number(), false, (last_x, last_y), (llx, lly), held_state)?;
+    x.conn.flush().map_err(|e| e.to_string())?;
     Ok(finished)
 }
 
@@ -698,7 +1108,7 @@ fn modifier(name: &str) -> Option<u32> {
 }
 
 /// The keysym that types this character.
-fn keysym_of(c: char) -> u32 {
+pub fn keysym_of(c: char) -> u32 {
     let code = c as u32;
     match code {
         0x0a | 0x0d => 0xff0d,
@@ -870,6 +1280,197 @@ pub fn type_text(text: &str, stop: &dyn Fn() -> bool) -> Result<usize, String> {
     Ok(typed)
 }
 
+/// Resolve the X11 subwindow and interior `(root_x, root_y, event_x, event_y)` coordinates for
+/// synthetic key delivery: uses `at` when a control spot is known, or the window's centre.
+fn key_target(x: &X, window: XWindow, at: Option<(i32, i32)>) -> (XWindow, i16, i16, i16, i16) {
+    let (px, py) = at.unwrap_or_else(|| {
+        x.rect(window)
+            .map(|(wx, wy, ww, wh)| (wx + ww / 2, wy + wh / 2))
+            .unwrap_or((1, 1))
+    });
+    let (target, lx, ly) = child_at(x, window, px, py);
+    (target, px as i16, py as i16, lx, ly)
+}
+
+fn send_key_event(x: &X, target: XWindow, coords: (i16, i16, i16, i16), code: u8, down: bool, state: KeyButMask) -> Result<(), String> {
+    let (root_x, root_y, event_x, event_y) = coords;
+    if down {
+        let event = xproto::KeyPressEvent {
+            response_type: xproto::KEY_PRESS_EVENT,
+            detail: code,
+            sequence: 0,
+            time: x.timestamp(),
+            root: x.root,
+            event: target,
+            child: x11rb::NONE,
+            root_x,
+            root_y,
+            event_x,
+            event_y,
+            state,
+            same_screen: true,
+        };
+        x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    } else {
+        let event = xproto::KeyReleaseEvent {
+            response_type: xproto::KEY_RELEASE_EVENT,
+            detail: code,
+            sequence: 0,
+            time: x.timestamp(),
+            root: x.root,
+            event: target,
+            child: x11rb::NONE,
+            root_x,
+            root_y,
+            event_x,
+            event_y,
+            state,
+            same_screen: true,
+        };
+        x.conn.send_event(false, target, EventMask::NO_EVENT, event).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+/// Serializes temporary spare-keycode mapping edits so concurrent agents never race on the X11 keymap.
+static KEYMAP_LOCK: Mutex<()> = Mutex::new(());
+
+fn send_tap(x: &X, target: XWindow, coords: (i16, i16, i16, i16), map: &Keymap, sym: u32, base_state: KeyButMask, hold: Duration) -> Result<(), String> {
+    let mut _keymap_guard = None;
+    let (code, needs_shift, borrowed) = match map.find(sym) {
+        Some((code, shifted)) => (code, shifted, false),
+        None => {
+            _keymap_guard = Some(KEYMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
+            let code = map.spare().ok_or("no free key to type that character with")?;
+            let row = vec![sym; map.per.max(1)];
+            x.conn.change_keyboard_mapping(1, code, map.per as u8, &row).map_err(|e| e.to_string())?;
+            x.conn.flush().map_err(|e| e.to_string())?;
+            thread::sleep(KEY_GAP);
+            (code, false, true)
+        }
+    };
+    let shift_code = (needs_shift && !base_state.contains(KeyButMask::SHIFT))
+        .then(|| map.find(0xffe1).map(|k| k.0))
+        .flatten();
+    let state = if needs_shift { base_state | KeyButMask::SHIFT } else { base_state };
+    let sent = (|| -> Result<(), String> {
+        if let Some(sc) = shift_code {
+            send_key_event(x, target, coords, sc, true, base_state)?;
+        }
+        send_key_event(x, target, coords, code, true, state)?;
+        x.conn.flush().map_err(|e| e.to_string())?;
+        if !hold.is_zero() {
+            thread::sleep(hold);
+        }
+        send_key_event(x, target, coords, code, false, state)?;
+        if let Some(sc) = shift_code {
+            send_key_event(x, target, coords, sc, false, state)?;
+        }
+        x.conn.flush().map_err(|e| e.to_string())?;
+        thread::sleep(KEY_GAP);
+        Ok(())
+    })();
+    if borrowed {
+        let row = vec![0u32; map.per.max(1)];
+        let _ = x.conn.change_keyboard_mapping(1, code, map.per as u8, &row);
+        let _ = x.conn.flush();
+    }
+    sent
+}
+
+/// Run synthetic key delivery inside a window-local synthetic FocusIn/FocusOut pair (when `window`
+/// is in the background). Never calls `XSetInputFocus`, so OS/WM focus never changes.
+fn with_synthetic_focus<T>(x: &X, window: XWindow, target: XWindow, work: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    let background = front() != Some(window);
+    if background {
+        let _ = send_focus(x, window, true);
+        if target != window {
+            let _ = send_focus(x, target, true);
+        }
+        let _ = x.conn.flush();
+    }
+    let result = work();
+    if background {
+        if target != window {
+            let _ = send_focus(x, target, false);
+        }
+        let _ = send_focus(x, window, false);
+        let _ = x.conn.flush();
+    }
+    result
+}
+
+/// Send a key chord directly to `window` (optionally targeting the subwindow at screen spot `at`)
+/// via XSendEvent without calling XSetInputFocus or raising.
+pub fn send_key_at(window: u32, at: Option<(i32, i32)>, chord: &Chord, hold: Duration) -> Result<(), String> {
+    let x = x()?;
+    let map = keymap(x)?;
+    let (target, rx, ry, lx, ly) = key_target(x, window, at);
+    let coords = (rx, ry, lx, ly);
+    let state = mod_mask(&chord.modifiers);
+    with_synthetic_focus(x, window, target, || match chord.key {
+        Some(sym) => {
+            let mods: Vec<(u32, u8)> = chord.modifiers.iter().filter_map(|&m| map.find(m).map(|k| (m, k.0))).collect();
+            let mut running = KeyButMask::default();
+            for &(m, code) in &mods {
+                send_key_event(x, target, coords, code, true, running)?;
+                running |= mod_mask(&[m]);
+            }
+            let sent = send_tap(x, target, coords, &map, sym, state, hold);
+            for &(m, code) in mods.iter().rev() {
+                let _ = send_key_event(x, target, coords, code, false, running);
+                running = KeyButMask::from(u16::from(running) & !u16::from(mod_mask(&[m])));
+            }
+            let _ = x.conn.flush();
+            sent
+        }
+        None => {
+            let mods: Vec<(u32, u8)> = chord.modifiers.iter().filter_map(|&m| map.find(m).map(|k| (m, k.0))).collect();
+            let mut running = KeyButMask::default();
+            for &(m, code) in &mods {
+                send_key_event(x, target, coords, code, true, running)?;
+                running |= mod_mask(&[m]);
+            }
+            x.conn.flush().map_err(|e| e.to_string())?;
+            if !hold.is_zero() {
+                thread::sleep(hold);
+            }
+            for &(m, code) in mods.iter().rev() {
+                send_key_event(x, target, coords, code, false, running)?;
+                running = KeyButMask::from(u16::from(running) & !u16::from(mod_mask(&[m])));
+            }
+            x.conn.flush().map_err(|e| e.to_string())
+        }
+    })
+}
+
+/// Send a key chord directly to `window` via XSendEvent without calling XSetInputFocus or raising.
+pub fn send_key(window: u32, chord: &Chord, hold: Duration) -> Result<(), String> {
+    send_key_at(window, None, chord, hold)
+}
+
+/// Type text directly into `window` (optionally at subwindow spot `at`) via XSendEvent without
+/// taking keyboard focus.
+pub fn send_text_at(window: u32, at: Option<(i32, i32)>, text: &str, stop: &dyn Fn() -> bool) -> Result<usize, String> {
+    let x = x()?;
+    let map = keymap(x)?;
+    let (target, rx, ry, lx, ly) = key_target(x, window, at);
+    let coords = (rx, ry, lx, ly);
+    with_synthetic_focus(x, window, target, || {
+        let mut typed = 0;
+        for c in text.chars() {
+            if stop() {
+                break;
+            }
+            send_tap(x, target, coords, &map, keysym_of(c), KeyButMask::default(), Duration::ZERO)?;
+            typed += 1;
+            thread::sleep(crate::motion::KEY_EVERY.saturating_sub(KEY_GAP));
+        }
+        Ok(typed)
+    })
+}
+
+
 /// Whether Ctrl+Alt+Esc is down now, read from the key state without grabbing anything.
 pub fn stop_keys_down() -> bool {
     let Ok(x) = x() else { return false };
@@ -976,7 +1577,7 @@ pub fn clipboard() -> Result<Option<String>, String> {
     Err("the clipboard needs xclip or xsel: install one (sudo apt install xclip)".into())
 }
 
-pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
+fn set_clipboard_unlocked(text: Option<&str>) -> Result<(), String> {
     if use_wayland_clipboard() {
         if let Some(res) = wayland_set_clipboard(text) {
             return res;
@@ -992,6 +1593,11 @@ pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
         }
     }
     Err("the clipboard needs xclip or xsel: install one (sudo apt install xclip)".into())
+}
+
+pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
+    let _loan = CLIPBOARD_LOAN.lock().unwrap_or_else(|e| e.into_inner());
+    set_clipboard_unlocked(text)
 }
 
 /// Hand the clipboard to xclip, xsel or wl-copy holding these bytes. None if the program is missing.
@@ -1058,15 +1664,22 @@ fn main_kind(kinds: &[String]) -> Option<&String> {
         .or_else(|| first(&|k| !NOT_DATA.contains(&k)))
 }
 
+/// Serializes clipboard loans across concurrent agents so one agent's paste cannot overwrite
+/// another agent's lent text or corrupt the person's saved clipboard.
+static CLIPBOARD_LOAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// What was on the clipboard before an agent borrowed it to paste: its picture, copied files or
-/// text, whichever it held.
+/// text, whichever it held. Automatically restores on drop if `put_back` was not reached.
 pub struct SavedClipboard {
+    _loan: std::sync::MutexGuard<'static, ()>,
     kept: Option<(String, Vec<u8>)>,
     lent: Option<String>,
+    restored: bool,
 }
 
 impl SavedClipboard {
     pub fn take() -> SavedClipboard {
+        let loan = CLIPBOARD_LOAN.lock().unwrap_or_else(|e| e.into_inner());
         let kept = match clipboard_kinds() {
             Some((wayland, kinds)) => main_kind(&kinds).and_then(|kind| {
                 let out = if wayland {
@@ -1082,25 +1695,29 @@ impl SavedClipboard {
             }),
             None => clipboard().ok().flatten().map(|text| ("UTF8_STRING".to_string(), text.into_bytes())),
         };
-        SavedClipboard { kept, lent: None }
+        SavedClipboard { _loan: loan, kept, lent: None, restored: false }
     }
 
     pub fn lend(&mut self, text: &str) -> Result<(), String> {
-        set_clipboard(Some(text))?;
+        set_clipboard_unlocked(Some(text))?;
         self.lent = Some(text.to_string());
         Ok(())
     }
 
-    /// Put the person's clipboard back, unless they copied something new in the meantime.
-    pub fn put_back(self) -> Result<(), String> {
-        if let Some(lent) = &self.lent
-            && clipboard().ok().flatten().as_deref() != Some(lent.as_str())
-        {
+    fn restore_inner(&mut self) -> Result<(), String> {
+        if self.restored {
             return Ok(());
         }
-        let Some((kind, bytes)) = self.kept else { return set_clipboard(None) };
+        self.restored = true;
+        let Some(lent) = &self.lent else {
+            return Ok(());
+        };
+        if clipboard().ok().flatten().as_deref() != Some(lent.as_str()) {
+            return Ok(());
+        }
+        let Some((kind, bytes)) = self.kept.take() else { return set_clipboard_unlocked(None) };
         if kind == "UTF8_STRING" || kind.starts_with("text/plain") {
-            return set_clipboard(Some(&String::from_utf8_lossy(&bytes)));
+            return set_clipboard_unlocked(Some(&String::from_utf8_lossy(&bytes)));
         }
         if use_wayland_clipboard()
             && let Some(done) = own_clipboard("wl-copy", &["--type", &kind], &bytes, None)
@@ -1109,5 +1726,52 @@ impl SavedClipboard {
         }
         own_clipboard("xclip", &["-selection", "clipboard", "-t", &kind, "-i"], &bytes, None)
             .unwrap_or_else(|| Err("the clipboard needs xclip to put a picture or files back".into()))
+    }
+
+    /// Put the person's clipboard back, unless they copied something new in the meantime.
+    pub fn put_back(mut self) -> Result<(), String> {
+        self.restore_inner()
+    }
+}
+
+impl Drop for SavedClipboard {
+    fn drop(&mut self) {
+        let _ = self.restore_inner();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn modifier_and_button_masks_match_x11() {
+        let mask = mod_mask(&[0xffe1, 0xffe3, 0xffe9, 0xffeb]);
+        assert!(mask.contains(KeyButMask::SHIFT));
+        assert!(mask.contains(KeyButMask::CONTROL));
+        assert!(mask.contains(KeyButMask::MOD1));
+        assert!(mask.contains(KeyButMask::MOD4));
+        assert_eq!(button_mask(Button::Left), KeyButMask::BUTTON1);
+        assert_eq!(button_mask(Button::Middle), KeyButMask::BUTTON2);
+        assert_eq!(button_mask(Button::Right), KeyButMask::BUTTON3);
+    }
+
+    #[test]
+    fn risky_chords_are_flagged() {
+        assert!(is_risky(&chord("alt+f4").unwrap()));
+        assert!(is_risky(&chord("ctrl+q").unwrap()));
+        assert!(is_risky(&chord("ctrl+w").unwrap()));
+        assert!(!is_risky(&chord("ctrl+c").unwrap()));
+    }
+
+    #[test]
+    fn synthetic_timestamps_are_nonzero_and_monotonic() {
+        let t1 = next_timestamp(1, 0);
+        assert!(t1 > 1);
+        let t2 = next_timestamp(t1, 0);
+        assert_eq!(t2, t1 + 1);
+        let t3 = next_timestamp(t2, 500);
+        assert_eq!(t3, 500);
+        assert_eq!(next_timestamp(u32::MAX, 0), 1);
     }
 }

@@ -50,8 +50,7 @@ impl Pen {
     }
 
     fn send(&self, x: i32, y: i32, flags: POINTER_FLAGS, pressure: u32) -> bool {
-        self.last.set(Some(POINT { x, y }));
-        unsafe {
+        let ok = unsafe {
             let mut input: POINTER_TYPE_INFO = zeroed();
             input.r#type = PT_PEN;
             let pen = &mut input.Anonymous.penInfo;
@@ -66,7 +65,9 @@ impl Pen {
             }
             pen.pressure = pressure;
             InjectSyntheticPointerInput(self.device, &input, 1) != 0
-        }
+        };
+        self.last.set(Some(pointer()));
+        ok
     }
 
     fn hover(&self, x: i32, y: i32) -> bool {
@@ -89,6 +90,7 @@ impl Pen {
 
     /// One press, or two for a double click. A right click is the pen's barrel button.
     pub fn tap(&self, x: i32, y: i32, right: bool, double: bool) -> bool {
+        crate::real::wait_for_quiet();
         if !self.hover(x, y) {
             return false;
         }
@@ -114,6 +116,7 @@ impl Pen {
     /// sending this pen to the window it pressed until it lifts.
     pub fn put_down(&self, path: &[(f32, f32)], button: Button) -> Result<(), String> {
         let Some(first) = path.first() else { return Ok(()) };
+        crate::real::wait_for_quiet();
         let (x, y) = (first.0.round() as i32, first.1.round() as i32);
         if !self.hover(x, y) {
             return Err("Windows would not take pen input".into());

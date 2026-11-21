@@ -63,8 +63,8 @@ fn aim(event: CGEventRef, window: u32) {
 }
 
 /// A click at a screen point, in points, aimed at one window of the app, with modifier keys held.
-pub fn click(pid: i32, window: u32, x: f64, y: f64, button: Button, count: u32, flags: u64) -> Result<(), String> {
-    let at = CGPoint { x, y };
+pub fn click(pid: i32, window: u32, at: (f64, f64), button: Button, count: u32, flags: u64, hold: Duration) -> Result<(), String> {
+    let at = CGPoint { x: at.0, y: at.1 };
     let (down, up, code, number) = match button {
         Button::Left => (kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft, 0),
         Button::Right => (kCGEventRightMouseDown, kCGEventRightMouseUp, kCGMouseButtonRight, 1),
@@ -73,7 +73,7 @@ pub fn click(pid: i32, window: u32, x: f64, y: f64, button: Button, count: u32, 
         Button::Forward => (kCGEventOtherMouseDown, kCGEventOtherMouseUp, 4, 4),
     };
     for click in 1..=count {
-        for kind in [down, up] {
+        for (idx, kind) in [down, up].into_iter().enumerate() {
             let event = unsafe { CGEventCreateMouseEvent(null(), kind, at, code) };
             if !event.is_null() {
                 unsafe {
@@ -86,7 +86,7 @@ pub fn click(pid: i32, window: u32, x: f64, y: f64, button: Button, count: u32, 
             }
             aim(event, window);
             post(To::App(pid), event)?;
-            thread::sleep(CLICK_GAP);
+            thread::sleep(if idx == 0 { hold.max(CLICK_GAP) } else { CLICK_GAP });
         }
     }
     Ok(())
@@ -147,11 +147,13 @@ pub fn stroke(
     Ok(finished)
 }
 
-pub fn scroll(pid: i32, x: f64, y: f64, lines: i32) -> Result<(), String> {
-    let event = unsafe { CGEventCreateScrollWheelEvent2(null(), kCGScrollEventUnitLine, 1, lines, 0, 0) };
+pub fn scroll(pid: i32, window: u32, x: f64, y: f64, lines: i32, sideways: bool) -> Result<(), String> {
+    let (v, h) = if sideways { (0, lines) } else { (lines, 0) };
+    let event = unsafe { CGEventCreateScrollWheelEvent2(null(), kCGScrollEventUnitLine, 2, v, h, 0) };
     if !event.is_null() {
         unsafe { CGEventSetLocation(event, CGPoint { x, y }) };
     }
+    aim(event, window);
     post(To::App(pid), event)
 }
 
@@ -198,8 +200,17 @@ pub struct Chord {
     pub key: Option<u16>,
 }
 
+const LETTERS: &str = "asdfhgzxcv_bqweryt123465=97-80]ou[ip_lj'k;\\,/nm.";
+
+/// The ASCII character corresponding to a macOS virtual key code, if it is a printable key.
+pub fn key_char(code: u16) -> Option<char> {
+    if code == 50 {
+        return Some('`');
+    }
+    LETTERS.chars().nth(code as usize).filter(|&c| c != '_')
+}
+
 fn key_code(name: &str) -> Option<u16> {
-    const LETTERS: &str = "asdfhgzxcv_bqweryt123465=97-80]ou[ip_lj'k;\\,/nm.";
     let code = match name {
         "enter" | "return" => 36,
         "tab" => 48,

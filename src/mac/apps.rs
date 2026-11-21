@@ -74,6 +74,7 @@ pub fn element(window: &Window) -> Option<Owned> {
 
 /// Open an app by name or path, without bringing it to the front, and wait for a new window.
 pub fn launch(app: &str, args: &[String], front: bool) -> Result<Option<Window>, String> {
+    let before_front = (!front).then(front_pid).flatten();
     let before: HashSet<u32> = list().iter().map(|w| w.id).collect();
     let mut open = Command::new("/usr/bin/open");
     if !front {
@@ -94,6 +95,13 @@ pub fn launch(app: &str, args: &[String], front: bool) -> Result<Option<Window>,
     let started = std::time::Instant::now();
     while started.elapsed() < LAUNCH_WAIT {
         if let Some(new) = list().into_iter().find(|w| !before.contains(&w.id)) {
+            if let Some(prev) = before_front
+                && front_pid() == Some(new.pid)
+                && prev != new.pid
+                && idle_seconds() >= started.elapsed().as_secs_f64()
+            {
+                activate(prev);
+            }
             return Ok(Some(new));
         }
         thread::sleep(LAUNCH_STEP);
@@ -118,6 +126,23 @@ pub fn front_pid() -> Option<i32> {
         }
         let pid: i32 = msg_send![app, processIdentifier];
         Some(pid)
+    }
+}
+
+/// Find the PID of a running application by localized name or bundle executable name (e.g. NotificationCenter).
+pub fn pid_of_app(name: &str) -> Option<i32> {
+    unsafe {
+        let info = Owned::new(CGWindowListCopyWindowInfo(kCGWindowListOptionAll, kCGNullWindowID))?;
+        let wanted = name.to_lowercase();
+        for entry in items(info.0) {
+            let owner = string_of(CFDictionaryGetValue(entry, kCGWindowOwnerName)).unwrap_or_default();
+            if owner.to_lowercase() == wanted
+                && let Some(pid) = number_of(CFDictionaryGetValue(entry, kCGWindowOwnerPID))
+            {
+                return Some(pid as i32);
+            }
+        }
+        None
     }
 }
 
@@ -208,12 +233,19 @@ pub fn clipboard() -> Option<String> {
     })
 }
 
+/// Serializes clipboard loans across concurrent agents so one agent's paste cannot overwrite
+/// another agent's lent text or corrupt the person's saved clipboard.
+static CLIPBOARD_LOAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Everything on the clipboard before an agent borrowed it to paste: every item and every kind of
-/// data on each, so pictures and copied files come back as well as text.
+/// data on each, so pictures and copied files come back as well as text. Automatically restores
+/// on drop if `put_back` was not reached.
 pub struct SavedClipboard {
+    _loan: std::sync::MutexGuard<'static, ()>,
     items: Vec<Vec<(String, Vec<u8>)>>,
     /// The clipboard's change count once the agent's own text is on it.
     lent: Option<isize>,
+    restored: bool,
 }
 
 /// Kinds that ask clipboard managers and Universal Clipboard to leave an entry alone (nspasteboard.org).
@@ -235,6 +267,7 @@ impl SavedClipboard {
         use objc2::msg_send;
         use objc2::runtime::AnyObject;
         use std::ffi::{CStr, c_char, c_void};
+        let loan = CLIPBOARD_LOAN.lock().unwrap_or_else(|e| e.into_inner());
         let items = objc2::rc::autoreleasepool(|_| unsafe {
             let mut items = Vec::new();
             let list: *mut AnyObject = msg_send![pasteboard(), pasteboardItems];
@@ -265,7 +298,7 @@ impl SavedClipboard {
             }
             items
         });
-        SavedClipboard { items, lent: None }
+        SavedClipboard { _loan: loan, items, lent: None, restored: false }
     }
 
     /// Put the agent's text on the clipboard, marked so clipboard managers leave it out.
@@ -285,18 +318,22 @@ impl SavedClipboard {
         })
     }
 
-    /// Put the person's clipboard back, unless they copied something new in the meantime.
-    pub fn put_back(self) -> Result<(), String> {
+    fn restore_inner(&mut self) -> Result<(), String> {
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
         use std::ffi::c_void;
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        let Some(lent) = self.lent else {
+            return Ok(());
+        };
         objc2::rc::autoreleasepool(|_| unsafe {
             let board = pasteboard();
-            if let Some(lent) = self.lent {
-                let now: isize = msg_send![board, changeCount];
-                if now != lent {
-                    return Ok(());
-                }
+            let now: isize = msg_send![board, changeCount];
+            if now != lent {
+                return Ok(());
             }
             let _: isize = msg_send![board, clearContents];
             if self.items.is_empty() {
@@ -316,11 +353,29 @@ impl SavedClipboard {
             if done { Ok(()) } else { Err("macOS would not take the clipboard back".into()) }
         })
     }
+
+    /// Put the person's clipboard back, unless they copied something new in the meantime.
+    pub fn put_back(mut self) -> Result<(), String> {
+        self.restore_inner()
+    }
+}
+
+impl Drop for SavedClipboard {
+    fn drop(&mut self) {
+        let _ = self.restore_inner();
+    }
+}
+
+/// Seconds elapsed since the person's most recent physical HID input (keyboard/mouse/trackpad).
+pub fn idle_seconds() -> f64 {
+    const HID_SYSTEM_STATE: i32 = 1;
+    unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, u32::MAX) }
 }
 
 /// Replace the clipboard with text, or empty it with None.
 pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
     use objc2::msg_send;
+    let _loan = CLIPBOARD_LOAN.lock().unwrap_or_else(|e| e.into_inner());
     objc2::rc::autoreleasepool(|_| unsafe {
         let board = pasteboard();
         let _: isize = msg_send![board, clearContents];

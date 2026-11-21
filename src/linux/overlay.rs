@@ -15,13 +15,14 @@ use std::time::{Duration, Instant};
 use x11rb::connection::{Connection, RequestConnection};
 use x11rb::protocol::shape::{self, ConnectionExt as _};
 use x11rb::protocol::xproto::{
-    ClipOrdering, ColormapAlloc, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, ImageFormat, Rectangle, StackMode, VisualClass,
-    Window as XWindow, WindowClass,
+    AtomEnum, ClipOrdering, ColormapAlloc, ConfigureWindowAux, ConnectionExt as _, CreateGCAux, CreateWindowAux, ImageFormat, PropMode, Rectangle, StackMode,
+    VisualClass, Window as XWindow, WindowClass,
 };
 use x11rb::rust_connection::RustConnection;
 
 const FRAME: Duration = Duration::from_millis(16);
-const RESTACK_EVERY: Duration = Duration::from_millis(100);
+const RESTACK_EVERY: Duration = Duration::from_millis(250);
+const REST_AFTER: Duration = Duration::from_secs(4);
 const PRESS_LINGER_MS: f32 = 450.0;
 const LABEL_PX: f32 = 11.0;
 /// Without a compositor a window has no see-through pixels, so it is cut to the parts at least
@@ -192,6 +193,7 @@ struct Layer {
     h: u16,
     at: (i32, i32),
     shown: bool,
+    last_stacked: Option<XWindow>,
 }
 
 impl Layer {
@@ -199,11 +201,24 @@ impl Layer {
         let window = conn.generate_id().ok()?;
         let aux = CreateWindowAux::new().override_redirect(1).background_pixel(0).border_pixel(0).colormap(look.colormap);
         conn.create_window(look.depth, window, look.root, 0, 0, 1, 1, 0, WindowClass::INPUT_OUTPUT, look.visual, &aux).ok()?;
+        // Never accept input focus or appear in taskbars/pagers.
+        let wm_hints: [u32; 9] = [1, 0, 0, 0, 0, 0, 0, 0, 0]; // InputHint = 1, input = False
+        let hint_bytes: Vec<u8> = wm_hints.iter().flat_map(|v| v.to_ne_bytes()).collect();
+        let _ = conn.change_property(PropMode::REPLACE, window, AtomEnum::WM_HINTS, AtomEnum::WM_HINTS, 32, wm_hints.len() as u32, &hint_bytes);
+        if let (Some(state_atom), Some(skip_tb), Some(skip_pg)) = (
+            conn.intern_atom(false, b"_NET_WM_STATE").ok().and_then(|c| c.reply().ok()),
+            conn.intern_atom(false, b"_NET_WM_STATE_SKIP_TASKBAR").ok().and_then(|c| c.reply().ok()),
+            conn.intern_atom(false, b"_NET_WM_STATE_SKIP_PAGER").ok().and_then(|c| c.reply().ok()),
+        ) {
+            let atoms = [skip_tb.atom, skip_pg.atom];
+            let atom_bytes: Vec<u8> = atoms.iter().flat_map(|v| v.to_ne_bytes()).collect();
+            let _ = conn.change_property(PropMode::REPLACE, window, state_atom.atom, AtomEnum::ATOM, 32, atoms.len() as u32, &atom_bytes);
+        }
         // An empty input shape lets every click through to what is underneath.
         conn.shape_rectangles(shape::SO::SET, shape::SK::INPUT, ClipOrdering::UNSORTED, window, 0, 0, &[]).ok()?;
         let gc = conn.generate_id().ok()?;
         conn.create_gc(gc, window, &CreateGCAux::new()).ok()?;
-        Some(Layer { window, gc, w: 1, h: 1, at: (i32::MIN, i32::MIN), shown: false })
+        Some(Layer { window, gc, w: 1, h: 1, at: (i32::MIN, i32::MIN), shown: false, last_stacked: None })
     }
 
     /// Show a picture with its top left at x,y.
@@ -243,6 +258,7 @@ impl Layer {
         if visible && !self.shown {
             let _ = conn.map_window(self.window);
             self.shown = true;
+            self.last_stacked = None;
         }
     }
 
@@ -253,19 +269,23 @@ impl Layer {
         }
     }
 
-    /// Just above the agent's window, or above everything if it has none.
-    fn stack(&self, conn: &RustConnection, above: Option<XWindow>) {
-        let aux = match above {
-            Some(sibling) => ConfigureWindowAux::new().sibling(sibling).stack_mode(StackMode::ABOVE),
-            None => ConfigureWindowAux::new().stack_mode(StackMode::ABOVE),
-        };
+    /// Just above the agent's window. Never raises globally without a target window, and skips
+    /// redundant restacks when `force` is false and the target sibling is unchanged.
+    fn stack(&mut self, conn: &RustConnection, above: Option<XWindow>, force: bool) {
+        let Some(sibling) = above else { return };
+        if !force && self.last_stacked == Some(sibling) {
+            return;
+        }
+        let aux = ConfigureWindowAux::new().sibling(sibling).stack_mode(StackMode::ABOVE);
         let _ = conn.configure_window(self.window, &aux);
+        self.last_stacked = Some(sibling);
     }
 
     fn hide(&mut self, conn: &RustConnection) {
         if self.shown {
             let _ = conn.unmap_window(self.window);
             self.shown = false;
+            self.last_stacked = None;
         }
     }
 
@@ -273,6 +293,7 @@ impl Layer {
         if !self.shown {
             let _ = conn.map_window(self.window);
             self.shown = true;
+            self.last_stacked = None;
         }
     }
 
@@ -324,6 +345,8 @@ struct Agent {
     side: f32,
     /// Where its caret's top left is and how tall, while it is a caret.
     caret: Option<(i32, i32, i32)>,
+    last_active: Instant,
+    resting: bool,
 }
 
 struct Press {
@@ -381,6 +404,7 @@ fn run(inbox: Receiver<Command>) {
     let Some(look) = look_of(&conn, screen) else { return };
     let scale = 1.0;
     let mut agents: HashMap<String, Agent> = HashMap::new();
+    let mut waiting: HashMap<String, XWindow> = HashMap::new();
     let mut presses: Vec<Press> = Vec::new();
     let mut aside_depth: usize = 0;
     let mut restacked = Instant::now();
@@ -399,20 +423,48 @@ fn run(inbox: Receiver<Command>) {
                 Command::Move { agent, x, y, instant, done } => {
                     let taken: Vec<Rgb> = agents.values().map(|a| a.colour).collect();
                     let side = if agents.len().is_multiple_of(2) { 1.0 } else { -1.0 };
+                    let mut created = false;
                     if !agents.contains_key(&agent) {
                         let colour = motion::colour_for(&agent, &taken);
                         let label = text_mask(&agent, LABEL_PX * scale);
                         let Some(mut layer) = Layer::new(&conn, &look) else { continue };
                         let Some((picture, tx, ty)) = draw::posed(colour, &label, scale, 0.0, 1.0) else { continue };
                         // A new cursor arrives from a little way off, as on Windows.
-                        let start = (x as f32 + 90.0, y as f32 + 90.0);
+                        let start = if instant { (x as f32, y as f32) } else { (x as f32 + 90.0, y as f32 + 90.0) };
+                        let above = waiting.remove(&agent);
                         layer.show(&conn, &look, &picture, start.0 as i32 - tx, start.1 as i32 - ty, !aside);
+                        if !aside {
+                            layer.stack(&conn, above, true);
+                        }
                         agents.insert(
                             agent.clone(),
-                            Agent { colour, label, pose: motion::Pose::new(), look: (0, 0), layer, tip: (tx, ty), at: start, glide: None, above: None, side, caret: None },
+                            Agent {
+                                colour,
+                                label,
+                                pose: motion::Pose::new(),
+                                look: (0, 0),
+                                layer,
+                                tip: (tx, ty),
+                                at: start,
+                                glide: None,
+                                above,
+                                side,
+                                caret: None,
+                                last_active: Instant::now(),
+                                resting: false,
+                            },
                         );
+                        created = true;
                     }
                     let entry = agents.get_mut(&agent).expect("just added");
+                    entry.last_active = Instant::now();
+                    let was_resting = entry.resting;
+                    if entry.resting {
+                        entry.resting = false;
+                        if !aside {
+                            entry.layer.unhide(&conn);
+                        }
+                    }
                     // Back to the arrow, which the next frame draws afresh.
                     if entry.caret.take().is_some() {
                         entry.look = (i32::MIN, i32::MIN);
@@ -422,6 +474,9 @@ fn run(inbox: Receiver<Command>) {
                         entry.glide = None;
                         entry.at = to;
                         entry.layer.place(&conn, x.saturating_sub(entry.tip.0), y.saturating_sub(entry.tip.1));
+                        if (created || was_resting) && !aside {
+                            entry.layer.stack(&conn, entry.above, false);
+                        }
                         if let Some(done) = done {
                             let _ = done.send(());
                         }
@@ -431,41 +486,55 @@ fn run(inbox: Receiver<Command>) {
                     entry.glide = Some(Glide { from: entry.at, middle: motion::bow(entry.at, to, entry.side), to, started: Instant::now(), ms, done });
                     entry.side = -entry.side;
                     if !aside {
-                        entry.layer.stack(&conn, entry.above);
+                        entry.layer.stack(&conn, entry.above, false);
                     }
                 }
                 Command::Over { agent, window } => {
                     let frame = frame_of(&conn, look.root, window);
                     if let Some(entry) = agents.get_mut(&agent) {
+                        let changed = entry.above != Some(frame);
                         entry.above = Some(frame);
-                        if !aside {
-                            entry.layer.stack(&conn, entry.above);
+                        if !aside && !entry.resting && changed {
+                            entry.layer.stack(&conn, entry.above, false);
                         }
+                    } else {
+                        waiting.insert(agent, frame);
                     }
                 }
                 Command::Press { agent, target } => {
                     let target = (target.0, target.1, target.2.clamp(1, 8192), target.3.clamp(1, 8192));
-                    if let Some(entry) = agents.get(&agent)
-                        && let Some(layer) = Layer::new(&conn, &look)
-                    {
-                        presses.push(Press { colour: entry.colour, target, layer, started: Instant::now(), above: entry.above });
+                    if let Some(entry) = agents.get_mut(&agent) {
+                        entry.last_active = Instant::now();
+                        if let Some(layer) = Layer::new(&conn, &look) {
+                            presses.push(Press { colour: entry.colour, target, layer, started: Instant::now(), above: entry.above });
+                        }
                     }
                 }
                 Command::Type { agent, keys } => {
                     if let Some(entry) = agents.get_mut(&agent) {
+                        entry.last_active = Instant::now();
+                        if entry.resting {
+                            entry.resting = false;
+                            if !aside {
+                                entry.layer.unhide(&conn);
+                                entry.layer.stack(&conn, entry.above, false);
+                            }
+                        }
                         entry.pose.type_keys(Instant::now(), keys);
                     }
                 }
                 Command::Caret { agent, x, y, h } => {
                     let h = h.clamp(1, 8192);
                     if let Some(entry) = agents.get_mut(&agent) {
+                        entry.last_active = Instant::now();
+                        entry.resting = false;
                         entry.glide = None;
                         entry.at = (x as f32, y as f32);
                         entry.caret = Some((x, y, h));
                         if let Some((picture, cx, cy)) = draw::caret(entry.colour, &entry.label, scale, h, 1.0) {
                             entry.layer.show(&conn, &look, &picture, x.saturating_sub(cx), y.saturating_sub(cy), !aside);
                             if !aside {
-                                entry.layer.stack(&conn, entry.above);
+                                entry.layer.stack(&conn, entry.above, false);
                             }
                         }
                     }
@@ -480,10 +549,20 @@ fn run(inbox: Receiver<Command>) {
                     let now_aside = aside_depth > 0;
                     if now_aside != was {
                         for agent in agents.values_mut() {
-                            if now_aside { agent.layer.hide(&conn) } else { agent.layer.unhide(&conn) }
+                            if now_aside {
+                                agent.layer.hide(&conn);
+                            } else if !agent.resting {
+                                agent.layer.unhide(&conn);
+                                agent.layer.stack(&conn, agent.above, true);
+                            }
                         }
                         for press in &mut presses {
-                            if now_aside { press.layer.hide(&conn) } else { press.layer.unhide(&conn) }
+                            if now_aside {
+                                press.layer.hide(&conn);
+                            } else {
+                                press.layer.unhide(&conn);
+                                press.layer.stack(&conn, press.above, true);
+                            }
                         }
                         // Once a round trip returns, the server has done everything asked before it.
                         let _ = conn.get_input_focus().ok().and_then(|c| c.reply().ok());
@@ -503,6 +582,14 @@ fn run(inbox: Receiver<Command>) {
 fn tick(conn: &RustConnection, look: &Look, scale: f32, agents: &mut HashMap<String, Agent>, presses: &mut Vec<Press>, aside: bool, restacked: &mut Instant) {
     let now = Instant::now();
     for agent in agents.values_mut() {
+        if !agent.resting && agent.glide.is_none() && agent.last_active.elapsed() >= REST_AFTER {
+            agent.resting = true;
+            agent.layer.hide(conn);
+            continue;
+        }
+        if agent.resting {
+            continue;
+        }
         // A caret stays where the text goes in until the agent moves on.
         if agent.caret.is_some() {
             continue;
@@ -546,15 +633,17 @@ fn tick(conn: &RustConnection, look: &Look, scale: f32, agents: &mut HashMap<Str
         {
             press.layer.show(conn, look, &picture, x - margin, y - margin, !aside);
             if !aside {
-                press.layer.stack(conn, press.above);
+                press.layer.stack(conn, press.above, false);
             }
         }
         index += 1;
     }
     if *restacked + RESTACK_EVERY <= now && !aside {
         *restacked = now;
-        for agent in agents.values() {
-            agent.layer.stack(conn, agent.above);
+        for agent in agents.values_mut() {
+            if !agent.resting && agent.glide.is_some() {
+                agent.layer.stack(conn, agent.above, true);
+            }
         }
     }
     let _ = conn.flush();

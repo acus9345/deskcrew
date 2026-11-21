@@ -72,6 +72,7 @@ pub const kCFNumberSInt64Type: i32 = 4;
 pub const kCFNumberDoubleType: i32 = 13;
 pub const kAXValueCGPointType: i32 = 1;
 pub const kAXValueCGSizeType: i32 = 2;
+pub const kAXValueCFRangeType: i32 = 4;
 pub const kAXErrorSuccess: AXError = 0;
 
 pub const kCGWindowListOptionAll: u32 = 0;
@@ -151,6 +152,7 @@ unsafe extern "C" {
     pub fn CFArrayGetCount(array: CFArrayRef) -> CFIndex;
     pub fn CFArrayGetValueAtIndex(array: CFArrayRef, index: CFIndex) -> CFTypeRef;
     pub fn CFBooleanGetValue(b: CFTypeRef) -> u8;
+    pub fn CFNumberCreate(alloc: CFAllocatorRef, kind: i32, value: *const c_void) -> CFTypeRef;
     pub fn CFNumberGetValue(n: CFTypeRef, kind: i32, out: *mut c_void) -> u8;
     pub fn CFDictionaryGetValue(d: CFDictionaryRef, key: CFTypeRef) -> CFTypeRef;
     pub fn CFDictionaryCreate(
@@ -181,6 +183,7 @@ unsafe extern "C" {
     pub fn AXIsProcessTrusted() -> u8;
     pub fn AXIsProcessTrustedWithOptions(options: CFDictionaryRef) -> u8;
     pub fn AXUIElementCreateApplication(pid: i32) -> AXUIElementRef;
+    pub fn AXUIElementCopyElementAtPosition(application: AXUIElementRef, x: f32, y: f32, element: *mut AXUIElementRef) -> AXError;
     pub fn AXUIElementCopyAttributeValue(element: AXUIElementRef, attribute: CFStringRef, value: *mut CFTypeRef) -> AXError;
     pub fn AXUIElementCopyMultipleAttributeValues(element: AXUIElementRef, attributes: CFArrayRef, options: u32, values: *mut CFArrayRef) -> AXError;
     pub fn AXUIElementSetAttributeValue(element: AXUIElementRef, attribute: CFStringRef, value: CFTypeRef) -> AXError;
@@ -255,6 +258,7 @@ unsafe extern "C" {
     pub fn CGEventGetIntegerValueField(event: CGEventRef, field: u32) -> i64;
     pub fn CGEventPostToPid(pid: i32, event: CGEventRef);
     pub fn CGEventPost(tap: u32, event: CGEventRef);
+    pub fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
     pub fn CGGetActiveDisplayList(max: u32, displays: *mut u32, count: *mut u32) -> i32;
     pub fn CGEventTapCreate(tap: u32, place: u32, options: u32, mask: u64, callback: CGEventTapCallBack, info: *mut c_void) -> *mut c_void;
     pub fn CGEventTapEnable(tap: *mut c_void, enable: bool);
@@ -339,6 +343,10 @@ pub fn number_of(cf: CFTypeRef) -> Option<f64> {
         let mut value = 0.0f64;
         (CFNumberGetValue(cf, kCFNumberDoubleType, (&mut value as *mut f64).cast()) != 0).then_some(value)
     }
+}
+
+pub fn cf_number(value: f64) -> Option<Owned> {
+    Owned::new(unsafe { CFNumberCreate(std::ptr::null(), kCFNumberDoubleType, (&value as *const f64).cast()) })
 }
 
 /// The items of a CFArray, still owned by the array.

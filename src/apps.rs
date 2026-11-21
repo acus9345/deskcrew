@@ -230,7 +230,12 @@ pub fn clipboard_text() -> Result<String, String> {
     }
 }
 
+pub fn clipboard_seq() -> u32 {
+    unsafe { GetClipboardSequenceNumber() }
+}
+
 pub fn set_clipboard(text: &str) -> Result<(), String> {
+    let _loan = CLIPBOARD_LOAN.lock().unwrap_or_else(|e| e.into_inner());
     put_on_clipboard(&[(CF_UNICODETEXT, units_as_bytes(&wide(text)))])
 }
 
@@ -276,16 +281,23 @@ fn quiet_format() -> u32 {
     unsafe { RegisterClipboardFormatW(name.as_ptr()) }
 }
 
+/// Serializes clipboard loans across concurrent agents so one agent's paste cannot overwrite
+/// another agent's lent text or corrupt the person's saved clipboard.
+static CLIPBOARD_LOAN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Everything that was on the clipboard before an agent borrowed it to paste: text, pictures,
-/// copied files, all of it.
+/// copied files, all of it. Automatically restores on drop if `put_back` was not reached.
 pub struct SavedClipboard {
+    _loan: std::sync::MutexGuard<'static, ()>,
     formats: Vec<(u32, Vec<u8>)>,
     /// Which change of the clipboard the agent's own text was, once it is put there.
     lent: Option<u32>,
+    restored: bool,
 }
 
 impl SavedClipboard {
     pub fn take() -> Result<SavedClipboard, String> {
+        let loan = CLIPBOARD_LOAN.lock().unwrap_or_else(|e| e.into_inner());
         let mut formats = Vec::new();
         unsafe {
             open_clipboard()?;
@@ -311,7 +323,7 @@ impl SavedClipboard {
             }
             CloseClipboard();
         }
-        Ok(SavedClipboard { formats, lent: None })
+        Ok(SavedClipboard { _loan: loan, formats, lent: None, restored: false })
     }
 
     /// Put the agent's text on the clipboard, kept out of the person's clipboard history.
@@ -321,18 +333,35 @@ impl SavedClipboard {
         Ok(())
     }
 
-    /// Put the person's clipboard back, unless they copied something new in the meantime.
-    pub fn put_back(self) -> Result<(), String> {
+    fn restore_inner(&mut self) -> Result<(), String> {
+        if self.restored {
+            return Ok(());
+        }
+        self.restored = true;
+        if self.lent.is_none() {
+            return Ok(());
+        }
         if self.lent.is_some_and(|lent| unsafe { GetClipboardSequenceNumber() } != lent) {
             return Ok(());
         }
         // Putting it back is not a new copy, so history does not get it twice.
         let quiet = quiet_format();
-        let mut formats = self.formats;
+        let mut formats = std::mem::take(&mut self.formats);
         if !formats.iter().any(|(format, _)| *format == quiet) {
             formats.push((quiet, vec![0; 4]));
         }
         put_on_clipboard(&formats)
+    }
+
+    /// Put the person's clipboard back, unless they copied something new in the meantime.
+    pub fn put_back(mut self) -> Result<(), String> {
+        self.restore_inner()
+    }
+}
+
+impl Drop for SavedClipboard {
+    fn drop(&mut self) {
+        let _ = self.restore_inner();
     }
 }
 

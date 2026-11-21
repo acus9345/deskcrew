@@ -6,6 +6,7 @@
 use super::{
     atspi::{self, FrameWindow, Node, Obj},
     overlay::Overlay,
+    portal,
     x::{self, Bounds, Button, By, Window},
 };
 use crate::{
@@ -30,6 +31,7 @@ windows [filter]                      list windows
 see [window] [-f] [-a] [--find word] [--from N]
                                       controls; later reads show only changes (-f for all, -a off-screen too)
 get e3                                a control's full text
+table e3 [--from N]                   rows of a table or list
 shot [window|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
                                       PNG path; \"unchanged\" if it matches the last one
 click e3 [e4 ...] | \"Name\" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift] [--hold ms]
@@ -37,15 +39,17 @@ hover e3 | x,y     check e3     uncheck e3     toggle e3     expand e3     colla
 is e3 on|off|open|closed|selected|enabled|disabled
 down shift     up (lets go; 30 s limit)
 set e3 \"value\"     type [e3] \"text\" [--paste]     key enter [--hold ms]     select e3 \"Item\"
-scroll [e3] up|down|left|right [n]     show e3     wait \"text\" [--gone] [--ms N]
-drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth]
+scroll [e3] up|down|left|right [n]     show e3     wait \"text\"|ms [--gone] [--ms N]
+drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth] [--fill] [--close]
+pick-file \"/path/to/file\"            fill and accept an open file dialog
+notifications [close]                 list recent desktop notifications
 do \"click e1; set e2 hi; key enter\" [--dry] [--risk low|medium|high]   many steps, one reply
 Any action: --expect \"text\" fails unless the text shows afterwards.
-launch app [args]     focus     close     place x,y,w,h|min|max|restore
-apps     screens     clip     clip set \"text\"     clip clear     status     resume     quit     setup (installs for your coding agents)     mcp (the same as MCP tools, over stdio)
+launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore|left|right|monitor N
+apps     screens     cursor     quiet [on|off]     clip     clip set \"text\"     clip clear     status     resume     quit     setup     mcp
 Every action replies with what changed, in the picture too. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
-Controls go through accessibility (AT-SPI) in the background. On X11, keys and typing take the window's keyboard
-for a moment without raising it, and points and drawing use the X pointer, bringing the window forward. Flags: -w window, --agent name, --fast, --force (allow risky keys).
+Controls go through accessibility (AT-SPI) and background X11 events so the person's focus and pointer stay untouched.
+Flags: -w window, --agent name, --fast, --real (bring forward / real XTest input), --mouse (use pointer device), --front (launch in front), --force (allow risky keys).
 On Wayland, AT-SPI commands (windows, see, get, set, check, select, pressing controls, scroll bars, tables, notifications) work; screenshots, global keys/pointer and window placement still need X11 (or desktop portals).";
 
 /// What a picture of a window the agent has not read yet says: reading is far cheaper.
@@ -81,8 +85,8 @@ const STOP_WATCH: Duration = Duration::from_millis(50);
 const STOPPED: &str = "stopped by the person with Ctrl+Alt+Esc: ask them before doing more (deskcrew resume clears it)";
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
 const MARKED: [&str; 11] = ["button", "edit", "menuitem", "checkbox", "radio", "combobox", "tab", "item", "link", "slider", "spinner"];
-// Roles that hold other controls, and so may be a canvas rather than something covering its space.
-const CONTAINERS: [&str; 2] = ["", "image"];
+// Roles that hold other controls or drawable surfaces, so blind_spot can still inspect/OCR them.
+const CONTAINERS: [&str; 4] = ["", "image", "canvas", "document"];
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
@@ -126,9 +130,11 @@ struct View {
     nodes: BTreeMap<u32, Node>,
     lines: Seen,
     hidden: usize,
+    quiet: Vec<Bounds>,
     element: Option<Obj>,
     read_once: bool,
     blind: Option<(u64, Vec<String>)>,
+    ocr_hits: Vec<(String, Bounds)>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -211,6 +217,10 @@ struct Flags {
     ms: Option<u64>,
     hold: Option<u64>,
     expect: Option<String>,
+    fast: bool,
+    real: bool,
+    front: bool,
+    mouse: bool,
 }
 
 impl Flags {
@@ -232,6 +242,10 @@ impl Flags {
         self.with = self.with.or_else(|| outer.with.clone());
         self.ms = self.ms.or(outer.ms);
         self.hold = self.hold.or(outer.hold);
+        self.fast |= outer.fast;
+        self.real |= outer.real;
+        self.front |= outer.front;
+        self.mouse |= outer.mouse;
         self
     }
 
@@ -348,8 +362,10 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
             "--rulers" => flags.rulers = true,
             "--changed" => flags.changed = true,
             "--screen" => flags.screen = true,
-            // Accepted for scripts written for other systems; Linux has one way for each.
-            "--real" | "--fast" | "--front" | "--mouse" => {}
+            "--fast" => flags.fast = true,
+            "--real" => flags.real = true,
+            "--front" => flags.front = true,
+            "--mouse" => flags.mouse = true,
             _ => rest.push(word.clone()),
         }
         at += 1;
@@ -375,9 +391,10 @@ enum Target {
     Point(i32, i32),
 }
 
-/// Modifier keys one agent holds down.
+/// Modifier keys and mouse buttons one agent holds down.
 struct Held {
     keys: Vec<u32>,
+    buttons: Vec<(u32, Button, i32, i32)>,
     since: Instant,
 }
 
@@ -388,11 +405,37 @@ struct Service {
     agents: Mutex<HashMap<String, AgentState>>,
     last_used: Mutex<Instant>,
     active: AtomicUsize,
+    quiet: AtomicBool,
     quit: AtomicBool,
     unlinked: AtomicBool,
     wake_lock: Mutex<()>,
     wake: Condvar,
     overlay: Overlay,
+}
+
+fn env_quiet() -> bool {
+    std::env::var("DESKCREW_QUIET")
+        .map(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+        .unwrap_or(false)
+}
+
+fn quiet_blocked(verb: &str, flags: &Flags, steps: Option<&[Step]>) -> Option<&'static str> {
+    if verb == "focus" {
+        return Some("refused: quiet mode is on (focus is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if verb == "down" {
+        return Some("refused: quiet mode is on (down borrows real input; run 'deskcrew quiet off' to allow)");
+    }
+    if flags.real || steps.is_some_and(|s| s.iter().any(|st| st.flags.real)) {
+        return Some("refused: quiet mode is on (--real is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if flags.mouse || steps.is_some_and(|s| s.iter().any(|st| st.flags.mouse)) {
+        return Some("refused: quiet mode is on (--mouse is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    if verb == "launch" && flags.front {
+        return Some("refused: quiet mode is on (launch --front is disabled; run 'deskcrew quiet off' to allow)");
+    }
+    None
 }
 
 struct ActiveGuard<'a> {
@@ -419,16 +462,40 @@ impl Drop for ActiveGuard<'_> {
 }
 
 impl Service {
-    /// Glide this agent's drawn cursor to a spot, keep it above the agent's window, and light up
-    /// the control there when it is pressed.
-    fn cursor_on(&self, who: &str, tracked: &Tracked, rect: Bounds, press: bool) {
+    /// Glide (or jump when `--fast`) this agent's drawn cursor to a spot, keep it above the
+    /// agent's window, and light up the control there when it is pressed.
+    fn cursor_on(&self, who: &str, flags: &Flags, tracked: &Tracked, rect: Bounds, press: bool) {
         let Some(xid) = tracked.x11 else { return };
         let (px, py) = centre(rect);
-        self.overlay.move_to(who, px, py);
         self.overlay.over(who, xid);
+        if flags.fast {
+            self.overlay.jump(who, px, py);
+        } else {
+            self.overlay.move_to(who, px, py);
+        }
         if press && rect.2 > 0 && rect.3 > 0 {
             self.overlay.press(who, rect);
         }
+    }
+
+    /// Ensure a short background action never leaves the target window focused over the person's
+    /// window. Skips restoration if the person moved the pointer during the action so intentional
+    /// window switches are never undone.
+    fn keep_behind<T>(&self, tracked: &Tracked, flags: &Flags, work: impl FnOnce() -> T) -> T {
+        let before = (!flags.real && !flags.mouse).then(x::front).flatten();
+        let ptr_before = before.and_then(|_| x::pointer());
+        let started = Instant::now();
+        let result = work();
+        if let (Some(xid), Some(prev)) = (tracked.x11, before)
+            && prev != xid
+            && x::front() == Some(xid)
+            && started.elapsed() < Duration::from_millis(800)
+            && x::pointer() == ptr_before
+        {
+            x::lower_behind(xid, prev);
+            let _ = x::activate(prev);
+        }
+        result
     }
 
     fn track(&self, window: &WindowInfo) -> Arc<Tracked> {
@@ -552,7 +619,20 @@ impl Service {
 
     fn read(&self, tracked: &Tracked, view: &mut View, all: bool) -> Result<(), String> {
         let window = self.window_of(tracked)?;
-        atspi::bus()?;
+        view.ocr_hits.clear();
+        let bus_result = atspi::bus();
+        if let Err(err) = bus_result {
+            if tracked.x11.is_some() {
+                view.element = None;
+                view.nodes.clear();
+                view.lines.clear();
+                view.hidden = 0;
+                view.quiet.clear();
+                view.read_once = true;
+                return Ok(());
+            }
+            return Err(err);
+        }
         if let WindowKey::AtSpi(obj) = &tracked.key {
             if view.element.is_none() {
                 view.element = Some(obj.clone());
@@ -564,13 +644,28 @@ impl Service {
                 view.element = atspi::frame_for(window.pid, &window.title, window.rect);
             }
         }
-        let element = view.element.as_ref().ok_or(
-            "that window does not answer accessibility requests: start the app with accessibility on (GTK and Qt apps are, once the AT-SPI bus runs; for Qt set QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1, for Chrome --force-renderer-accessibility)",
-        )?;
-        let (nodes, hidden) = atspi::read(element, window.rect, all);
+        let Some(element) = view.element.as_ref() else {
+            // X11 windows without an AT-SPI tree (SDL, Wine, Tk, FLTK, OpenGL/canvas apps, or
+            // Qt/Chrome started without accessibility flags) still work via OCR + x,y + XSendEvent.
+            if tracked.x11.is_some() {
+                view.nodes.clear();
+                view.lines.clear();
+                view.hidden = 0;
+                view.quiet.clear();
+                view.read_once = true;
+                return Ok(());
+            }
+            return Err(
+                "that window does not answer accessibility requests: start the app with accessibility on (GTK and Qt apps are, once the AT-SPI bus runs; for Qt set QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1, for Chrome --force-renderer-accessibility)".into(),
+            );
+        };
+        let mut surfaces = vec![element.clone()];
+        surfaces.extend(atspi::popup_frames(window.pid, element));
+        let (nodes, hidden, quiet) = atspi::read_surfaces(&surfaces, window.rect, all);
         view.nodes = view.refs.assign(nodes);
         view.lines = view.nodes.iter().map(|(id, node)| (*id, lines::line(&node.parts))).collect();
         view.hidden = hidden;
+        view.quiet = quiet;
         view.read_once = true;
         Ok(())
     }
@@ -602,15 +697,18 @@ impl Service {
     }
 
     fn resolve(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<Target, String> {
+        self.resolve_for(word, who, tracked, view, &[])
+    }
+
+    /// Resolve a target, preferring controls whose roles appear in `preferred` when a name matches
+    /// more than one control (e.g. a label + edit box both named "Search").
+    fn resolve_for(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View, preferred: &[&str]) -> Result<Target, String> {
         if let Some((px, py)) = is_point(word) {
-            if tracked.x11.is_none() {
-                return Err("x,y coordinates on Wayland need X11 (or ScreenCast/RemoteDesktop portals): name a control or ref instead".into());
-            }
             let frames = self.agents.lock().unwrap().get(who).and_then(|a| a.shots.get(&tracked.key).map(|s| s.frames));
             let frames = frames.ok_or("x,y are pixels in a shot: take one first")?;
             let (px, py) = frames.to_screen(px, py);
             let (left, top, w, h) = self.window_of(tracked)?.rect;
-            if w <= 0 || h <= 0 || px < left || py < top || px >= left + w || py >= top + h {
+            if w > 0 && h > 0 && (px < left || py < top || px >= left + w || py >= top + h) {
                 return Err("refused: that point is not on the window".into());
             }
             return Ok(Target::Point(px, py));
@@ -636,8 +734,23 @@ impl Service {
                 [] => continue,
                 [one] => return Ok(Target::Control(*one)),
                 many => {
+                    if !preferred.is_empty() {
+                        let fitted: Vec<u32> = many.iter().copied().filter(|id| preferred.contains(&view.nodes[id].parts.role.as_str())).collect();
+                        if let [one] = fitted.as_slice() {
+                            return Ok(Target::Control(*one));
+                        }
+                    }
                     let acting: Vec<u32> = many.iter().copied().filter(|id| MARKED.contains(&view.nodes[id].parts.role.as_str())).collect();
                     if let [one] = acting.as_slice() {
+                        return Ok(Target::Control(*one));
+                    }
+                    // If one matched control encloses all other matched controls, pick the innermost acting one.
+                    let innermost: Vec<u32> = acting
+                        .iter()
+                        .copied()
+                        .filter(|id| !acting.iter().any(|other| other != id && atspi::encloses(view.nodes[id].rect, view.nodes[other].rect)))
+                        .collect();
+                    if let [one] = innermost.as_slice() {
                         return Ok(Target::Control(*one));
                     }
                     let shown: Vec<String> = many.iter().take(6).map(|id| format!("e{id} {}", view.lines[id])).collect();
@@ -645,7 +758,64 @@ impl Service {
                 }
             }
         }
+        // On X11 apps with no AT-SPI match (SDL, Wine, Tk, FLTK, OpenGL/canvas), resolve visible
+        // labels via OCR so `click "Play"` / `hover "Settings"` work by name in the background.
+        if let Some(target) = self.ocr_resolve(word, tracked, view)? {
+            return Ok(target);
+        }
+        if view.element.is_none() && tracked.x11.is_some() {
+            return Err(format!(
+                "no control or OCR text named '{word}': this window exposes no AT-SPI controls (use x,y from see/shot, install tesseract for OCR name lookup, or start with accessibility enabled)"
+            ));
+        }
         Err(format!("no control named '{word}': see"))
+    }
+
+    /// Look up `word` among OCR text lines captured from an X11 window (populating `view.ocr_hits`
+    /// on demand, or refreshing once on a miss) and return its screen centre as `Target::Point`.
+    fn ocr_resolve(&self, word: &str, tracked: &Tracked, view: &mut View) -> Result<Option<Target>, String> {
+        let Some(xid) = tracked.x11 else { return Ok(None) };
+        let window = self.window_of(tracked)?;
+        let wanted = word.to_lowercase();
+        let mut refreshed = false;
+        loop {
+            if view.ocr_hits.is_empty() && !refreshed {
+                refreshed = true;
+                if let Ok((frame, _)) = x::window_picture(xid)
+                    && let Ok(lines) = look::read_text(&frame)
+                {
+                    view.ocr_hits = lines
+                        .into_iter()
+                        .map(|l| (l.text, (window.rect.0 + l.rect.0, window.rect.1 + l.rect.1, l.rect.2, l.rect.3)))
+                        .collect();
+                }
+            }
+            let exact: Vec<&(String, Bounds)> = view.ocr_hits.iter().filter(|(t, _)| t.trim().to_lowercase() == wanted).collect();
+            let hits = if exact.is_empty() {
+                view.ocr_hits.iter().filter(|(t, _)| t.to_lowercase().contains(&wanted)).collect()
+            } else {
+                exact
+            };
+            match hits.as_slice() {
+                [] if !refreshed => {
+                    view.ocr_hits.clear();
+                    continue;
+                }
+                [] => return Ok(None),
+                [(_, rect)] => return Ok(Some(Target::Point(centre(*rect).0, centre(*rect).1))),
+                many => {
+                    let shown: Vec<String> = many
+                        .iter()
+                        .take(6)
+                        .map(|(t, r)| {
+                            let (cx, cy) = centre(*r);
+                            format!("\"{}\" {},{}", lines::clip(t, 40), cx - window.rect.0, cy - window.rect.1)
+                        })
+                        .collect();
+                    return Err(format!("'{word}' matches {} OCR labels:\n{}", many.len(), shown.join("\n")));
+                }
+            }
+        }
     }
 
     fn point_of(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<(i32, i32), String> {
@@ -657,7 +827,11 @@ impl Service {
 
     /// A control's box now, and its object, for acting on it.
     fn control(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View) -> Result<(u32, Bounds, Obj), String> {
-        match self.resolve(word, who, tracked, view)? {
+        self.control_for(word, who, tracked, view, &[])
+    }
+
+    fn control_for(&self, word: &str, who: &str, tracked: &Tracked, view: &mut View, preferred: &[&str]) -> Result<(u32, Bounds, Obj), String> {
+        match self.resolve_for(word, who, tracked, view, preferred)? {
             Target::Control(id) => {
                 let node = &view.nodes[&id];
                 Ok((id, atspi::rect(&node.element).unwrap_or(node.rect), node.element.clone()))
@@ -726,7 +900,7 @@ impl Service {
         keys
     }
 
-    /// Let go of held keys: everyone's, or only those held too long or since Ctrl+Alt+Esc.
+    /// Let go of held keys and mouse buttons: everyone's, or only those held too long or since Ctrl+Alt+Esc.
     fn release(&self, all: bool) -> Vec<String> {
         let stopped = STOP.load(Ordering::Relaxed);
         let mut held = self.held.lock().unwrap();
@@ -734,7 +908,12 @@ impl Service {
         held.retain(|who, keys| {
             let keep = !all && !stopped && keys.since.elapsed() < HOLD_MOST;
             if !keep {
-                let _ = x::modifiers(&keys.keys, false);
+                for &(xid, btn, px, py) in keys.buttons.iter().rev() {
+                    let _ = x::send_button_at(xid, px, py, btn, false, &keys.keys);
+                }
+                if !keys.keys.is_empty() {
+                    let _ = x::modifiers(&keys.keys, false);
+                }
                 gone.push(who.clone());
             }
             keep
@@ -759,12 +938,14 @@ impl Service {
                 (atspi::rect(&node.element).unwrap_or(node.rect), Some(node.element.clone()))
             }
         };
-        self.cursor_on(who, tracked, rect, element.is_some());
-        let plain = with.is_empty() && count == 1 && flags.hold.is_none() && button == Button::Left;
-        // Clicking a text field puts the caret there: focus does that without the pointer.
+        self.cursor_on(who, flags, tracked, rect, element.is_some());
+        let plain = with.is_empty() && count == 1 && flags.hold.is_none() && button == Button::Left && !flags.real && !flags.mouse;
+        // Only grab focus on an editable field if Wayland-only or the window is already focused;
+        // on X11, GrabFocus on a background window can raise it or steal the person's focus.
         if let Some(element) = &element
             && plain
             && atspi::editable(element)
+            && (tracked.x11.is_none() || x::front() == tracked.x11)
             && atspi::focus(element).is_ok()
         {
             return Ok("focus".into());
@@ -774,7 +955,7 @@ impl Service {
         if let Some(element) = &element
             && plain
         {
-            match atspi::press(element) {
+            match self.keep_behind(tracked, flags, || atspi::press(element)) {
                 Ok(action) => return Ok(action),
                 Err(error) => atspi_error = Some(error),
             }
@@ -791,24 +972,40 @@ impl Service {
                 .filter(|node| inside(&node.rect) && matches!(node.parts.role.as_str(), "button" | "checkbox" | "radio" | "menuitem" | "tab" | "item" | "link"))
                 .min_by_key(|node| node.rect.2 as i64 * node.rect.3 as i64);
             if let Some(node) = under
-                && let Ok(action) = atspi::press(&node.element)
+                && let Ok(action) = self.keep_behind(tracked, flags, || atspi::press(&node.element))
             {
                 return Ok(format!("{action} on '{}' under {word}", node.parts.name));
             }
         }
-        if tracked.x11.is_none() {
-            return Err(match atspi_error {
-                Some(reason) => format!("{reason}, and pointer clicks on Wayland need X11 (or the RemoteDesktop portal)"),
-                None if !plain => "mouse buttons, double/triple clicks, holds and --with keys on Wayland need X11 (or the RemoteDesktop portal); plain left click on a control uses AT-SPI".into(),
-                None => "clicking x,y coordinates on Wayland needs X11 (or ScreenCast/RemoteDesktop portals)".into(),
-            });
-        }
         let (px, py) = centre(rect);
         let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
-        // The agents' own pointer leaves the person's where it is. Held keys belong to the
-        // display's own keyboard, which the apps pair with the person's pointer, so those clicks
-        // still use that one.
-        let by = self.pointer_for(&with);
+        let Some(xid) = tracked.x11 else {
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (Wayland portal input uses the shared desktop seat; run 'deskcrew quiet off' to allow)".into());
+            }
+            return match portal::click(px, py, button, count, hold, &with) {
+                Ok(()) => Ok("portal".into()),
+                Err(portal_err) => Err(match atspi_error {
+                    Some(reason) => format!("{reason}; Wayland portal fallback failed ({portal_err})"),
+                    None => format!("Wayland portal click failed ({portal_err})"),
+                }),
+            };
+        };
+        // When uncovered on X11, prefer deskcrew's dedicated XInput 2 agent pointer (`By::Agent`),
+        // which works on GTK/Qt/Chromium/Firefox without raising the window or moving the person's
+        // cursor. Fall back to background XSendEvent when covered or in quiet mode.
+        if !flags.real && !flags.mouse {
+            if !self.quiet.load(Ordering::Relaxed) && self.pointer_for(&with) == By::Agent {
+                let _turn = self.real_input.lock().unwrap();
+                if x::shows_at(xid, px, py) {
+                    x::click(By::Agent, px, py, button, count, hold)?;
+                    return Ok("own pointer".into());
+                }
+            }
+            self.keep_behind(tracked, flags, || x::send_click(xid, px, py, button, count, hold, &with))?;
+            return Ok("event".into());
+        }
+        let by = if flags.mouse { By::Person } else { self.pointer_for(&with) };
         self.with_pointer(by, tracked, (px, py), || {
             x::modifiers(&own, true)?;
             let clicked = x::click(by, px, py, button, count, hold);
@@ -845,89 +1042,129 @@ impl Service {
         Ok(if by == By::Agent { "own pointer, window brought forward" } else { "pointer" }.into())
     }
 
-    fn hover(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
-        if tracked.x11.is_none() {
-            return Err("moving the pointer (hover) on Wayland needs X11 (or the RemoteDesktop portal)".into());
-        }
+    fn hover(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let (px, py) = self.point_of(word, who, tracked, view)?;
-        self.cursor_on(who, tracked, (px, py, 0, 0), false);
-        let by = self.pointer_for(&[]);
+        self.cursor_on(who, flags, tracked, (px, py, 0, 0), false);
+        let Some(xid) = tracked.x11 else {
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (Wayland portal hover moves the real pointer; run 'deskcrew quiet off' to allow)".into());
+            }
+            portal::hover(px, py)?;
+            return Ok("portal".into());
+        };
+        if !flags.real && !flags.mouse {
+            if !self.quiet.load(Ordering::Relaxed) && self.pointer_for(&[]) == By::Agent {
+                let _turn = self.real_input.lock().unwrap();
+                if x::shows_at(xid, px, py) {
+                    x::move_by(By::Agent, px, py)?;
+                    return Ok("own pointer".into());
+                }
+            }
+            self.keep_behind(tracked, flags, || x::send_hover(xid, px, py))?;
+            return Ok("event".into());
+        }
+        let by = if flags.mouse { By::Person } else { self.pointer_for(&[]) };
         self.with_pointer(by, tracked, (px, py), || x::move_by(by, px, py))
     }
 
-    fn set(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
-        let (_, rect, element) = self.control(word, who, tracked, view)?;
-        self.cursor_on(who, tracked, rect, true);
+    fn set(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, value: &str) -> Reply {
+        let (id, rect, element) = self.control_for(word, who, tracked, view, &["edit", "document", "slider", "spinner", "combobox"])?;
+        self.cursor_on(who, flags, tracked, rect, true);
         self.overlay.typing(who, value.chars().count());
-        if atspi::editable(&element) {
-            atspi::set_text(&element, value)?;
+        if atspi::editable(&element)
+            && self.keep_behind(tracked, flags, || atspi::set_text(&element, value)).is_ok()
+        {
             return Ok("text".into());
         }
         if atspi::has_value(&element)
             && let Ok(number) = value.trim().parse::<f64>()
         {
-            atspi::set_value(&element, number)?;
+            self.keep_behind(tracked, flags, || atspi::set_value(&element, number))?;
             return Ok("value".into());
+        }
+        let editable_role = matches!(view.nodes[&id].parts.role.as_str(), "edit" | "document" | "combobox" | "spinner");
+        if editable_role
+            && let Some(xid) = tracked.x11
+            && !flags.real
+        {
+            let spot = centre(rect);
+            let stop = || STOP.load(Ordering::Relaxed);
+            self.keep_behind(tracked, flags, || -> Result<(), String> {
+                x::send_click(xid, spot.0, spot.1, Button::Left, 1, Duration::ZERO, &[])?;
+                thread::sleep(KEYS_SETTLE);
+                x::send_key_at(xid, Some(spot), &x::chord("ctrl+a")?, Duration::ZERO)?;
+                x::send_key_at(xid, Some(spot), &x::chord("backspace")?, Duration::ZERO)?;
+                if !value.is_empty() {
+                    let typed = x::send_text_at(xid, Some(spot), value, &stop)?;
+                    if typed < value.chars().count() {
+                        return Err(format!("{STOPPED} (typed {typed} of {} characters)", value.chars().count()));
+                    }
+                }
+                Ok(())
+            })?;
+            return Ok("event".into());
         }
         Err("that control's text can't be set: try type".into())
     }
 
     /// Leave a checkbox or switch alone if it is already that way, or press it once.
-    fn ensure(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, wanted: Option<&'static str>) -> Reply {
-        let (id, rect, element) = self.control(word, who, tracked, view)?;
-        self.cursor_on(who, tracked, rect, true);
+    fn ensure(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, wanted: Option<&'static str>) -> Reply {
+        let (id, rect, element) = self.control_for(word, who, tracked, view, &["checkbox", "radio", "button"])?;
+        self.cursor_on(who, flags, tracked, rect, true);
         if let Some(wanted) = wanted {
             let role = &view.nodes[&id].parts.role;
             if atspi::toggle_state(&element, role)? == Some(wanted) {
                 return Ok(format!("already {wanted}"));
             }
         }
-        atspi::perform(&element, &["toggle", "click", "press", "activate", "*"])
+        self.keep_behind(tracked, flags, || atspi::perform(&element, &["toggle", "click", "press", "activate", "*"]))
     }
 
-    fn expand(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, open: bool) -> Reply {
-        let (id, rect, element) = self.control(word, who, tracked, view)?;
-        self.cursor_on(who, tracked, rect, true);
+    fn expand(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, open: bool) -> Reply {
+        let (id, rect, element) = self.control_for(word, who, tracked, view, &["combobox", "button", "item"])?;
+        self.cursor_on(who, flags, tracked, rect, true);
         let wanted = if open { "open" } else { "closed" };
         let role = &view.nodes[&id].parts.role;
         if atspi::expand_state(&element, role)? == Some(wanted) {
             return Ok(format!("already {wanted}"));
         }
-        atspi::perform(&element, &["expand or contract", if open { "expand" } else { "collapse" }, "press", "click", "activate"])
-            .map_err(|_| format!("that control cannot be {}", if open { "expanded" } else { "collapsed" }))
+        self.keep_behind(tracked, flags, || {
+            atspi::perform(&element, &["expand or contract", if open { "expand" } else { "collapse" }, "press", "click", "activate"])
+        })
+        .map_err(|_| format!("that control cannot be {}", if open { "expanded" } else { "collapsed" }))
     }
 
-    fn show(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
+    fn show(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str) -> Reply {
         let (_, rect, element) = self.control(word, who, tracked, view)?;
-        self.cursor_on(who, tracked, rect, false);
-        atspi::show(&element)?;
+        self.cursor_on(who, flags, tracked, rect, false);
+        self.keep_behind(tracked, flags, || atspi::show(&element))?;
         Ok("scroll".into())
     }
 
     /// Pick an entry from a combo box or a list.
-    fn select(&self, who: &str, tracked: &Tracked, view: &mut View, word: &str, item: &str) -> Reply {
-        let (id, rect, element) = self.control(word, who, tracked, view)?;
-        self.cursor_on(who, tracked, rect, true);
+    fn select(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, word: &str, item: &str) -> Reply {
+        let (id, rect, element) = self.control_for(word, who, tracked, view, &["combobox", "list", "tree", "edit"])?;
+        self.cursor_on(who, flags, tracked, rect, true);
         if view.nodes[&id].parts.role == "edit" && atspi::editable(&element) {
-            atspi::set_text(&element, item)?;
+            self.keep_behind(tracked, flags, || atspi::set_text(&element, item))?;
             return Ok("text".into());
         }
         let combo = view.nodes[&id].parts.role == "combobox";
-        if combo && atspi::choose(&element, item).is_ok() {
+        if combo && self.keep_behind(tracked, flags, || atspi::choose(&element, item).is_ok()) {
             return Ok("select".into());
         }
         if !combo
             && let Some(entry) = atspi::find_named(&element, item, MENU_DEPTH)
-            && (atspi::select_child(&element, &entry).is_ok() || atspi::press(&entry).is_ok())
+            && self.keep_behind(tracked, flags, || atspi::select_child(&element, &entry).is_ok() || atspi::press(&entry).is_ok())
         {
             return Ok("select".into());
         }
         // A combo box may build its list only once it opens.
         if combo {
-            atspi::press(&element).map_err(|_| "that dropdown did not answer".to_string())?;
+            self.keep_behind(tracked, flags, || atspi::press(&element)).map_err(|_| "that dropdown did not answer".to_string())?;
             thread::sleep(MENU_OPEN);
             if let Some(entry) = atspi::find_named(&element, item, MENU_DEPTH)
-                && atspi::press(&entry).is_ok()
+                && self.keep_behind(tracked, flags, || atspi::press(&entry).is_ok())
             {
                 thread::sleep(MENU_OPEN);
                 let chosen = atspi::selected_name(&element)
@@ -937,8 +1174,12 @@ impl Service {
                     return Ok("select".into());
                 }
             }
-            if tracked.x11.is_some() {
-                let _ = self.keyboard(tracked, || x::press(&x::chord("esc")?, Duration::ZERO));
+            if let Some(xid) = tracked.x11 {
+                if flags.real {
+                    let _ = self.keyboard(tracked, || x::press(&x::chord("esc")?, Duration::ZERO));
+                } else {
+                    let _ = x::chord("esc").and_then(|esc| x::send_key(xid, &esc, Duration::ZERO));
+                }
             } else {
                 let _ = atspi::press(&element);
             }
@@ -956,9 +1197,9 @@ impl Service {
         // go to whatever has focus, so they replace a selection as typing would.
         let field = match target {
             Some(word) => {
-                let (_, rect, element) = self.control(word, who, tracked, view)?;
-                self.cursor_on(who, tracked, rect, true);
-                Some(element)
+                let (_, rect, element) = self.control_for(word, who, tracked, view, &["edit", "document", "combobox"])?;
+                self.cursor_on(who, flags, tracked, rect, true);
+                Some((rect, element))
             }
             None => None,
         };
@@ -971,38 +1212,97 @@ impl Service {
                 self.overlay.caret(who, cx, cy, h);
             }
         };
-        if let Some(field) = &field {
+        if let Some((_, field)) = &field {
             caret_at(field);
         }
-        if !flags.paste
-            && let Some(field) = &field
+        let focused_el = field
+            .as_ref()
+            .map(|(_, el)| el.clone())
+            .or_else(|| view.nodes.values().find(|n| n.parts.states.contains(&"focused")).map(|n| n.element.clone()))
+            .or_else(|| view.nodes.values().find(|n| matches!(n.parts.role.as_str(), "edit" | "document") && atspi::focused(&n.element)).map(|n| n.element.clone()));
+        if !flags.real
+            && let Some((_, field)) = &field
             && atspi::editable(field)
-            && atspi::insert_text(field, text).is_ok()
+            && self.keep_behind(tracked, flags, || atspi::append_text(field, text).is_ok())
         {
             caret_at(field);
             return Ok("text".into());
         }
         let Some(xid) = tracked.x11 else {
-            return Err(if flags.paste {
-                "type --paste on Wayland needs X11 (or the RemoteDesktop portal): omit --paste and name an editable control like `type Name \"text\"`"
-            } else if field.is_none() {
-                "typing without naming a control on Wayland needs X11 (or the RemoteDesktop portal): name an editable control like `type Name \"text\"`"
-            } else {
-                "that control cannot be edited through AT-SPI, and key simulation on Wayland needs X11 (or the RemoteDesktop portal)"
+            // Pure Wayland: insert directly through AT-SPI EditableText when a focused editable
+            // control exists, avoiding the global Wayland portal seat altogether.
+            if !flags.real
+                && let Some(ref el) = focused_el
+                && atspi::editable(el)
+                && atspi::insert_at_caret(el, text).is_ok()
+            {
+                return Ok("text".into());
             }
-            .into());
+            if let Some((_, field)) = &field {
+                let _ = atspi::focus(field);
+            }
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (Wayland portal typing uses the focused window; run 'deskcrew quiet off' to allow)".into());
+            }
+            let stop = || STOP.load(Ordering::Relaxed);
+            let typed = portal::type_text(text, &stop)?;
+            if typed < text.chars().count() {
+                return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
+            }
+            return Ok("portal".into());
         };
-        // Focusing a field makes some apps, Chrome among them, raise their window, so a field that
-        // already has the focus is left as it is.
+        let spot = field.as_ref().map(|(rect, _)| centre(*rect));
+        // In quiet mode (where even XSetInputFocus without raising is avoided), use XSendEvent +
+        // AT-SPI EditableText fallback. Otherwise use `keyboard()` (XSetInputFocus without raising,
+        // which reaches Chromium, Electron, GTK, Qt, and Firefox reliably in the background).
+        if !flags.real && self.quiet.load(Ordering::Relaxed) {
+            if let Some((px, py)) = spot {
+                let _ = self.keep_behind(tracked, flags, || x::send_click(xid, px, py, Button::Left, 1, Duration::ZERO, &[]));
+                thread::sleep(KEYS_SETTLE);
+            }
+            if flags.paste {
+                let before_text = focused_el.as_ref().and_then(atspi::text_of);
+                let _turn = self.real_input.lock().unwrap();
+                let mut saved = x::SavedClipboard::take();
+                if let Err(error) = saved.lend(text) {
+                    let _ = saved.put_back();
+                    return Err(error);
+                }
+                thread::sleep(PASTE_SETTLE);
+                let sent = self.keep_behind(tracked, flags, || x::chord("ctrl+v").and_then(|paste| x::send_key_at(xid, spot, &paste, Duration::ZERO)));
+                thread::sleep(PASTE_SETTLE);
+                saved.put_back()?;
+                sent?;
+                // If an app (e.g. Chromium/Electron/GTK4) ignored XSendEvent Ctrl+V in the
+                // background, insert directly at the caret via AT-SPI EditableText.
+                if let (Some(el), Some(before)) = (&focused_el, &before_text)
+                    && atspi::text_of(el).as_deref() == Some(before.as_str())
+                    && atspi::editable(el)
+                    && self.keep_behind(tracked, flags, || atspi::insert_at_caret(el, text).is_ok())
+                {
+                    caret_at(el);
+                    return Ok("text".into());
+                }
+                return Ok("paste".into());
+            }
+            let stop = || STOP.load(Ordering::Relaxed);
+            let typed = self.keep_behind(tracked, flags, || x::send_text_at(xid, spot, text, &stop))?;
+            if let Some((_, field)) = &field {
+                caret_at(field);
+            }
+            if typed < text.chars().count() {
+                return Err(format!("{STOPPED} (typed {typed} of {} characters)", text.chars().count()));
+            }
+            return Ok("event".into());
+        }
+        // Standard X11 path: `keyboard()` sets X input focus briefly without raising the window.
         let person = x::front();
-        if let Some(field) = &field
+        if let Some((_, field)) = &field
             && !atspi::focused(field)
         {
             let _ = atspi::focus(field);
         }
         if flags.paste {
-            // The display has one clipboard: it is lent and put back while this agent has the
-            // keyboard, so two agents pasting at once take turns.
             self.keyboard(tracked, || {
                 let mut saved = x::SavedClipboard::take();
                 if let Err(error) = saved.lend(text) {
@@ -1019,7 +1319,6 @@ impl Service {
         }
         let stop = || STOP.load(Ordering::Relaxed);
         let typed = self.keyboard(tracked, || x::type_text(text, &stop));
-        // If the app pulled itself over the person's window, theirs goes back on top.
         if let Some(person) = person
             && person != xid
             && x::front() != Some(person)
@@ -1027,7 +1326,7 @@ impl Service {
             let _ = x::activate(person);
         }
         let typed = typed?;
-        if let Some(field) = &field {
+        if let Some((_, field)) = &field {
             caret_at(field);
         }
         if typed < text.chars().count() {
@@ -1036,12 +1335,130 @@ impl Service {
         Ok("keys".into())
     }
 
-    fn key(&self, _who: &str, flags: &Flags, tracked: &Tracked, spec: &str) -> Reply {
-        if tracked.x11.is_none() {
-            return Err("pressing keys on Wayland needs X11 (or the RemoteDesktop portal); use set, type <control>, select, check or click <control> through AT-SPI".into());
-        }
+    fn focused_atspi(view: &View) -> Option<Obj> {
+        view.nodes
+            .values()
+            .find(|n| n.parts.states.contains(&"focused"))
+            .or_else(|| view.nodes.values().find(|n| matches!(n.parts.role.as_str(), "edit" | "document") && atspi::focused(&n.element)))
+            .map(|n| n.element.clone())
+    }
+
+    fn key(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &View, spec: &str) -> Reply {
+        const XK_CONTROL_L: u32 = 0xffe3;
+        const XK_CONTROL_R: u32 = 0xffe4;
         let chord = x::chord(spec)?;
         let hold = Duration::from_millis(flags.hold.unwrap_or(0).min(HOLD_MOST.as_millis() as u64));
+        let ctrl_letter = |c: &x::Chord| -> Option<char> {
+            (c.modifiers.len() == 1 && matches!(c.modifiers[0], XK_CONTROL_L | XK_CONTROL_R))
+                .then(|| c.key.and_then(|k| u8::try_from(k).ok()).map(|b| (b as char).to_ascii_lowercase()))
+                .flatten()
+        };
+        let Some(xid) = tracked.x11 else {
+            if x::is_risky(&chord) && !flags.force {
+                return Err(format!("'{spec}' can quit or close things: ask the person, then add --force"));
+            }
+            // On pure Wayland, handle clipboard/selection shortcuts through AT-SPI silently
+            // before touching the global Wayland portal seat.
+            if !flags.real && hold.is_zero()
+                && let Some(letter) = ctrl_letter(&chord)
+                && let Some(focused) = Self::focused_atspi(view)
+            {
+                match letter {
+                    'a' if atspi::select_all(&focused) => return Ok("select all".into()),
+                    'c' => {
+                        if let Some(sel) = atspi::selected_text(&focused)
+                            && x::set_clipboard(Some(&sel)).is_ok()
+                        {
+                            return Ok("text selection".into());
+                        }
+                    }
+                    'x' => {
+                        if atspi::editable(&focused)
+                            && let Some(sel) = atspi::selected_text(&focused)
+                            && x::set_clipboard(Some(&sel)).is_ok()
+                            && atspi::delete_selection(&focused).is_some()
+                        {
+                            return Ok("cut selection".into());
+                        }
+                    }
+                    'v' => {
+                        if let Ok(Some(clip)) = x::clipboard()
+                            && atspi::insert_at_caret(&focused, &clip).is_ok()
+                        {
+                            return Ok("text paste".into());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (Wayland portal keys go to the focused window; run 'deskcrew quiet off' to allow)".into());
+            }
+            portal::key(&chord, hold)?;
+            return Ok("portal".into());
+        };
+        if !flags.real && self.quiet.load(Ordering::Relaxed) {
+            let held = self.held_keys(who);
+            let combined = x::Chord { modifiers: chord.modifiers.iter().chain(&held).copied().collect(), key: chord.key };
+            if x::is_risky(&combined) && !flags.force {
+                return Err(format!("'{spec}' can quit or close things: ask the person, then add --force"));
+            }
+            let letter = hold.is_zero().then(|| ctrl_letter(&combined)).flatten();
+            let clipboard_shortcut = matches!(letter, Some('c' | 'x' | 'v' | 'a'));
+            let focused = clipboard_shortcut.then(|| Self::focused_atspi(view)).flatten();
+            let clip_before = matches!(letter, Some('c' | 'x')).then(|| x::clipboard().ok().flatten());
+            let val_before = if letter == Some('v') {
+                focused.as_ref().and_then(atspi::text_of)
+            } else {
+                None
+            };
+            self.keep_behind(tracked, flags, || x::send_key(xid, &combined, hold))?;
+            // If an X11 app (e.g. Chromium, Electron, GTK4) ignored synthetic XSendEvent for
+            // Copy/Cut/Paste/Select-All in the background, complete it via AT-SPI without ever
+            // raising the window or stealing focus.
+            if let (Some(letter), Some(el)) = (letter, focused.as_ref()) {
+                match letter {
+                    'c' => {
+                        thread::sleep(PASTE_SETTLE);
+                        if clip_before.as_ref() == Some(&x::clipboard().ok().flatten())
+                            && let Some(sel) = atspi::selected_text(el)
+                            && x::set_clipboard(Some(&sel)).is_ok()
+                        {
+                            return Ok("text selection".into());
+                        }
+                    }
+                    'x' => {
+                        thread::sleep(PASTE_SETTLE);
+                        if clip_before.as_ref() == Some(&x::clipboard().ok().flatten())
+                            && atspi::editable(el)
+                            && let Some(sel) = atspi::selected_text(el)
+                            && x::set_clipboard(Some(&sel)).is_ok()
+                            && atspi::delete_selection(el).is_some()
+                        {
+                            return Ok("cut selection".into());
+                        }
+                    }
+                    'v' => {
+                        thread::sleep(PASTE_SETTLE);
+                        if let Some(before) = &val_before
+                            && atspi::text_of(el).as_deref() == Some(before.as_str())
+                            && let Ok(Some(clip)) = x::clipboard()
+                            && self.keep_behind(tracked, flags, || atspi::insert_at_caret(el, &clip).is_ok())
+                        {
+                            return Ok("text paste".into());
+                        }
+                    }
+                    'a' => {
+                        thread::sleep(KEYS_SETTLE);
+                        if atspi::selected_text(el).is_none() && self.keep_behind(tracked, flags, || atspi::select_all(el)) {
+                            return Ok("select all".into());
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            return Ok("event".into());
+        }
         self.keyboard(tracked, || {
             let mut chord = x::Chord { modifiers: chord.modifiers.clone(), key: chord.key };
             let held = self.all_held_keys();
@@ -1056,18 +1473,38 @@ impl Service {
         Ok("keys".into())
     }
 
-    /// Hold modifier keys for this agent's later clicks and keys, until `up`.
-    fn down(&self, who: &str, words: &[String]) -> Reply {
-        if !x::has_display() {
-            return Err("holding modifier keys (down) on Wayland needs X11 (or the RemoteDesktop portal)".into());
+    /// Hold modifier keys or a mouse button for this agent's later clicks and keys, until `up`.
+    fn down(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+        let (spec, at_word) = match words {
+            [spec] => (spec.as_str(), None),
+            [spec, spot] => (spec.as_str(), Some(spot.as_str())),
+            _ => return Err("down shift|ctrl|alt|super|left|right|middle [target]".into()),
+        };
+        if let Some(btn) = Button::named(spec) {
+            let Some(xid) = tracked.x11 else {
+                return Err("holding a mouse button on Wayland needs X11".into());
+            };
+            let (px, py) = match at_word {
+                Some(word) => self.point_of(word, who, tracked, view)?,
+                None => centre(self.window_of(tracked)?.rect),
+            };
+            let held_mods = self.held_keys(who);
+            self.keep_behind(tracked, flags, || x::send_button_at(xid, px, py, btn, true, &held_mods))?;
+            let mut held = self.held.lock().unwrap();
+            let entry = held.entry(who.to_string()).or_insert(Held { keys: Vec::new(), buttons: Vec::new(), since: Instant::now() });
+            entry.buttons.push((xid, btn, px, py));
+            entry.since = Instant::now();
+            return Ok("held".into());
         }
-        let [spec] = words else { return Err("down shift (or ctrl, alt, super)".into()) };
-        if matches!(spec.as_str(), "left" | "right" | "middle") {
-            return Err("holding a mouse button is not on Linux yet".into());
+        if at_word.is_some() {
+            return Err("down shift (or ctrl, alt, super, left, right, middle)".into());
+        }
+        if !x::has_display() {
+            return Err("holding modifier keys (down) on Wayland needs X11".into());
         }
         let chord = x::chord(spec)?;
         if chord.key.is_some() {
-            return Err("down holds modifier keys: shift, ctrl, alt or super".into());
+            return Err("down holds modifier keys or mouse buttons: shift, ctrl, alt, super, left, right or middle".into());
         }
         let _turn = self.real_input.lock().unwrap();
         {
@@ -1078,13 +1515,13 @@ impl Service {
         }
         x::modifiers(&chord.modifiers, true)?;
         let mut held = self.held.lock().unwrap();
-        let entry = held.entry(who.to_string()).or_insert(Held { keys: Vec::new(), since: Instant::now() });
+        let entry = held.entry(who.to_string()).or_insert(Held { keys: Vec::new(), buttons: Vec::new(), since: Instant::now() });
         entry.keys.extend(chord.modifiers);
         entry.since = Instant::now();
         Ok("held".into())
     }
 
-    fn scroll(&self, who: &str, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
+    fn scroll(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let direction = |word: &String| matches!(word.as_str(), "up" | "down" | "left" | "right");
         let at = words.iter().position(direction).ok_or("scroll [control] up|down|left|right [n]")?;
         let times: i32 = words.get(at + 1).and_then(|n| n.parse::<i32>().ok()).unwrap_or(3).clamp(1, 200);
@@ -1092,7 +1529,7 @@ impl Service {
             Some(word) => self.point_of(word, who, tracked, view)?,
             None => centre(self.window_of(tracked)?.rect),
         };
-        self.cursor_on(who, tracked, (px, py, 0, 0), false);
+        self.cursor_on(who, flags, tracked, (px, py, 0, 0), false);
         let sideways = words[at] == "left" || words[at] == "right";
         // A scroll bar moves through accessibility, with no pointer and the window left where it is.
         let control = match words[..at].first() {
@@ -1103,23 +1540,49 @@ impl Service {
             None => view.element.clone(),
         };
         let onward = if words[at] == "down" || words[at] == "right" { times } else { -times };
-        if let Some(control) = control
-            && atspi::scroll(&control, !sideways, onward).is_ok()
+        if !flags.real
+            && !flags.mouse
+            && let Some(control) = control
+            && self.keep_behind(tracked, flags, || atspi::scroll(&control, !sideways, onward).is_ok())
         {
             return Ok("scroll bar".into());
         }
-        if tracked.x11.is_none() {
-            return Err("this control has no AT-SPI scroll bar, and scrolling by mouse wheel on Wayland needs X11 (or the RemoteDesktop portal)".into());
-        }
         // Positive is up, or right when sideways, as x::wheel takes it.
         let notches = if words[at] == "up" || words[at] == "right" { times } else { -times };
-        let by = self.pointer_for(&[]);
+        let Some(xid) = tracked.x11 else {
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (Wayland portal scroll moves the real pointer; run 'deskcrew quiet off' to allow)".into());
+            }
+            portal::wheel(px, py, notches, sideways)?;
+            return Ok("portal".into());
+        };
+        if !flags.real && !flags.mouse {
+            if !self.quiet.load(Ordering::Relaxed) && self.pointer_for(&[]) == By::Agent {
+                let _turn = self.real_input.lock().unwrap();
+                if x::shows_at(xid, px, py) {
+                    x::wheel(By::Agent, px, py, notches, sideways)?;
+                    return Ok("own pointer".into());
+                }
+            }
+            self.keep_behind(tracked, flags, || x::send_wheel(xid, px, py, notches, sideways))?;
+            return Ok("event".into());
+        }
+        let by = if flags.mouse { By::Person } else { self.pointer_for(&[]) };
         self.with_pointer(by, tracked, (px, py), || x::wheel(by, px, py, notches, sideways))
     }
 
-    fn strokes(&self, who: &str, tracked: &Tracked, strokes: &[Vec<(f32, f32)>], button: Button, modifiers: &[u32]) -> Reply {
+    fn strokes(&self, who: &str, flags: &Flags, tracked: &Tracked, strokes: &[Vec<(f32, f32)>], button: Button, modifiers: &[u32]) -> Reply {
+        let stop = || STOP.load(Ordering::Relaxed);
         let Some(xid) = tracked.x11 else {
-            return Err("pointer strokes on Wayland need X11 (or the RemoteDesktop portal)".into());
+            if self.quiet.load(Ordering::Relaxed) {
+                return Err("refused: quiet mode is on (Wayland portal drawing moves the real pointer; run 'deskcrew quiet off' to allow)".into());
+            }
+            for stroke in strokes {
+                if !portal::stroke(stroke, button, modifiers, &stop)? {
+                    return Err(STOPPED.into());
+                }
+            }
+            return Ok("portal".into());
         };
         let window = self.window_of(tracked)?.rect;
         let inside = |p: &(f32, f32)| {
@@ -1129,20 +1592,58 @@ impl Service {
         if !strokes.iter().flatten().all(inside) {
             return Err("refused: that stroke leaves the window".into());
         }
-        let stop = || STOP.load(Ordering::Relaxed);
         if let Some(&(px, py)) = strokes.first().and_then(|s| s.first()) {
-            self.cursor_on(who, tracked, (px as i32, py as i32, 0, 0), false);
+            self.cursor_on(who, flags, tracked, (px as i32, py as i32, 0, 0), false);
         }
-        // The drawn cursor rides along with the pen. The agents' own pointer needs the window to
-        // show along the whole stroke, or it would draw on whatever covers it.
-        let by = self.pointer_for(modifiers);
+        // When uncovered on X11, prefer deskcrew's dedicated XI2 agent pointer (`By::Agent`),
+        // which works in Krita/GIMP/GTK/Qt/Chromium without raising the window or touching the
+        // person's cursor. Fall back to background XSendEvent when covered or in quiet mode.
+        if !flags.real && !flags.mouse {
+            if !self.quiet.load(Ordering::Relaxed) && self.pointer_for(modifiers) == By::Agent {
+                let _turn = self.real_input.lock().unwrap();
+                if strokes.iter().flatten().all(|p| x::shows_at(xid, p.0 as i32, p.1 as i32)) {
+                    for stroke in strokes {
+                        if !x::stroke(By::Agent, stroke, button, &stop, &mut |at, px, py| {
+                            if at.is_multiple_of(3) {
+                                self.overlay.jump(who, px, py);
+                            }
+                        })? {
+                            return Err(STOPPED.into());
+                        }
+                    }
+                    return Ok("own pointer".into());
+                }
+            }
+            let mut held = self.held_keys(who);
+            held.extend_from_slice(modifiers);
+            let finished = self.keep_behind(tracked, flags, || -> Result<bool, String> {
+                for stroke in strokes {
+                    let ok = x::send_stroke(xid, stroke, button, &held, &stop, &mut |at, px, py| {
+                        if at.is_multiple_of(3) {
+                            self.overlay.jump(who, px, py);
+                        }
+                    })?;
+                    if !ok {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            })?;
+            return if finished { Ok("event".into()) } else { Err(STOPPED.into()) };
+        }
+        // Explicit --real / --mouse path.
+        let by = if flags.mouse { By::Person } else { self.pointer_for(modifiers) };
         let all_visible = || strokes.iter().flatten().all(|p| x::shows_at(xid, p.0 as i32, p.1 as i32));
         let finished = std::cell::Cell::new(true);
         let draw = || {
             x::modifiers(modifiers, true)?;
             let res = (|| {
                 for stroke in strokes {
-                    if !x::stroke(by, stroke, button, &stop, &mut |_, px, py| self.overlay.jump(who, px, py))? {
+                    if !x::stroke(by, stroke, button, &stop, &mut |at, px, py| {
+                        if at.is_multiple_of(3) {
+                            self.overlay.jump(who, px, py);
+                        }
+                    })? {
                         finished.set(false);
                         return Ok(());
                     }
@@ -1176,16 +1677,13 @@ impl Service {
     }
 
     fn drag(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, from: &str, to: &str) -> Reply {
-        if tracked.x11.is_none() {
-            return Err("dragging with the pointer on Wayland needs X11 (or the RemoteDesktop portal)".into());
-        }
         let a = self.point_of(from, who, tracked, view)?;
         let b = self.point_of(to, who, tracked, view)?;
         let button = flags.mouse_button()?;
         let mut modifiers = flags.modifiers()?;
         // Keys this agent already holds stay down after the stroke.
         modifiers.retain(|m| !self.held_keys(who).contains(m));
-        self.strokes(who, tracked, &[motion::trace(&[a, b], flags.smooth)], button, &modifiers)
+        self.strokes(who, flags, tracked, &[motion::trace(&[a, b], flags.smooth)], button, &modifiers)
     }
 
     fn plan_draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Result<Vec<Vec<(f32, f32)>>, String> {
@@ -1235,18 +1733,30 @@ impl Service {
 
     /// Strokes of x,y points in the last shot, or from a control's top left.
     fn draw(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
-        if tracked.x11.is_none() {
-            return Err("drawing with the pointer on Wayland needs X11 (or the RemoteDesktop portal)".into());
-        }
         let strokes = self.plan_draw(who, flags, tracked, view, words)?;
         let button = flags.mouse_button()?;
         let mut modifiers = flags.modifiers()?;
         // Keys this agent already holds stay down after the stroke.
         modifiers.retain(|m| !self.held_keys(who).contains(m));
-        self.strokes(who, tracked, &strokes, button, &modifiers)
+        self.strokes(who, flags, tracked, &strokes, button, &modifiers)
     }
 
-    fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
+    fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str, allow_ms: bool) -> Reply {
+        // Numeric `wait 500` sleeps for that many milliseconds, matching Windows and macOS.
+        if allow_ms
+            && !flags.gone
+            && let Ok(ms) = text.parse::<u64>()
+        {
+            let delay = Duration::from_millis(ms.min(WAIT_MOST_MS));
+            let started = Instant::now();
+            while started.elapsed() < delay {
+                if STOP.load(Ordering::Relaxed) {
+                    return Err(STOPPED.into());
+                }
+                thread::sleep(Duration::from_millis(50).min(delay.saturating_sub(started.elapsed())));
+            }
+            return Ok("waited".into());
+        }
         let limit = Duration::from_millis(flags.ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MOST_MS));
         let wanted = text.to_lowercase();
         let started = Instant::now();
@@ -1269,16 +1779,16 @@ impl Service {
     /// Fill a GTK or Qt file dialog's file name with this path and accept it with Enter, which
     /// works in any language. GTK's Open dialog shows its location field on Ctrl+L. The dialog can
     /// be this window, or one its app opened over it.
-    fn pick_file(&self, tracked: &Tracked, view: &mut View, path: &str) -> Reply {
+    fn pick_file(&self, flags: &Flags, tracked: &Tracked, view: &mut View, path: &str) -> Reply {
         let pid = self.window_of(tracked)?.pid;
-        if let Some(done) = self.fill_file_dialog(tracked, view, path) {
+        if let Some(done) = self.fill_file_dialog(flags, tracked, view, path) {
             return done;
         }
         if pid > 0 {
             for window in self.list_windows()?.into_iter().filter(|w| w.pid == pid && w.key != tracked.key) {
                 let dialog = Tracked { id: 0, key: window.key, x11: window.x11, view: Mutex::new(View { element: window.element, ..View::default() }) };
                 let mut dialog_view = dialog.view.lock().unwrap();
-                if let Some(done) = self.fill_file_dialog(&dialog, &mut dialog_view, path) {
+                if let Some(done) = self.fill_file_dialog(flags, &dialog, &mut dialog_view, path) {
                     return done;
                 }
             }
@@ -1287,7 +1797,7 @@ impl Service {
     }
 
     /// None if this window has no field for a file name, even after Ctrl+L.
-    fn fill_file_dialog(&self, tracked: &Tracked, view: &mut View, path: &str) -> Option<Reply> {
+    fn fill_file_dialog(&self, flags: &Flags, tracked: &Tracked, view: &mut View, path: &str) -> Option<Reply> {
         let field = |view: &View| {
             let fields: Vec<&Obj> = view.nodes.values().filter(|n| n.parts.role == "edit").map(|n| &n.element).filter(|e| atspi::editable(e)).collect();
             fields.iter().find(|e| atspi::focused(e)).or(fields.first()).map(|e| (*e).clone())
@@ -1302,8 +1812,12 @@ impl Service {
         // GTK's dialog keeps hidden fields, its search box among them: Ctrl+L shows its location
         // field and puts the keyboard there. Qt's has its file name field focused already.
         if role == "file chooser" || field(view).is_none() {
-            if tracked.x11.is_some() {
-                self.keyboard(tracked, || x::press(&x::chord("ctrl+l")?, Duration::ZERO)).ok()?;
+            if let Some(xid) = tracked.x11 {
+                if flags.real {
+                    self.keyboard(tracked, || x::press(&x::chord("ctrl+l")?, Duration::ZERO)).ok()?;
+                } else {
+                    self.keep_behind(tracked, flags, || x::chord("ctrl+l").and_then(|c| x::send_key(xid, &c, Duration::ZERO))).ok()?;
+                }
                 thread::sleep(MENU_OPEN);
                 self.read(tracked, view, false).ok()?;
             } else if field(view).is_none() {
@@ -1312,21 +1826,25 @@ impl Service {
         }
         let element = field(view)?;
         Some((|| {
-            atspi::set_text(&element, path)?;
+            self.keep_behind(tracked, flags, || atspi::set_text(&element, path))?;
             // The dialog's default button, Open or Save in any language, accepts it as Enter would,
             // and needs no keyboard focus, which a dialog that is not the active window lacks.
             thread::sleep(MENU_OPEN);
             self.read(tracked, view, false)?;
             let default = view.nodes.values().find(|n| n.parts.role == "button" && !n.parts.states.contains(&"disabled") && atspi::is_default(&n.element));
             if let Some(button) = default
-                && atspi::press(&button.element).is_ok()
+                && self.keep_behind(tracked, flags, || atspi::press(&button.element).is_ok())
             {
                 // Accepted through AT-SPI.
-            } else if tracked.x11.is_some() {
-                if !atspi::focused(&element) {
-                    let _ = atspi::focus(&element);
+            } else if let Some(xid) = tracked.x11 {
+                if flags.real {
+                    if !atspi::focused(&element) {
+                        let _ = atspi::focus(&element);
+                    }
+                    self.keyboard(tracked, || x::press(&x::chord("enter")?, Duration::ZERO))?;
+                } else {
+                    self.keep_behind(tracked, flags, || x::chord("enter").and_then(|c| x::send_key(xid, &c, Duration::ZERO)))?;
                 }
-                self.keyboard(tracked, || x::press(&x::chord("enter")?, Duration::ZERO))?;
             } else {
                 return Err("set the path, but that dialog has no AT-SPI default button and pressing Enter on Wayland needs X11".into());
             }
@@ -1357,29 +1875,30 @@ impl Service {
         let (command, args) = words.split_first().ok_or("empty step")?;
         let route = match (command.as_str(), args) {
             ("click", [word]) => self.click(who, &merged, tracked, view, word),
-            ("hover", [word]) => self.hover(who, tracked, view, word),
-            ("set", [word, value]) => self.set(who, tracked, view, word, value),
-            ("clear", [word]) => self.set(who, tracked, view, word, ""),
-            ("check", [word]) => self.ensure(who, tracked, view, word, Some("on")),
-            ("uncheck", [word]) => self.ensure(who, tracked, view, word, Some("off")),
-            ("toggle", [word]) => self.ensure(who, tracked, view, word, None),
-            ("expand", [word]) => self.expand(who, tracked, view, word, true),
-            ("collapse", [word]) => self.expand(who, tracked, view, word, false),
-            ("show", [word]) => self.show(who, tracked, view, word),
-            ("select", [word, item]) => self.select(who, tracked, view, word, item),
+            ("hover", [word]) => self.hover(who, &merged, tracked, view, word),
+            ("set", [word, value]) => self.set(who, &merged, tracked, view, word, value),
+            ("clear", [word]) => self.set(who, &merged, tracked, view, word, ""),
+            ("check", [word]) => self.ensure(who, &merged, tracked, view, word, Some("on")),
+            ("uncheck", [word]) => self.ensure(who, &merged, tracked, view, word, Some("off")),
+            ("toggle", [word]) => self.ensure(who, &merged, tracked, view, word, None),
+            ("expand", [word]) => self.expand(who, &merged, tracked, view, word, true),
+            ("collapse", [word]) => self.expand(who, &merged, tracked, view, word, false),
+            ("show", [word]) => self.show(who, &merged, tracked, view, word),
+            ("select", [word, item]) => self.select(who, &merged, tracked, view, word, item),
             ("type", rest) => self.type_text(who, &merged, tracked, view, rest),
-            ("key", [spec]) => self.key(who, &merged, tracked, spec),
-            ("down", rest) => self.down(who, rest),
-            ("scroll", rest) => self.scroll(who, tracked, view, rest),
+            ("key", [spec]) => self.key(who, &merged, tracked, view, spec),
+            ("down", rest) => self.down(who, &merged, tracked, view, rest),
+            ("scroll", rest) => self.scroll(who, &merged, tracked, view, rest),
             ("drag", [from, to]) => self.drag(who, &merged, tracked, view, from, to),
             ("draw", rest) => self.draw(who, &merged, tracked, view, rest),
-            ("wait", [text]) => self.wait(&merged, tracked, view, text),
-            ("pick-file", [path]) => self.pick_file(tracked, view, path),
+            ("wait", [text]) => self.wait(&merged, tracked, view, text, true),
+            ("expect", [text]) => self.wait(&merged, tracked, view, text, false),
+            ("pick-file", [path]) => self.pick_file(&merged, tracked, view, path),
             _ => Err(format!("can't do '{}': see deskcrew help", words.join(" "))),
         }?;
         if let Some(text) = &step.flags.expect {
             let waiting = Flags { ms: merged.ms, ..Flags::default() };
-            self.wait(&waiting, tracked, view, text)?;
+            self.wait(&waiting, tracked, view, text, false)?;
         }
         Ok(route)
     }
@@ -1499,20 +2018,40 @@ impl Service {
         let mut out = vec![format!("w{} \"{}\" {} controls{hidden}", tracked.id, lines::clip(&window.title, 50), view.lines.len())];
         out.extend(lines::page(&view.lines, flags.find.as_deref(), flags.from));
         if !filtered {
-            out.extend(self.blind_spot(who, &tracked, &window, view));
+            let blind = self.blind_spot(who, &tracked, &window, view);
+            if blind.is_empty() && view.element.is_none() && tracked.x11.is_some() {
+                out.push("(no AT-SPI controls: use x,y from shot, or start with accessibility enabled)".into());
+            } else {
+                out.extend(blind);
+            }
         }
         Ok(out.join("\n"))
     }
 
-    /// Point out the largest part of the window with no controls in it.
+    /// Point out the largest part of the window with no controls in it, reading any text drawn
+    /// there via OCR (tesseract) so the agent gets clickable coordinates and named OCR lookup
+    /// without needing a shot. Uses the window's composited backing pixmap so covered windows work.
     fn blind_spot(&self, who: &str, tracked: &Tracked, window: &WindowInfo, view: &mut View) -> Vec<String> {
-        if tracked.x11.is_none() {
+        let Some(xid) = tracked.x11 else {
             return Vec::new();
-        }
+        };
         let rect = window.rect;
-        let rects: Vec<_> = view.nodes.values().map(|n| (n.rect, CONTAINERS.contains(&n.parts.role.as_str()) && n.parts.name.is_empty())).collect();
+        let mut rects: Vec<_> = view
+            .nodes
+            .values()
+            .map(|n| (n.rect, CONTAINERS.contains(&n.parts.role.as_str()) && n.parts.name.is_empty()))
+            .collect();
+        rects.extend(view.quiet.iter().map(|&r| (r, false)));
         let Some((bx, by, w, h)) = look::empty_area(rect, &rects) else { return Vec::new() };
-        let Ok(part) = x::capture((bx, by, w, h)) else { return Vec::new() };
+        let part = x::window_picture(xid)
+            .ok()
+            .map(|(full, _)| {
+                let lx = (bx - rect.0).max(0) as u32;
+                let ly = (by - rect.1).max(0) as u32;
+                full.crop(lx, ly, w.max(1) as u32, h.max(1) as u32)
+            })
+            .or_else(|| x::capture((bx, by, w, h)).ok());
+        let Some(part) = part else { return Vec::new() };
         if !part.busy() {
             return Vec::new();
         }
@@ -1522,7 +2061,22 @@ impl Service {
         {
             return said.clone();
         }
-        let said = vec![format!("no controls in {},{} {w}x{h}, only drawing: shot --region {bx},{by},{w},{h}", bx - rect.0, by - rect.1)];
+        let mut said = Vec::new();
+        let text = look::read_text(&part).unwrap_or_default();
+        view.ocr_hits = text
+            .iter()
+            .map(|line| (line.text.clone(), (bx + line.rect.0, by + line.rect.1, line.rect.2, line.rect.3)))
+            .collect();
+        if text.is_empty() {
+            said.push(format!("no controls in {},{} {w}x{h}, only drawing: shot --region {bx},{by},{w},{h}", bx - rect.0, by - rect.1));
+        } else {
+            said.push(format!("read from {},{} {w}x{h} (no controls there; click name or x,y works):", bx - rect.0, by - rect.1));
+            for line in text {
+                let cx = (bx - rect.0) + line.rect.0 + line.rect.2 / 2;
+                let cy = (by - rect.1) + line.rect.1 + line.rect.3 / 2;
+                said.push(format!("  \"{}\" {cx},{cy}", lines::clip(&line.text, 80)));
+            }
+        }
         // x,y in the window read as screen pixels from its corner until the next shot.
         let mut agents = self.agents.lock().unwrap();
         let state = agents.entry(who.to_string()).or_default();
@@ -1602,20 +2156,56 @@ impl Service {
     }
 
     fn shot(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
-        if !x::has_display() && x::has_wayland() {
-            return Err("screenshots on Wayland need X11 (or the ScreenCast/Screenshot desktop portal with your consent and PipeWire); use `see` and `get` through AT-SPI".into());
-        }
-        x::ready()?;
         let edge = flags.edge.unwrap_or(shot::DEFAULT_EDGE);
+        let pure_wayland = !x::has_display() && x::has_wayland();
         if let Some(region) = &flags.region {
             let parts: Vec<i32> = region.split(',').filter_map(|n| n.trim().parse().ok()).collect();
             let [rx, ry, w, h] = parts[..] else { return Err("--region x,y,w,h".into()) };
             if w < 1 || h < 1 {
                 return Err("--region needs a width and height".into());
             }
+            if pure_wayland {
+                let (full, origin, units) = portal::screenshot(Some((rx + w / 2, ry + h / 2)))?;
+                let px_x = (((rx - origin.0) as f32 / units).round() as i32).max(0) as u32;
+                let px_y = (((ry - origin.1) as f32 / units).round() as i32).max(0) as u32;
+                let px_w = ((w as f32 / units).round() as u32).max(1);
+                let px_h = ((h as f32 / units).round() as u32).max(1);
+                let frame = full.crop(px_x, px_y, px_w, px_h);
+                let hash = frame.hash();
+                let (small, shrink) = frame.shrink(edge);
+                let scale = shrink * units;
+                let (sw, sh) = (small.w, small.h);
+                let path = shot::path_for(who, 0);
+                small.save(&path)?;
+                let mut agents = self.agents.lock().unwrap();
+                let state = agents.entry(who.to_string()).or_default();
+                if let Some(window) = state.current.clone() {
+                    let frames = Frames { x: rx, y: ry, scale };
+                    state.shots.insert(window, LastShot { hash, frame: small, frames });
+                }
+                return Ok(format!("{} {}x{} scale {scale:.2}", path.display(), sw, sh));
+            }
+            x::ready()?;
             return self.save_screen(who, (rx, ry, w, h), edge);
         }
         if flags.screen {
+            if pure_wayland {
+                let (frame, origin, units) = portal::screenshot(None)?;
+                let hash = frame.hash();
+                let (small, shrink) = frame.shrink(edge);
+                let scale = shrink * units;
+                let (sw, sh) = (small.w, small.h);
+                let path = shot::path_for(who, 0);
+                small.save(&path)?;
+                let mut agents = self.agents.lock().unwrap();
+                let state = agents.entry(who.to_string()).or_default();
+                if let Some(window) = state.current.clone() {
+                    let frames = Frames { x: origin.0, y: origin.1, scale };
+                    state.shots.insert(window, LastShot { hash, frame: small, frames });
+                }
+                return Ok(format!("{} {}x{} scale {scale:.2}", path.display(), sw, sh));
+            }
+            x::ready()?;
             let screens = x::screens();
             let main = screens.iter().find(|(_, main)| *main).map(|(r, _)| *r).unwrap_or((0, 0, 1, 1));
             let rect = if flags.all {
@@ -1629,16 +2219,34 @@ impl Service {
             };
             return self.save_screen(who, rect, edge);
         }
+        if !pure_wayland {
+            x::ready()?;
+        }
         let word = words.first();
         let control = word.and_then(|w| is_ref(w));
         let tracked = self.pick(who, if control.is_some() { flags.window.as_deref() } else { word.map(String::as_str).or(flags.window.as_deref()) })?;
-        let Some(xid) = tracked.x11 else {
-            return Err("that is a native Wayland window, so X11 cannot read its pixels; screenshots on Wayland need the ScreenCast/Screenshot portal with your consent and PipeWire — use `see` and `get` through AT-SPI".into());
-        };
         let window = self.window_of(&tracked)?;
-        let (left, top, _, _) = window.rect;
-        let (mut frame, _) = x::window_picture(xid)?;
-        let mut origin = (left, top);
+        let (left, top, ww, wh) = window.rect;
+        let (mut frame, mut origin, units) = match tracked.x11 {
+            Some(xid) => {
+                let (f, u) = x::window_picture(xid)?;
+                (f, (left, top), u)
+            }
+            None => {
+                let hint = (ww > 0 && wh > 0).then_some((left + ww / 2, top + wh / 2));
+                let (full, screen_origin, units) = portal::screenshot(hint)?;
+                if ww > 0 && wh > 0 {
+                    let px_x = (((left - screen_origin.0) as f32 / units).round() as i32).max(0) as u32;
+                    let px_y = (((top - screen_origin.1) as f32 / units).round() as i32).max(0) as u32;
+                    let px_w = ((ww as f32 / units).round() as u32).max(1);
+                    let px_h = ((wh as f32 / units).round() as u32).max(1);
+                    let cropped = full.crop(px_x, px_y, px_w, px_h);
+                    (cropped, (left.max(screen_origin.0), top.max(screen_origin.1)), units)
+                } else {
+                    (full, screen_origin, units)
+                }
+            }
+        };
         if let Some(id) = control {
             let mut view = tracked.view.lock().unwrap();
             if !view.nodes.contains_key(&id) {
@@ -1646,8 +2254,12 @@ impl Service {
             }
             let node = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?;
             let rect = atspi::rect(&node.element).unwrap_or(node.rect);
-            frame = frame.crop(rect.0.saturating_sub(left).max(0) as u32, rect.1.saturating_sub(top).max(0) as u32, rect.2.max(1) as u32, rect.3.max(1) as u32);
-            origin = (rect.0.max(left), rect.1.max(top));
+            let cx = (((rect.0 - origin.0) as f32 / units).round() as i32).max(0) as u32;
+            let cy = (((rect.1 - origin.1) as f32 / units).round() as i32).max(0) as u32;
+            let cw = ((rect.2 as f32 / units).round() as u32).max(1);
+            let ch = ((rect.3 as f32 / units).round() as u32).max(1);
+            frame = frame.crop(cx, cy, cw, ch);
+            origin = (rect.0.max(origin.0), rect.1.max(origin.1));
         }
         let hash = frame.hash();
         // The view before the agents: every other command takes the two locks in that order.
@@ -1666,12 +2278,13 @@ impl Service {
         let crop = if flags.changed && control.is_none() { last.and_then(|l| frame.changed_from(&l.frame)) } else { None };
         let picture = match crop {
             Some((cx, cy, w, h)) => {
-                origin = (origin.0 + cx as i32, origin.1 + cy as i32);
+                origin = (origin.0 + (cx as f32 * units).round() as i32, origin.1 + (cy as f32 * units).round() as i32);
                 frame.crop(cx, cy, w, h)
             }
             None => frame.crop(0, 0, frame.w, frame.h),
         };
-        let (mut small, scale) = picture.shrink(edge);
+        let (mut small, shrink) = picture.shrink(edge);
+        let scale = shrink * units;
         if flags.marks {
             let to_image = |value: i32, from: i32| ((value - from) as f32 / scale) as i32;
             for (id, (nx, ny, w, h)) in marked {
@@ -1697,11 +2310,12 @@ impl Service {
         Ok(format!("{} {}x{} scale {scale:.2}{part}", path.display(), small.w, small.h) + unread)
     }
 
-    fn launch(&self, who: &str, words: &[String]) -> Reply {
+    fn launch(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         if STOP.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
         }
         let app = words.first().ok_or("launch needs an app")?;
+        let before_front = (!flags.front).then(x::front).flatten();
         let before: Vec<WindowKey> = self.list_windows()?.into_iter().map(|w| w.key).collect();
         let pid = x::spawn(app, &words[1..])?;
         let xwayland = x::is_xwayland();
@@ -1734,6 +2348,16 @@ impl Service {
             }
         }
         let Some(window) = found else { return Ok(format!("started {app}; no new window yet")) };
+        // Keep background launches behind the person's active window unless `--front` was passed.
+        if !flags.front
+            && let (Some(new_xid), Some(prev)) = (window.x11, before_front)
+            && prev != new_xid
+        {
+            x::lower_behind(new_xid, prev);
+            if x::front() == Some(new_xid) {
+                let _ = x::activate(prev);
+            }
+        }
         let tracked = self.track(&window);
         self.set_current(who, window.key);
         Ok(format!("w{} \"{}\" {}", tracked.id, lines::clip(&window.title, 50), window.app))
@@ -1744,7 +2368,7 @@ impl Service {
         agents.sort();
         let stopped = if STOP.load(Ordering::Relaxed) { "; stopped by Ctrl+Alt+Esc" } else { "" };
         let display = if !x::has_display() && x::has_wayland() {
-            format!("; wayland {} (AT-SPI only; no X11)", std::env::var("WAYLAND_DISPLAY").unwrap_or_default())
+            format!("; wayland {} (AT-SPI + desktop portals; no X11)", std::env::var("WAYLAND_DISPLAY").unwrap_or_default())
         } else if x::is_xwayland() {
             format!(
                 "; wayland {} + xwayland {}",
@@ -1761,7 +2385,8 @@ impl Service {
             Ok(_) => "",
             Err(_) => "; no accessibility bus",
         };
-        Ok(format!("deskcrew {} running; agents: {}{stopped}{display}{access}", env!("CARGO_PKG_VERSION"), agents.join(", ")))
+        let quiet = if self.quiet.load(Ordering::Relaxed) { "; quiet: on" } else { "" };
+        Ok(format!("deskcrew {} running; agents: {}{stopped}{quiet}{display}{access}", env!("CARGO_PKG_VERSION"), agents.join(", ")))
     }
 
     fn is(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
@@ -1800,15 +2425,22 @@ impl Service {
         let (command, args) = rest.split_first().ok_or(HELP)?;
         let with_expect = |mut steps: Vec<Step>| {
             if let Some(text) = &flags.expect {
-                steps.push(Step { flags: Flags::default(), words: vec!["wait".to_string(), text.clone()] });
+                steps.push(Step { flags: Flags::default(), words: vec!["expect".to_string(), text.clone()] });
             }
             steps
         };
         let window_spec = || args.first().map(String::as_str).or(flags.window.as_deref());
         // Commands that change windows or the clipboard stop with every action on Ctrl+Alt+Esc.
-        let changes = matches!(command.as_str(), "focus" | "close" | "place") || (command == "clip" && !args.is_empty());
+        let changes = matches!(command.as_str(), "focus" | "close" | "place")
+            || (command == "clip" && !args.is_empty())
+            || (matches!(command.as_str(), "quiet" | "background-only") && args.first().map(String::as_str) == Some("off"));
         if changes && STOP.load(Ordering::Relaxed) {
             return Err(STOPPED.into());
+        }
+        if self.quiet.load(Ordering::Relaxed) && command != "do"
+            && let Some(msg) = quiet_blocked(command, &flags, None)
+        {
+            return Err(msg.into());
         }
         if !(command == "do" && flags.dry) && matches!(flags.risk.as_deref(), Some("medium" | "high")) && !flags.force {
             return Err("declared risky: ask the person, then add --force".into());
@@ -1820,7 +2452,7 @@ impl Service {
             "get" => self.get(who, &flags, args),
             "is" => self.is(who, &flags, args),
             "shot" => self.shot(who, &flags, args),
-            "launch" => self.launch(who, args),
+            "launch" => self.launch(who, &flags, args),
             "status" => self.status(),
             "focus" => {
                 let tracked = self.pick(who, window_spec())?;
@@ -1842,8 +2474,11 @@ impl Service {
                 let Some(xid) = tracked.x11 else {
                     return Err("moving or resizing another app's window on Wayland needs X11 (Wayland keeps window placement with the compositor)".into());
                 };
-                let how = args.first().ok_or("place x,y,w,h|min|max|restore")?;
-                x::place(xid, how).map(|_| "ok".to_string())
+                if args.is_empty() {
+                    return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into());
+                }
+                let how = args.join(" ");
+                x::place(xid, &how).map(|_| "ok".to_string())
             }
             "clip" => match args {
                 [] => Ok(x::clipboard()?.unwrap_or_else(|| "(no text on the clipboard)".into())),
@@ -1871,9 +2506,29 @@ impl Service {
             }
             "up" => {
                 let gone = self.release(true);
-                Ok(if gone.is_empty() { "nothing was held".into() } else { format!("let go of keys held by {}", gone.join(", ")) })
+                Ok(if gone.is_empty() { "nothing was held".into() } else { format!("let go of held input by {}", gone.join(", ")) })
             }
-            "cursor" => Err("the Linux version never borrows anyone's cursor: on X11 it uses the display's pointer for points and drawing only".into()),
+            "cursor" => Ok(if x::has_display() && x::own_pointer() {
+                "agents use background events and their own XInput 2 pointer; the person's cursor is untouched".into()
+            } else {
+                "agents use background accessibility and events; the person's cursor is untouched".into()
+            }),
+            "quiet" | "background-only" => match args.first().map(String::as_str) {
+                None | Some("status") => Ok(if self.quiet.load(Ordering::Relaxed) {
+                    "quiet: on (focus, --real, --mouse, --front, and down are refused)".into()
+                } else {
+                    "quiet: off".into()
+                }),
+                Some("on") => {
+                    self.quiet.store(true, Ordering::Relaxed);
+                    Ok("quiet: on (focus, --real, --mouse, --front, and down are refused)".into())
+                }
+                Some("off") => {
+                    self.quiet.store(false, Ordering::Relaxed);
+                    Ok("quiet: off".into())
+                }
+                _ => Err("quiet [on|off|status]".into()),
+            },
             "table" => self.table(who, &flags, args),
             "notifications" => match args.first().map(String::as_str) {
                 // Notifications are not a window here, so there is nothing to close.
@@ -1924,6 +2579,17 @@ impl Service {
                         return Err("declared risky: ask the person, then add --force".into());
                     }
                 }
+                if self.quiet.load(Ordering::Relaxed) {
+                    if let Some(msg) = quiet_blocked("do", &flags, Some(&steps)) {
+                        return Err(msg.into());
+                    }
+                    for step in &steps {
+                        let step_verb = step.words.first().map_or("", String::as_str);
+                        if let Some(msg) = quiet_blocked(step_verb, &step.flags, None) {
+                            return Err(msg.into());
+                        }
+                    }
+                }
                 self.act(who, &flags, &with_expect(steps))
             }
             "click" if args.len() > 1 => {
@@ -1966,6 +2632,7 @@ pub fn run() {
         agents: Mutex::new(HashMap::new()),
         last_used: Mutex::new(Instant::now()),
         active: AtomicUsize::new(0),
+        quiet: AtomicBool::new(env_quiet()),
         quit: AtomicBool::new(false),
         unlinked: AtomicBool::new(false),
         wake_lock: Mutex::new(()),
@@ -2016,4 +2683,23 @@ pub fn run() {
         let _ = service.wake.wait_timeout(guard, Duration::from_millis(25)).unwrap();
     }
     service.release(true);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn quiet_mode_blocks_focus_and_real_input() {
+        let plain = Flags::default();
+        assert!(quiet_blocked("focus", &plain, None).is_some());
+        assert!(quiet_blocked("down", &plain, None).is_some());
+        assert!(quiet_blocked("click", &Flags { real: true, ..Flags::default() }, None).is_some());
+        assert!(quiet_blocked("click", &Flags { mouse: true, ..Flags::default() }, None).is_some());
+        assert!(quiet_blocked("launch", &Flags { front: true, ..Flags::default() }, None).is_some());
+        assert!(quiet_blocked("click", &plain, None).is_none());
+        assert!(quiet_blocked("type", &Flags { paste: true, ..Flags::default() }, None).is_none());
+        let step_real = vec![Step { flags: Flags { real: true, ..Flags::default() }, words: vec!["click".into(), "e1".into()] }];
+        assert!(quiet_blocked("do", &plain, Some(&step_real)).is_some());
+    }
 }

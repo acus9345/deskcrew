@@ -506,13 +506,18 @@ pub fn type_text(text: &str, root: Hwnd, surfaces: &[Hwnd], stop: &AtomicBool) -
     Ok(true)
 }
 
-fn idle_for() -> Duration {
+/// Tick count of the person's most recent physical keyboard or mouse input.
+pub fn last_input_tick() -> u32 {
     unsafe {
         let mut info: LASTINPUTINFO = zeroed();
         info.cbSize = size_of::<LASTINPUTINFO>() as u32;
         GetLastInputInfo(&mut info);
-        Duration::from_millis(GetTickCount().wrapping_sub(info.dwTime) as u64)
+        info.dwTime
     }
+}
+
+fn idle_for() -> Duration {
+    Duration::from_millis(unsafe { GetTickCount() }.wrapping_sub(last_input_tick()) as u64)
 }
 
 /// Wait for a gap in the person's own input, so their click cannot land in the middle of ours.
@@ -541,6 +546,16 @@ pub enum Loan {
 }
 
 pub fn borrow(root: Hwnd, pids: &[u32], loan: Loan) -> Result<Borrowed, String> {
+    borrow_inner(root, &[], pids, loan, true)
+}
+
+/// Borrow input only if `root` (or one of `surfaces`) is ALREADY the foreground window. Never
+/// calls `bring_forward`, so background actions without `--real` cannot race and steal focus.
+pub fn borrow_if_front(root: Hwnd, surfaces: &[Hwnd], pids: &[u32], loan: Loan) -> Result<Borrowed, String> {
+    borrow_inner(root, surfaces, pids, loan, false)
+}
+
+fn borrow_inner(root: Hwnd, surfaces: &[Hwnd], pids: &[u32], loan: Loan, allow_bring_forward: bool) -> Result<Borrowed, String> {
     let mouse = loan == Loan::Mouse;
     wait_for_quiet();
     let mut pointer = POINT { x: 0, y: 0 };
@@ -550,11 +565,14 @@ pub fn borrow(root: Hwnd, pids: &[u32], loan: Loan) -> Result<Borrowed, String> 
     // A dialog the window opened over itself takes its input, and is what comes forward: the
     // window itself is disabled until it closes, and keys would go nowhere if it came forward.
     let front = win::key_window(root);
-    let already_front = win::foreground() == front;
-    if !already_front && !win::bring_forward(front) {
-        return Err("Windows would not bring that window forward".into());
-    }
+    let already_front = win::foreground() == front || (!allow_bring_forward && win::front_is(root, surfaces));
     if !already_front {
+        if !allow_bring_forward {
+            return Err(crate::act::NEEDS_REAL.into());
+        }
+        if !win::bring_forward(front) {
+            return Err("Windows would not bring that window forward".into());
+        }
         thread::sleep(if loan == Loan::Pen { PEN_SETTLE } else { FOCUS_SETTLE });
     }
     let drain = if loan == Loan::Pen { PEN_DRAIN } else { DRAIN };

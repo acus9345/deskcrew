@@ -16,13 +16,16 @@ use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::{Duration, Instant};
 
 const FRAME: Duration = Duration::from_millis(16);
-const RESTACK_EVERY: Duration = Duration::from_millis(100);
+const RESTACK_EVERY: Duration = Duration::from_millis(150);
+const REST_AFTER: Duration = Duration::from_secs(4);
 const LABEL_PX: f64 = 11.0;
 const PRESS_LINGER_MS: f32 = 450.0;
 const IMAGE_ALPHA_LAST: u32 = 1;
 /// The name tag's font, as on Windows; CoreText falls back to Helvetica without it.
 const LABEL_FONT: &str = "Arial-BoldMT";
 const BEHAVIOUR: usize = 1 | 16 | 64 | 256;
+/// NSWindowStyleMaskNonactivatingPanel (1 << 7) | borderless (0): never activates or steals focus.
+const NON_ACTIVATING_PANEL: usize = 1 << 7;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq)]
 pub struct Rect {
@@ -142,15 +145,17 @@ fn image_of(picture: &tiny_skia::Pixmap) -> Option<Owned> {
 impl Layer {
     unsafe fn new() -> Layer {
         unsafe {
-            let window: *mut AnyObject = msg_send![class!(NSWindow), alloc];
+            let window: *mut AnyObject = msg_send![class!(NSPanel), alloc];
             let rect = CGRect::new(0.0, 0.0, 1.0, 1.0);
-            let window: *mut AnyObject = msg_send![window, initWithContentRect: rect, styleMask: 0usize, backing: 2usize, defer: false];
+            let window: *mut AnyObject = msg_send![window, initWithContentRect: rect, styleMask: NON_ACTIVATING_PANEL, backing: 2usize, defer: false];
             let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
             let _: () = msg_send![window, setOpaque: false];
             let _: () = msg_send![window, setBackgroundColor: clear];
             let _: () = msg_send![window, setHasShadow: false];
             let _: () = msg_send![window, setIgnoresMouseEvents: true];
             let _: () = msg_send![window, setReleasedWhenClosed: false];
+            let _: () = msg_send![window, setHidesOnDeactivate: false];
+            let _: () = msg_send![window, setCanHide: false];
             let _: () = msg_send![window, setLevel: 0isize];
             let _: () = msg_send![window, setCollectionBehavior: BEHAVIOUR];
             let view: *mut AnyObject = msg_send![window, contentView];
@@ -181,8 +186,12 @@ impl Layer {
         }
     }
 
-    /// Just above the agent's window, or in front if it has none.
+    /// Just above the agent's window; skips ordering if no target window is known so the overlay
+    /// never pops in front of the person's unrelated foreground app.
     unsafe fn stack(&self, above: u32) {
+        if above == 0 {
+            return;
+        }
         unsafe {
             let _: () = msg_send![self.window, orderWindow: 1isize, relativeTo: above as isize];
         }
@@ -224,6 +233,8 @@ struct Agent {
     glide: Option<Glide>,
     above: u32,
     side: f32,
+    last_active: Instant,
+    visible: bool,
 }
 
 struct Press {
@@ -232,6 +243,7 @@ struct Press {
     layer: Layer,
     started: Instant,
     above: u32,
+    stacked: bool,
 }
 
 /// Runs on the main thread for as long as the service lives, drawing whatever the service asks.
@@ -245,6 +257,7 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
         let scale: f64 = if screen.is_null() { 2.0 } else { msg_send![screen, backingScaleFactor] };
         let screen_h = crate::mac::apps::main_height();
         let mut agents: HashMap<String, Agent> = HashMap::new();
+        let mut waiting: HashMap<String, u32> = HashMap::new();
         let mut presses: Vec<Press> = Vec::new();
         let mut aside = false;
         let mut restacked = Instant::now();
@@ -265,7 +278,10 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                     Command::Move { agent, x, y, instant, done } => {
                         let taken: Vec<Rgb> = agents.values().map(|a| a.colour).collect();
                         let side = if agents.len().is_multiple_of(2) { 1.0 } else { -1.0 };
+                        let pending = waiting.remove(&agent);
+                        let mut created = false;
                         let entry = agents.entry(agent.clone()).or_insert_with(|| {
+                            created = true;
                             let colour = motion::colour_for(&agent, &taken);
                             let mut layer = Layer::new();
                             let label = text_mask(&agent, LABEL_PX * scale);
@@ -274,13 +290,38 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                                 tip = (tx as f64 / scale, ty as f64 / scale);
                                 layer.show(&picture, scale, x as f64 - tip.0, y as f64 - tip.1, screen_h);
                             }
-                            Agent { colour, label, pose: motion::Pose::new(), look: (0, 0), layer, tip, at: (x as f32, y as f32), glide: None, above: 0, side }
+                            Agent {
+                                colour,
+                                label,
+                                pose: motion::Pose::new(),
+                                look: (0, 0),
+                                layer,
+                                tip,
+                                at: (x as f32, y as f32),
+                                glide: None,
+                                above: pending.unwrap_or(0),
+                                side,
+                                last_active: Instant::now(),
+                                visible: false,
+                            }
                         });
+                        let mut over_changed = false;
+                        if let Some(window) = pending
+                            && entry.above != window
+                        {
+                            entry.above = window;
+                            over_changed = true;
+                        }
+                        entry.last_active = Instant::now();
                         let to = (x as f32, y as f32);
                         if instant {
                             entry.glide = None;
                             entry.at = to;
                             entry.layer.place(x as f64 - entry.tip.0, y as f64 - entry.tip.1, screen_h);
+                            if !aside && (created || !entry.visible || over_changed) && entry.above != 0 {
+                                entry.layer.stack(entry.above);
+                                entry.visible = true;
+                            }
                             if let Some(done) = done {
                                 let _ = done.send(());
                             }
@@ -289,41 +330,66 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                         let ms = motion::travel_ms(entry.at, to);
                         entry.glide = Some(Glide { from: entry.at, middle: motion::bow(entry.at, to, entry.side), to, started: Instant::now(), ms, done });
                         entry.side = -entry.side;
-                        if !aside {
+                        if !aside && entry.above != 0 {
                             entry.layer.stack(entry.above);
+                            entry.visible = true;
                         }
                     }
                     Command::Over { agent, window } => {
                         if let Some(entry) = agents.get_mut(&agent) {
-                            entry.above = window;
-                            if !aside {
-                                entry.layer.stack(window);
+                            if entry.above != window {
+                                entry.above = window;
+                                if !aside && window != 0 && (entry.visible || entry.last_active.elapsed() < REST_AFTER) {
+                                    entry.layer.stack(window);
+                                    entry.visible = true;
+                                }
                             }
+                        } else {
+                            waiting.insert(agent, window);
                         }
                     }
                     Command::Press { agent, target } => {
-                        if let Some(entry) = agents.get(&agent) {
-                            presses.push(Press { colour: entry.colour, target, layer: Layer::new(), started: Instant::now(), above: entry.above });
+                        if let Some(entry) = agents.get_mut(&agent) {
+                            entry.last_active = Instant::now();
+                            presses.push(Press { colour: entry.colour, target, layer: Layer::new(), started: Instant::now(), above: entry.above, stacked: false });
                         }
                     }
                     Command::Type { agent, keys } => {
                         if let Some(entry) = agents.get_mut(&agent) {
+                            entry.last_active = Instant::now();
                             entry.pose.type_keys(Instant::now(), keys);
+                            if !aside && entry.above != 0 && !entry.visible {
+                                entry.layer.stack(entry.above);
+                                entry.visible = true;
+                            }
                         }
                     }
                     Command::Aside(on) => {
                         aside = on;
-                        for agent in agents.values() {
-                            if on { agent.layer.hide() } else { agent.layer.stack(agent.above) }
+                        for agent in agents.values_mut() {
+                            if on {
+                                agent.layer.hide();
+                            } else if agent.visible && agent.above != 0 {
+                                agent.layer.stack(agent.above);
+                            }
                         }
                         for press in &presses {
-                            if on { press.layer.hide() } else { press.layer.stack(press.above) }
+                            if on {
+                                press.layer.hide();
+                            } else if press.above != 0 {
+                                press.layer.stack(press.above);
+                            }
                         }
                     }
                 }
             }
             let now = Instant::now();
             for agent in agents.values_mut() {
+                if agent.visible && agent.glide.is_none() && now.duration_since(agent.last_active) > REST_AFTER {
+                    agent.layer.hide();
+                    agent.visible = false;
+                    continue;
+                }
                 let mut moved = false;
                 if let Some(glide) = &mut agent.glide {
                     let t = (glide.started.elapsed().as_millis() as f32 / glide.ms.max(1) as f32).min(1.0);
@@ -359,8 +425,9 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                 let (w, h) = ((press.target.w as f64 * scale) as i32, (press.target.h as f64 * scale) as i32);
                 if let Some(picture) = draw::press(press.colour, w, h, scale as f32, ms.min(draw::PRESS_SETTLE_MS)) {
                     press.layer.show(&picture, scale, press.target.x as f64 - margin, press.target.y as f64 - margin, screen_h);
-                    if !aside {
+                    if !aside && !press.stacked && press.above != 0 {
                         press.layer.stack(press.above);
+                        press.stacked = true;
                     }
                 }
                 true
@@ -368,7 +435,9 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
             if restacked.elapsed() >= RESTACK_EVERY && !aside {
                 restacked = Instant::now();
                 for agent in agents.values() {
-                    agent.layer.stack(agent.above);
+                    if agent.visible && agent.above != 0 {
+                        agent.layer.stack(agent.above);
+                    }
                 }
             }
         }

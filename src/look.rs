@@ -10,10 +10,10 @@ const LEAST_SIDE: i32 = 80;
 const CONTAINER_SHARE: f32 = 0.4;
 // Below this share of pixels away from the background colour, an area is plain.
 const BUSY_SHARE: f32 = 0.01;
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const MAX_TEXT_LINES: usize = 30;
 // Small text reads far better enlarged.
-#[cfg(windows)]
+#[cfg(any(windows, target_os = "linux"))]
 const OCR_SMALL: u32 = 900;
 
 /// The largest part of the window, in screen pixels, that no control on the list sits in.
@@ -88,7 +88,7 @@ impl Frame {
         (sampled - background) as f32 > sampled as f32 * BUSY_SHARE
     }
 
-    #[cfg_attr(not(windows), allow(dead_code))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub fn enlarge(&self, by: u32) -> Frame {
         let (w, h) = (self.w * by, self.h * by);
         let mut pixels = Vec::with_capacity((w * h * 4) as usize);
@@ -102,7 +102,7 @@ impl Frame {
     }
 }
 
-/// One line of text Windows read off a picture, and its box in that picture's pixels.
+/// One line of text read off a picture, and its box in that picture's pixels.
 pub struct Text {
     pub text: String,
     pub rect: (i32, i32, i32, i32),
@@ -110,6 +110,113 @@ pub struct Text {
 
 #[cfg(target_os = "macos")]
 pub use crate::mac::ocr::read_text;
+
+/// Encode a BGRA frame as a binary PPM (P6) image in memory for piping to tesseract.
+#[cfg(target_os = "linux")]
+fn to_ppm(frame: &Frame) -> Vec<u8> {
+    let header = format!("P6\n{} {}\n255\n", frame.w, frame.h);
+    let mut out = Vec::with_capacity(header.len() + (frame.w * frame.h * 3) as usize);
+    out.extend_from_slice(header.as_bytes());
+    for pixel in frame.pixels.as_chunks::<4>().0 {
+        out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
+    }
+    out
+}
+
+/// Group tesseract TSV word rows into lines with union bounding rectangles, scaling back by `by`.
+#[cfg(target_os = "linux")]
+fn parse_tesseract_tsv(tsv: &str, by: f32) -> Vec<Text> {
+    use std::collections::BTreeMap;
+    type LineKey = (i32, i32, i32, i32);
+    type LineBox = (Vec<String>, i32, i32, i32, i32);
+    // Key: (page_num, block_num, par_num, line_num) -> (words, left, top, right, bottom)
+    let mut lines: BTreeMap<LineKey, LineBox> = BTreeMap::new();
+    for (idx, row) in tsv.lines().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        let cols: Vec<&str> = row.split('\t').collect();
+        if cols.len() < 12 {
+            continue;
+        }
+        let level: i32 = match cols[0].parse() {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if level != 5 {
+            continue;
+        }
+        let word = cols[11].trim();
+        if word.is_empty() {
+            continue;
+        }
+        let conf: f32 = cols[10].parse().unwrap_or(-1.0);
+        if (0.0..20.0).contains(&conf) {
+            continue;
+        }
+        let (Ok(page), Ok(block), Ok(par), Ok(line)) = (cols[1].parse(), cols[2].parse(), cols[3].parse(), cols[4].parse()) else { continue };
+        let (Ok(left), Ok(top), Ok(w), Ok(h)) = (cols[6].parse::<i32>(), cols[7].parse::<i32>(), cols[8].parse::<i32>(), cols[9].parse::<i32>()) else { continue };
+        if w <= 0 || h <= 0 {
+            continue;
+        }
+        let entry = lines.entry((page, block, par, line)).or_insert_with(|| (Vec::new(), i32::MAX, i32::MAX, i32::MIN, i32::MIN));
+        entry.0.push(word.to_string());
+        entry.1 = entry.1.min(left);
+        entry.2 = entry.2.min(top);
+        entry.3 = entry.3.max(left + w);
+        entry.4 = entry.4.max(top + h);
+    }
+    let back = |value: i32| (value as f32 / by).round() as i32;
+    lines
+        .into_values()
+        .filter(|(words, left, _, right, _)| !words.is_empty() && right > left)
+        .take(MAX_TEXT_LINES)
+        .map(|(words, left, top, right, bottom)| Text {
+            text: words.join(" "),
+            rect: (back(left), back(top), back(right - left).max(1), back(bottom - top).max(1)),
+        })
+        .collect()
+}
+
+/// Read the text in a picture on Linux using `tesseract` if installed; returns an empty list if
+/// `tesseract` is not present so `see` stays fast and quiet.
+#[cfg(target_os = "linux")]
+pub fn read_text(frame: &Frame) -> Result<Vec<Text>, String> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+    if frame.w == 0 || frame.h == 0 {
+        return Ok(Vec::new());
+    }
+    let by = if frame.w.max(frame.h) < OCR_SMALL { 2 } else { 1 };
+    let enlarged;
+    let picture = if by > 1 {
+        enlarged = frame.enlarge(by);
+        &enlarged
+    } else {
+        frame
+    };
+    let mut child = match Command::new("tesseract")
+        .args(["stdin", "stdout", "--psm", "6", "tsv"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(child) => child,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(format!("could not run tesseract: {e}")),
+    };
+    let ppm = to_ppm(picture);
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&ppm);
+    }
+    let output = child.wait_with_output().map_err(|e| format!("tesseract failed: {e}"))?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    let tsv = String::from_utf8_lossy(&output.stdout);
+    Ok(parse_tesseract_tsv(&tsv, by as f32))
+}
 
 /// Read the text in a picture with the OCR built into Windows, in the person's own languages.
 #[cfg(windows)]
@@ -199,5 +306,25 @@ mod tests {
             drawn.pixels[at] = 0;
         }
         assert!(drawn.busy());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ppm_and_tesseract_tsv_parse_lines() {
+        let frame = Frame { w: 2, h: 1, pixels: vec![10, 20, 30, 255, 40, 50, 60, 255] };
+        let ppm = to_ppm(&frame);
+        assert_eq!(ppm, b"P6\n2 1\n255\n\x1e\x14\x0a\x3c\x32\x28");
+
+        let tsv = "level\tpage_num\tblock_num\tpar_num\tline_num\tword_num\tleft\ttop\twidth\theight\tconf\ttext\n\
+                   5\t1\t1\t1\t1\t1\t20\t40\t60\t20\t95\tHello\n\
+                   5\t1\t1\t1\t1\t2\t90\t40\t70\t20\t92\tWorld\n\
+                   5\t1\t1\t1\t2\t1\t20\t80\t40\t20\t10\tNoise\n\
+                   5\t1\t1\t1\t3\t1\t20\t120\t80\t20\t88\tSubmit\n";
+        let lines = parse_tesseract_tsv(tsv, 2.0);
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0].text, "Hello World");
+        assert_eq!(lines[0].rect, (10, 20, 70, 10));
+        assert_eq!(lines[1].text, "Submit");
+        assert_eq!(lines[1].rect, (10, 60, 40, 10));
     }
 }

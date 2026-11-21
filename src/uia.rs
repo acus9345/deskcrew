@@ -24,6 +24,7 @@ use windows::{
 const INVOKE_WAIT: Duration = Duration::from_millis(1500);
 const MAX_TEXT: i32 = 200_000;
 const MAX_DEPTH: usize = 64;
+const MAX_LIVE_NODES: usize = 4000;
 
 pub fn enter_com() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -153,13 +154,40 @@ fn say(error: windows::core::Error) -> String {
 }
 
 impl Uia {
-    /// The control with keyboard focus, if it belongs to this window's program.
-    pub fn focused_in(&self, hwnd: Hwnd) -> Option<Element> {
+    /// The control with keyboard focus, ONLY if it belongs to `hwnd` (or one of `surfaces`).
+    /// `GetFocusedElement` returns the global OS foreground focus, so we require `hwnd` (or a
+    /// surface) to be the foreground window and verify the element's ancestor root HWND matches,
+    /// preventing cross-window corruption in single-process multi-window apps (Chrome/Edge/VS Code).
+    pub fn focused_in(&self, hwnd: Hwnd, surfaces: &[Hwnd]) -> Option<Element> {
+        use windows_sys::Win32::Foundation::HWND;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
+        if !crate::win::front_is(hwnd, surfaces) {
+            return None;
+        }
         unsafe {
             let element = self.auto.GetFocusedElement().ok()?;
-            // A Store app's window belongs to ApplicationFrameHost, so match only its own app processes.
             let pid = element.CurrentProcessId().ok()? as u32;
-            crate::win::app_pids(hwnd).contains(&pid).then_some(Element(element))
+            if !crate::win::app_pids(hwnd).contains(&pid) {
+                return None;
+            }
+            // Walk up to the nearest native window handle and verify its top-level root matches.
+            let walker = self.auto.ControlViewWalker().ok();
+            let mut cur = element.clone();
+            for _ in 0..32 {
+                let native = cur.CurrentNativeWindowHandle().map(|h| h.0 as Hwnd).unwrap_or(0);
+                if native != 0 {
+                    let root = GetAncestor(native as HWND, GA_ROOT) as Hwnd;
+                    let target_root = if root != 0 { root } else { native };
+                    if target_root == hwnd || surfaces.contains(&target_root) {
+                        return Some(Element(element));
+                    }
+                    return None;
+                }
+                let Some(ref w) = walker else { break };
+                let Ok(parent) = w.GetParentElement(&cur) else { break };
+                cur = parent;
+            }
+            Some(Element(element))
         }
     }
 
@@ -178,6 +206,7 @@ impl Uia {
             for id in [
                 UIA_ControlTypePropertyId,
                 UIA_NamePropertyId,
+                UIA_HelpTextPropertyId,
                 UIA_AutomationIdPropertyId,
                 UIA_BoundingRectanglePropertyId,
                 UIA_IsEnabledPropertyId,
@@ -194,6 +223,7 @@ impl Uia {
                 UIA_IsScrollPatternAvailablePropertyId,
                 UIA_IsScrollItemPatternAvailablePropertyId,
                 UIA_IsLegacyIAccessiblePatternAvailablePropertyId,
+                UIA_IsTextPatternAvailablePropertyId,
                 UIA_ValueValuePropertyId,
                 UIA_ValueIsReadOnlyPropertyId,
                 UIA_ToggleToggleStatePropertyId,
@@ -202,6 +232,8 @@ impl Uia {
                 UIA_RangeValueValuePropertyId,
                 UIA_ScrollVerticallyScrollablePropertyId,
                 UIA_ScrollHorizontallyScrollablePropertyId,
+                UIA_LegacyIAccessibleNamePropertyId,
+                UIA_LegacyIAccessibleValuePropertyId,
             ] {
                 cache.AddProperty(id).map_err(say)?;
             }
@@ -217,8 +249,17 @@ impl Uia {
     pub fn read(&self, hwnd: Hwnd, all: bool, nodes: &mut Vec<Node>, hidden: &mut usize, quiet: &mut Vec<(i32, i32, i32, i32)>) -> Result<(), String> {
         unsafe {
             let root = self.auto.ElementFromHandle(HWND(hwnd as _)).map_err(say)?;
-            let tree = root.BuildUpdatedCache(&self.cache).map_err(say)?;
-            walk(&tree, "", 0, None, all, nodes, hidden, 0);
+            match root.BuildUpdatedCache(&self.cache) {
+                Ok(tree) => walk(&tree, "", 0, None, all, nodes, hidden, 0),
+                Err(error) => {
+                    // Large or cross-process trees (e.g. Electron/Chromium) can occasionally fail
+                    // a single subtree cache fetch; fall back to walking the control view live.
+                    let Ok(walker) = self.auto.ControlViewWalker() else {
+                        return Err(say(error));
+                    };
+                    walk_live(&walker, &root, "", 0, None, all, nodes, hidden, 0);
+                }
+            }
             if !all {
                 drop_labels(nodes, quiet);
             }
@@ -289,7 +330,15 @@ unsafe fn walk(
         if lines::skipped(kind) {
             return;
         }
-        let name = text(el.CachedName());
+        let name = {
+            let primary = text(el.CachedName());
+            if !primary.is_empty() {
+                primary
+            } else {
+                let legacy = cached_text(el, UIA_LegacyIAccessibleNamePropertyId);
+                if !legacy.is_empty() { legacy } else { cached_text(el, UIA_HelpTextPropertyId) }
+            }
+        };
         let can = Can {
             invoke: cached_bool(el, UIA_IsInvokePatternAvailablePropertyId),
             toggle: cached_bool(el, UIA_IsTogglePatternAvailablePropertyId),
@@ -306,7 +355,7 @@ unsafe fn walk(
         let scrollable = can.scroll
             && (cached_bool(el, UIA_ScrollVerticallyScrollablePropertyId) || cached_bool(el, UIA_ScrollHorizontallyScrollablePropertyId));
         let read_only = cached_bool(el, UIA_ValueIsReadOnlyPropertyId);
-        let acts = can.invoke || can.toggle || can.select || can.expand || (can.value && !read_only) || can.range;
+        let acts = can.invoke || can.toggle || can.select || can.expand || (can.value && !read_only) || can.range || (can.legacy && focusable);
 
         // Inside a row, plain text belongs to the row's own line.
         if let Some(at) = row
@@ -391,7 +440,7 @@ unsafe fn walk(
                 }
                 match cached_i32(el, UIA_ExpandCollapseExpandCollapseStatePropertyId) {
                     Some(0) if can.expand => states.push("closed"),
-                    Some(1) if can.expand => states.push("open"),
+                    Some(1 | 2) if can.expand => states.push("open"),
                     _ => {}
                 }
                 if scrollable {
@@ -401,15 +450,25 @@ unsafe fn walk(
                 if password {
                     states.push("password");
                 }
+                let has_text_pattern = cached_bool(el, UIA_IsTextPatternAvailablePropertyId);
                 let value = if password {
                     None
                 } else if can.range {
                     cached_f64(el, UIA_RangeValueValuePropertyId).map(|v| format!("{v}"))
                 } else if can.value {
                     Some(cached_text(el, UIA_ValueValuePropertyId)).filter(|v| !v.is_empty() && *v != name)
+                } else if can.legacy && matches!(role, Some("edit" | "document" | "combobox" | "slider" | "spinner")) {
+                    Some(cached_text(el, UIA_LegacyIAccessibleValuePropertyId)).filter(|v| !v.is_empty() && *v != name)
                 } else {
                     None
-                };
+                }
+                .or_else(|| {
+                    if !password && has_text_pattern && matches!(role, Some("edit" | "document")) {
+                        text_preview(el, &name)
+                    } else {
+                        None
+                    }
+                });
                 let shown = if name.is_empty() && !automation_id.is_empty() { format!("#{automation_id}") } else { name.clone() };
                 let parts = Parts {
                     role: role.map_or_else(|| lines::container_role(kind).to_string(), str::to_string),
@@ -435,6 +494,206 @@ unsafe fn walk(
         }
         let carried = if listed { name.as_str() } else { parent };
         walk_children(el, carried, kind, own, all, nodes, hidden, depth);
+    }
+}
+
+unsafe fn text_preview(el: &IUIAutomationElement, name: &str) -> Option<String> {
+    unsafe {
+        let pattern = el.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).ok()?;
+        let range = pattern.DocumentRange().ok()?;
+        let preview = text(range.GetText(120));
+        let trimmed = preview.trim();
+        (!trimmed.is_empty() && trimmed != name).then(|| trimmed.to_string())
+    }
+}
+
+unsafe fn live_bool(el: &IUIAutomationElement, id: UIA_PROPERTY_ID) -> bool {
+    unsafe { el.GetCurrentPropertyValue(id) }.ok().and_then(|v: VARIANT| bool::try_from(&v).ok()).unwrap_or(false)
+}
+
+unsafe fn live_i32(el: &IUIAutomationElement, id: UIA_PROPERTY_ID) -> Option<i32> {
+    unsafe { el.GetCurrentPropertyValue(id) }.ok().and_then(|v: VARIANT| i32::try_from(&v).ok())
+}
+
+unsafe fn live_f64(el: &IUIAutomationElement, id: UIA_PROPERTY_ID) -> Option<f64> {
+    unsafe { el.GetCurrentPropertyValue(id) }.ok().and_then(|v: VARIANT| f64::try_from(&v).ok())
+}
+
+unsafe fn live_text(el: &IUIAutomationElement, id: UIA_PROPERTY_ID) -> String {
+    unsafe { el.GetCurrentPropertyValue(id) }.ok().and_then(|v: VARIANT| BSTR::try_from(&v).ok()).map(|s| s.to_string()).unwrap_or_default()
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_live(
+    walker: &IUIAutomationTreeWalker,
+    el: &IUIAutomationElement,
+    parent: &str,
+    parent_kind: i32,
+    row: Option<usize>,
+    all: bool,
+    nodes: &mut Vec<Node>,
+    hidden: &mut usize,
+    depth: usize,
+) {
+    unsafe {
+        if depth > MAX_DEPTH || nodes.len() >= MAX_LIVE_NODES {
+            return;
+        }
+        let kind = el.CurrentControlType().map(|k| k.0).unwrap_or(0);
+        if lines::skipped(kind) {
+            return;
+        }
+        let name = {
+            let primary = text(el.CurrentName());
+            if !primary.is_empty() {
+                primary
+            } else {
+                let legacy = live_text(el, UIA_LegacyIAccessibleNamePropertyId);
+                if !legacy.is_empty() { legacy } else { live_text(el, UIA_HelpTextPropertyId) }
+            }
+        };
+        let can = Can {
+            invoke: live_bool(el, UIA_IsInvokePatternAvailablePropertyId),
+            toggle: live_bool(el, UIA_IsTogglePatternAvailablePropertyId),
+            select: live_bool(el, UIA_IsSelectionItemPatternAvailablePropertyId),
+            expand: live_bool(el, UIA_IsExpandCollapsePatternAvailablePropertyId),
+            value: live_bool(el, UIA_IsValuePatternAvailablePropertyId),
+            range: live_bool(el, UIA_IsRangeValuePatternAvailablePropertyId),
+            scroll: live_bool(el, UIA_IsScrollPatternAvailablePropertyId),
+            scroll_item: live_bool(el, UIA_IsScrollItemPatternAvailablePropertyId),
+            legacy: live_bool(el, UIA_IsLegacyIAccessiblePatternAvailablePropertyId),
+        };
+        let off = flag(el.CurrentIsOffscreen());
+        let focusable = flag(el.CurrentIsKeyboardFocusable());
+        let scrollable = can.scroll
+            && (live_bool(el, UIA_ScrollVerticallyScrollablePropertyId) || live_bool(el, UIA_ScrollHorizontallyScrollablePropertyId));
+        let read_only = live_bool(el, UIA_ValueIsReadOnlyPropertyId);
+        let acts = can.invoke || can.toggle || can.select || can.expand || (can.value && !read_only) || can.range || (can.legacy && focusable);
+
+        if let Some(at) = row
+            && !acts && !focusable {
+                let shown = if name.is_empty() { live_text(el, UIA_ValueValuePropertyId) } else { name.clone() };
+                if !shown.is_empty() && shown != parent && !nodes[at].parts.cells.contains(&shown) {
+                    nodes[at].parts.cells.push(shown);
+                }
+                walk_live_children(walker, el, &name, kind, row, all, nodes, hidden, depth);
+                return;
+            }
+
+        let role = lines::role(kind);
+        let fitting = !all
+            && ((role == Some("button") && matches!(parent_kind, 50003 | 50016))
+                || (kind == 50016 && !can.value && !can.range)
+                || (kind == 50003 && !can.value && !can.expand && !can.range));
+        let listed = match role {
+            Some("") => !name.is_empty() && name != parent,
+            Some("image") => acts && !name.is_empty(),
+            Some(_) => true,
+            None => acts || scrollable || matches!(kind, 50028 | 50036),
+        } && !fitting;
+
+        let mut own = row;
+        if listed {
+            if off && !all {
+                *hidden += 1;
+            } else {
+                let control_id = text(el.CurrentAutomationId());
+                let automation_id = Some(control_id.clone()).filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default();
+                if lines::is_window_chrome(&automation_id) {
+                    walk_live_children(walker, el, parent, kind, row, all, nodes, hidden, depth);
+                    return;
+                }
+                let mut states = Vec::new();
+                if !flag(el.CurrentIsEnabled()) {
+                    states.push("disabled");
+                }
+                match live_i32(el, UIA_ToggleToggleStatePropertyId) {
+                    Some(0) if can.toggle => states.push("off"),
+                    Some(1) if can.toggle => states.push("on"),
+                    Some(2) if can.toggle => states.push("mixed"),
+                    _ => {}
+                }
+                if can.select && live_bool(el, UIA_SelectionItemIsSelectedPropertyId) {
+                    states.push("selected");
+                }
+                match live_i32(el, UIA_ExpandCollapseExpandCollapseStatePropertyId) {
+                    Some(0) if can.expand => states.push("closed"),
+                    Some(1 | 2) if can.expand => states.push("open"),
+                    _ => {}
+                }
+                if scrollable {
+                    states.push("scroll");
+                }
+                let password = flag(el.CurrentIsPassword());
+                if password {
+                    states.push("password");
+                }
+                let has_text_pattern = live_bool(el, UIA_IsTextPatternAvailablePropertyId);
+                let value = if password {
+                    None
+                } else if can.range {
+                    live_f64(el, UIA_RangeValueValuePropertyId).map(|v| format!("{v}"))
+                } else if can.value {
+                    Some(live_text(el, UIA_ValueValuePropertyId)).filter(|v| !v.is_empty() && *v != name)
+                } else if can.legacy && matches!(role, Some("edit" | "document" | "combobox" | "slider" | "spinner")) {
+                    Some(live_text(el, UIA_LegacyIAccessibleValuePropertyId)).filter(|v| !v.is_empty() && *v != name)
+                } else {
+                    None
+                }
+                .or_else(|| {
+                    if !password && has_text_pattern && matches!(role, Some("edit" | "document")) {
+                        text_preview(el, &name)
+                    } else {
+                        None
+                    }
+                });
+                let shown = if name.is_empty() && !automation_id.is_empty() { format!("#{automation_id}") } else { name.clone() };
+                let parts = Parts {
+                    role: role.map_or_else(|| lines::container_role(kind).to_string(), str::to_string),
+                    name: shown,
+                    value,
+                    states,
+                    cells: Vec::new(),
+                };
+                nodes.push(Node {
+                    runtime: runtime_id(el),
+                    identity: format!("{kind}|{automation_id}|{name}"),
+                    control_id,
+                    parts,
+                    rect: el.CurrentBoundingRectangle().map(rect_of).unwrap_or_default(),
+                    native: el.CurrentNativeWindowHandle().map(|h| h.0 as Hwnd).unwrap_or(0),
+                    can,
+                    element: Element(el.clone()),
+                });
+                if lines::is_row(kind) {
+                    own = Some(nodes.len() - 1);
+                }
+            }
+        }
+        let carried = if listed { name.as_str() } else { parent };
+        walk_live_children(walker, el, carried, kind, own, all, nodes, hidden, depth);
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn walk_live_children(
+    walker: &IUIAutomationTreeWalker,
+    el: &IUIAutomationElement,
+    parent: &str,
+    parent_kind: i32,
+    row: Option<usize>,
+    all: bool,
+    nodes: &mut Vec<Node>,
+    hidden: &mut usize,
+    depth: usize,
+) {
+    unsafe {
+        let Ok(mut child) = walker.GetFirstChildElement(el) else { return };
+        loop {
+            walk_live(walker, &child, parent, parent_kind, row, all, nodes, hidden, depth + 1);
+            let Ok(next) = walker.GetNextSiblingElement(&child) else { break };
+            child = next;
+        }
     }
 }
 
@@ -705,6 +964,53 @@ impl Element {
     /// What is in a field right now, and nothing else: an empty field gives an empty string.
     pub fn value_text(&self) -> String {
         unsafe { self.0.GetCurrentPropertyValue(UIA_ValueValuePropertyId) }.ok().and_then(|v| BSTR::try_from(&v).ok()).map(|s| s.to_string()).unwrap_or_default()
+    }
+
+    /// Editable field content from ValuePattern or TextPattern (without falling back to a
+    /// placeholder `Name`), so contenteditable web boxes like Gemini's prompt can be verified.
+    pub fn field_text(&self) -> Option<String> {
+        unsafe {
+            if let Ok(value) = self.0.GetCurrentPropertyValue(UIA_ValueValuePropertyId)
+                && let Ok(text) = BSTR::try_from(&value)
+            {
+                return Some(text.to_string());
+            }
+            if let Ok(pattern) = self.0.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                && let Ok(body) = pattern.DocumentRange().and_then(|r| r.GetText(MAX_TEXT))
+            {
+                return Some(body.to_string().trim_end_matches(['\r', '\n']).to_string());
+            }
+            None
+        }
+    }
+
+    /// Currently selected text inside this control via UIA TextPattern, with no keyboard or focus.
+    pub fn selected_text(&self) -> Option<String> {
+        unsafe {
+            let pattern = self.0.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).ok()?;
+            let selection = pattern.GetSelection().ok()?;
+            let count = selection.Length().ok()?;
+            let mut out = String::new();
+            for at in 0..count {
+                if let Ok(range) = selection.GetElement(at)
+                    && let Ok(piece) = range.GetText(MAX_TEXT)
+                {
+                    out.push_str(&piece.to_string());
+                }
+            }
+            (!out.is_empty()).then_some(out)
+        }
+    }
+
+    /// Select all text in this control via UIA TextPattern without needing keyboard focus.
+    pub fn select_all(&self) -> bool {
+        unsafe {
+            self.0
+                .GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId)
+                .and_then(|p| p.DocumentRange())
+                .and_then(|r| r.Select())
+                .is_ok()
+        }
     }
 
     /// All of a control's text: its document, then its value, then its name.
