@@ -1915,7 +1915,7 @@ impl Service {
             && chord.modified
             && chord.keys.len() == 2
             && chord.keys[0].0 == windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL)
-            .then_some(chord.keys[1].0 as u8);
+            .then(|| chord.keys[1].0 as u8);
         let clip_before = matches!(ctrl_letter, Some(b'C' | b'X')).then(apps::clipboard_seq);
         let focused_before = matches!(ctrl_letter, Some(b'C' | b'X' | b'A' | b'V'))
             .then(|| self.uia.focused_in(tracked.hwnd, &view.surfaces))
