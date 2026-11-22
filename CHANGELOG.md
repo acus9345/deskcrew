@@ -6,6 +6,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.30] - 2026-11-22
+
+- **Quiet mode:** `deskcrew quiet on` (or `DESKCREW_QUIET`) refuses everything that takes focus or real input: `focus`, `down`, `--real`, `--mouse`, `launch --front`, the pen, and Win+... shortcuts that open shell UI, even with `--force` or inside `do`. Background clicks, typing and drawing by window messages keep working.
+- **Background input in more apps (Windows):** covered Chrome, Edge, Electron, WebView2 and CEF windows take clicks and typing more reliably; classic Edit controls get copy, cut, paste and undo without any focus change; Krita and other Qt apps no longer have focus pulled or their title bar flashed.
+- **Clipboard safety everywhere:** agents take turns lending the clipboard, and it is always put back, even after an error.
+- **Focus recovery:** if an app steals focus during an action, the window you had is given back, unless you switched apps yourself in the meantime.
+- **Mac:** window pictures through ScreenCaptureKit, without the drop shadow, so x,y in a shot match clicks; better accessibility in Chrome and Electron apps; tables, scroll bars, notifications and selected text; `pick-file` for Save dialogs too.
+- **Linux:** covered X11 windows take input by sent events, windows can be pictured while covered (XComposite), text in pictures is read with Tesseract when installed, and on Wayland pictures and pointer input go through the desktop portal after a one-time consent.
+- **Fixed:** a one-key `key` (such as `key tab`) crashed the service.
+- Idle overlays no longer restack their windows over and over.
+
 ## [0.1.29] - 2026-11-19
 
 - **Cursor grants tied to the calling program (Windows):** "this session" and "always" cursor permissions now follow the calling agent's actual process and executable path rather than the self-reported `--agent` name. The prompt shows the real program alongside the agent name when they differ, and older name-only `always` lines in `cursor.txt` ask to be confirmed once.
