@@ -21,7 +21,7 @@ expect "primary" screens
 expect "First Text View" see TextEdit
 expect "from deskcrew" do "type 'hello from deskcrew'" -w TextEdit
 # Typing opens untitled panels in TextEdit: the window being worked in must still be the one picked.
-expect "from deskcrew" get e1 -w TextEdit
+expect "from deskcrew" get "First Text View" -w TextEdit
 run shot TextEdit
 expect "ok" clip set "deskcrew clip"
 expect "deskcrew clip" clip
@@ -38,7 +38,7 @@ osascript -l JavaScript -e "$board board.clearContents; board.setDataForType(\$.
 before=$(osascript -l JavaScript -e "$board board.dataForType('public.png').length" 2>&1)
 echo "picture on the clipboard before the paste: $before bytes"
 expect "paste" type " pasted" --paste -w TextEdit
-expect "pasted" get e1 -w TextEdit
+expect "pasted" get "First Text View" -w TextEdit
 after=$(osascript -l JavaScript -e "$board board.dataForType('public.png').length" 2>&1)
 echo "picture on the clipboard after the paste: $after bytes"
 if [ -z "$before" ] || [ "$before" = "0" ] || [ "$after" != "$before" ]; then echo "FAILED: the clipboard picture was not put back"; failed=1; fi
