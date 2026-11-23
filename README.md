@@ -1,6 +1,6 @@
 # deskcrew
 
-**Windows, with early macOS and Linux (X11 / Xvfb) versions; Wayland is not supported.** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
+**Windows, with early macOS and Linux versions (X11 and Xvfb in full; Wayland through accessibility and the desktop portal).** Every coding agent gets its own cursor on your desktop, works in the background, and costs very few tokens.
 ![Three agents draw a house, fill in an order form and type a note at the same time, each with its own cursor](https://raw.githubusercontent.com/acus9345/deskcrew/main/demo/deskcrew-demo.gif)
 
 Agents act through Windows accessibility and window messages, so your cursor stays yours. A few kinds of app take neither, and get a synthetic pen that brings their window forward for the stroke and puts your pointer back afterwards. Each agent appears as a drawn cursor in its own brand's colours with its name beside it: Claude in orange, Codex in ChatGPT green, Antigravity in dark navy, and so on. The cursor glides to a control along a curve, leaning into the move, and the control lights up with an outline in that colour when it is pressed. While an agent types, its cursor becomes a caret that follows the text. Agents work side by side while you keep working, even while you use another app full screen.
@@ -109,7 +109,7 @@ macOS asks once for Accessibility permission, and again for Screen Recording the
 
 Most commands and flags now match Windows: `check`, `uncheck`, `toggle`, `expand`, `collapse`, `clear`, `is`, `select`, `hover`, `show`, `draw`, `drag`, `down` and `up` for modifier keys, `place`, `focus`, `close`, `screens`, `apps`, `clip`, `shot --screen`, `do --dry` and `--risk`, `wait --gone`, `type --paste`, `--fast`, `--with`, and middle, back, forward and triple clicks. `--real` brings the app forward for a moment and sends keys through the system, then gives the front back.
 
-Not on the Mac yet: `table`, `pick-file`, sideways `scroll`, `click --hold`, `--mouse` and borrowing the cursor, holding a mouse button, `notifications` and the demo. On a Mac, `down` holds modifier keys only, and they apply to that agent's later clicks and keys in that app.
+Not on the Mac yet: sideways `scroll`, `click --hold`, `--mouse` and borrowing the cursor, holding a mouse button, and the demo. `table`, `notifications` and `pick-file` (Open and Save dialogs) work. On a Mac, `down` holds modifier keys only, and they apply to that agent's later clicks and keys in that app.
 
 ```text
 $ deskcrew see Calculator
@@ -129,7 +129,7 @@ For one run, a session keeps a fuller record. `deskcrew session start "order tes
 
 ## Linux (X11 / Xvfb)
 
-**Linux (X11 / Xvfb); Wayland not supported.** Wayland does not let one app read or drive another's windows, so on a Wayland session deskcrew says so and stops. Log in to an X11 (Xorg) session, or run the apps on a virtual display such as Xvfb, which is how agents on cloud machines and in CI usually work.
+**Linux: X11 and Xvfb in full; Wayland in part.** On X11 (a desktop session, or a virtual display such as Xvfb, which is how agents on cloud machines and in CI usually work) every command works. On Wayland, which does not let one app drive another's windows directly, controls are still read and acted on through AT-SPI (`windows`, `see`, `get`, `set`, `check`, `select`, pressing controls, scroll bars, tables, notifications), and pictures, pointer input, `drag` and `draw` go through the desktop portal after you consent once. Window placement and global keys still need X11.
 
 The Linux version is the newest and least tried. CI runs it on Ubuntu under Xvfb on every push, against a GTK window and against a toolkit-free test window (`examples/linux_form.rs`) on a bare accessibility bus.
 
@@ -344,6 +344,8 @@ Agents in one window take turns, because an app has one mouse state and one text
 
 **Ctrl+Alt+Esc** stops every agent. Reading still works, and work resumes with `deskcrew resume`. Shortcuts such as Alt+F4 and Win+R are refused without `--force`.
 
+**Quiet mode.** `deskcrew quiet on` (or `DESKCREW_QUIET=1` in the environment the service starts in) keeps every agent in the background: anything that would take focus or real input is refused, namely `focus`, `down`, `--real`, `--mouse`, `launch --front`, the pen, and Win+... shortcuts that open shell UI, even with `--force` and inside `do`. Background clicks, typing and drawing by window messages still work. `deskcrew quiet off` turns it off.
+
 ## Tests
 
 ```bash
@@ -377,7 +379,7 @@ desk-pilot always moved your real pointer; deskcrew only does with `--real` or `
 ## Limits
 
 - The Windows version is the tested one. The macOS version has run only on GitHub's Mac runners, against TextEdit (see [macOS](#macos)), and the Linux one only in CI, under Xvfb (see [Linux](#linux-x11--xvfb)).
-- On a Mac, pictures use `CGWindowListCreateImage`, which Apple has deprecated. A future macOS may stop it working, and then pictures would need ScreenCaptureKit.
+- On a Mac, window pictures use ScreenCaptureKit without the drop shadow, so x,y in a shot match clicks. Where that is not available, deskcrew falls back to `CGWindowListCreateImage`, which Apple has deprecated.
 - On a Mac, typed text goes out as key events carrying the characters. An app that reads key codes instead may get the wrong letters.
 - `notifications`, `down` and `--real` take focus, so they can interrupt what you are doing. A key held with `down` reaches whichever window has focus, and is let go after 30 s, on `quit` and on Ctrl+Alt+Esc. If deskcrew is killed outright it stays down until you press that key.
 - `--real` typing stops if focus leaves the window, and reports how much it had typed.
