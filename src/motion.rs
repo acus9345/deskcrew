@@ -33,7 +33,7 @@ const HEAD_FULL: f32 = 600.0;
 pub const LEAN_MOST: f32 = 160.0;
 const LEAN_MS: f32 = 110.0;
 /// Straightening up again is gentler than turning, so the arrow settles instead of snapping back.
-const LEAN_BACK_MS: f32 = 260.0;
+const LEAN_BACK_MS: f32 = 340.0;
 /// The lean is drawn in steps this fine, in degrees.
 const LEAN_STEPS_PER_DEGREE: f32 = 4.0;
 /// Where the resting arrow points, from the middle of its back to its tip: up and to the left.
