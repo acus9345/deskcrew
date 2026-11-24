@@ -21,11 +21,13 @@ const MS_PER_PIXEL: f32 = 0.4;
 const BOW: f32 = 0.2;
 /// The speed curve: a quick start, then a long gentle settle onto the target.
 const EASE: [f32; 4] = [0.3, 0.0, 0.1, 1.0];
-/// How far the arrow leans per pixel a second of sideways speed on a 100% screen, the most it
-/// leans either way, and how quickly it follows the speed, in milliseconds.
+/// How far the arrow leans per pixel a second of speed on a 100% screen, the most it leans either
+/// way, and how quickly it follows the speed, in milliseconds.
 const LEAN_PER_SPEED: f32 = 0.035;
 pub const LEAN_MOST: f32 = 32.0;
 const LEAN_MS: f32 = 130.0;
+/// Where the resting arrow points, from the middle of its back to its tip: up and to the left.
+const POINTING: (f32, f32) = (-6.7, -10.0);
 /// Each key typed pulls the name tag in a little and lets it spring back: how far, how long the
 /// pull takes, how long it holds, how long it takes back, how far apart pulses start, and the most
 /// pulses one piece of typing shows.
@@ -56,12 +58,28 @@ pub fn ease(t: f32) -> f32 {
     curve(y1, y2, (low + high) / 2.0)
 }
 
-/// How the cursor holds itself: the arrow leans into sideways travel, and the tag pulses as keys
-/// are typed.
+/// How the cursor holds itself: the arrow turns toward where it is heading, and the tag pulses as
+/// keys are typed.
 pub struct Pose {
     pub lean: f32,
     last: Option<(Instant, Point)>,
     typing: Option<(Instant, usize)>,
+}
+
+/// The lean, in degrees clockwise, that turns the arrow toward this velocity in pixels a second:
+/// more the faster it goes, never past the direction itself or LEAN_MOST. Heading straight back
+/// from the tip, either way round would do, so it fades out there instead of flipping.
+fn lean_toward(velocity: (f32, f32)) -> f32 {
+    let speed = velocity.0.hypot(velocity.1);
+    if speed < 1.0 {
+        return 0.0;
+    }
+    let cross = POINTING.0 * velocity.1 - POINTING.1 * velocity.0;
+    let dot = POINTING.0 * velocity.0 + POINTING.1 * velocity.1;
+    let turn = cross.atan2(dot).to_degrees();
+    let backward = (turn.abs() / 180.0).powi(4);
+    let size = (speed * LEAN_PER_SPEED).min(LEAN_MOST).min(turn.abs()) * (1.0 - backward);
+    size.copysign(turn)
 }
 
 impl Pose {
@@ -74,8 +92,8 @@ impl Pose {
         if let Some((then, was)) = self.last {
             let seconds = now.duration_since(then).as_secs_f32();
             if seconds > 0.0 {
-                let speed = (at.0 - was.0) / seconds / scale.max(1.0);
-                let wanted = (speed * LEAN_PER_SPEED).clamp(-LEAN_MOST, LEAN_MOST);
+                let per = seconds * scale.max(1.0);
+                let wanted = lean_toward(((at.0 - was.0) / per, (at.1 - was.1) / per));
                 self.lean += (wanted - self.lean) * (1.0 - (-seconds * 1000.0 / LEAN_MS).exp());
                 if wanted == 0.0 && self.lean.abs() < 0.15 {
                     self.lean = 0.0;
@@ -694,7 +712,7 @@ mod tests {
     }
 
     #[test]
-    fn the_arrow_leans_into_sideways_travel_and_straightens_when_it_stops() {
+    fn the_arrow_turns_toward_where_it_heads_and_straightens_when_it_stops() {
         let mut pose = Pose::new();
         let start = Instant::now();
         let frame = |i: u64| start + Duration::from_millis(16 * i);
@@ -714,12 +732,21 @@ mod tests {
         }
         assert_eq!(pose.lean, 0.0);
         assert!(!still);
-        // Straight down does not lean at all.
+        // Down turns the tip toward down, counter-clockwise; up turns it clockwise until it points
+        // straight up, about 34 degrees from where it rests.
         let mut down = Pose::new();
         for i in 0..30 {
             down.follow(frame(i), (0.0, i as f32 * 24.0), 1.0);
         }
-        assert_eq!(down.lean, 0.0);
+        assert!(down.lean < -15.0, "{}", down.lean);
+        let mut up = Pose::new();
+        for i in 0..30 {
+            up.follow(frame(i), (0.0, -(i as f32) * 24.0), 1.0);
+        }
+        assert!(up.lean > 25.0 && up.lean < 34.0, "{}", up.lean);
+        // Along the way it already points, or straight back from the tip, it stays upright.
+        assert_eq!(lean_toward((-670.0, -1000.0)).round(), 0.0);
+        assert!(lean_toward((670.0, 1000.0)).abs() < 1.0);
     }
 
     #[test]
