@@ -18,9 +18,11 @@ const RAMP_SLOWS: f32 = 1.4;
 pub const WORDS_PER_MINUTE: u64 = 600;
 pub const KEY_EVERY: Duration = Duration::from_millis(60_000 / (WORDS_PER_MINUTE * 5));
 
-const MIN_TRAVEL_MS: f32 = 160.0;
-const MAX_TRAVEL_MS: f32 = 560.0;
-const MS_PER_PIXEL: f32 = 0.4;
+/// How long a move takes, as on qlinter.org: twice deskcrew's old 160 ms + 0.4 ms a pixel, at most
+/// 1120 ms.
+const MIN_TRAVEL_MS: f32 = 320.0;
+const MAX_TRAVEL_MS: f32 = 1120.0;
+const MS_PER_PIXEL: f32 = 0.8;
 /// How far the path's middle bends out, as a share of its length.
 const BOW: f32 = 0.2;
 /// The speed curve: a quick start, then a long gentle settle onto the target.
@@ -32,8 +34,8 @@ const HEAD_FROM: f32 = 40.0;
 const HEAD_FULL: f32 = 600.0;
 pub const LEAN_MOST: f32 = 160.0;
 const LEAN_MS: f32 = 110.0;
-/// Straightening up again is gentler than turning, so the arrow settles instead of snapping back.
-const LEAN_BACK_MS: f32 = 340.0;
+/// How quickly the arrow straightens up again: the same as it turns, as on qlinter.org.
+const LEAN_BACK_MS: f32 = 110.0;
 /// The lean is drawn in steps this fine, in degrees.
 const LEAN_STEPS_PER_DEGREE: f32 = 4.0;
 /// Where the resting arrow points, from the middle of its back to its tip: up and to the left.
@@ -757,9 +759,9 @@ mod tests {
 
     #[test]
     fn short_hops_are_quick_and_long_ones_are_capped() {
-        assert_eq!(travel_ms((0.0, 0.0), (0.0, 0.0)), 160);
-        assert_eq!(travel_ms((0.0, 0.0), (100.0, 0.0)), 200);
-        assert_eq!(travel_ms((0.0, 0.0), (2560.0, 1600.0)), 560);
+        assert_eq!(travel_ms((0.0, 0.0), (0.0, 0.0)), 320);
+        assert_eq!(travel_ms((0.0, 0.0), (100.0, 0.0)), 400);
+        assert_eq!(travel_ms((0.0, 0.0), (2560.0, 1600.0)), 1120);
     }
 
     #[test]
