@@ -32,6 +32,10 @@ const HEAD_FROM: f32 = 40.0;
 const HEAD_FULL: f32 = 600.0;
 pub const LEAN_MOST: f32 = 160.0;
 const LEAN_MS: f32 = 110.0;
+/// Straightening up again is gentler than turning, so the arrow settles instead of snapping back.
+const LEAN_BACK_MS: f32 = 260.0;
+/// The lean is drawn in steps this fine, in degrees.
+const LEAN_STEPS_PER_DEGREE: f32 = 4.0;
 /// Where the resting arrow points, from the middle of its back to its tip: up and to the left.
 const POINTING: (f32, f32) = (-6.7, -10.0);
 /// Each key typed pulls the name tag in a little and lets it spring back: how far, how long the
@@ -98,8 +102,10 @@ impl Pose {
             if seconds > 0.0 {
                 let per = seconds * scale.max(1.0);
                 let wanted = lean_toward(((at.0 - was.0) / per, (at.1 - was.1) / per));
-                self.lean += (wanted - self.lean) * (1.0 - (-seconds * 1000.0 / LEAN_MS).exp());
-                if wanted == 0.0 && self.lean.abs() < 0.15 {
+                let settling = wanted.abs() < self.lean.abs();
+                let pace = if settling { LEAN_BACK_MS } else { LEAN_MS };
+                self.lean += (wanted - self.lean) * (1.0 - (-seconds * 1000.0 / pace).exp());
+                if wanted == 0.0 && self.lean.abs() < 0.05 {
                     self.lean = 0.0;
                 }
             }
@@ -153,13 +159,13 @@ impl Pose {
 
     /// The pose rounded to what shows, so a frame that looks the same is not drawn again.
     pub fn look(&self, now: Instant) -> (i32, i32) {
-        ((self.lean * 2.0).round() as i32, ((1.0 - self.squeeze(now)) * 400.0).round() as i32)
+        ((self.lean * LEAN_STEPS_PER_DEGREE).round() as i32, ((1.0 - self.squeeze(now)) * 400.0).round() as i32)
     }
 
     /// The pose as drawn: lean in degrees and the tag's size.
     pub fn shown(&self, now: Instant) -> (f32, f32) {
         let (lean, pull) = self.look(now);
-        (lean as f32 / 2.0, 1.0 - pull as f32 / 400.0)
+        (lean as f32 / LEAN_STEPS_PER_DEGREE, 1.0 - pull as f32 / 400.0)
     }
 }
 
@@ -783,7 +789,7 @@ mod tests {
         assert!(pose.lean < -15.0, "{}", pose.lean);
         // Standing still, it settles back to upright and says so.
         let mut still = true;
-        for i in 60..120 {
+        for i in 60..240 {
             still = pose.follow(frame(i), (0.0, 0.0), 1.0);
         }
         assert_eq!(pose.lean, 0.0);
