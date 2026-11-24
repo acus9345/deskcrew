@@ -5,10 +5,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
-// How far apart stroke points are, and how fast a stroke is drawn.
+// How far apart stroke points are, and how fast a stroke is drawn on average, as on qlinter.org.
 const STEP_PIXELS: f32 = 6.0;
-#[cfg_attr(not(windows), allow(dead_code))]
-const PIXELS_PER_SECOND: f32 = 1000.0;
+pub const PIXELS_PER_SECOND: f32 = 504.0;
+/// The handwriting rhythm: how much slower a stroke goes per degree of turn per pixel, how much
+/// of each end eases in or out, and how much slower the very ends are.
+const CURVE_SLOWS: f32 = 22.0;
+const RAMP_SHARE: f32 = 0.1;
+const RAMP_SLOWS: f32 = 1.4;
 
 /// How fast every kind of typing goes: 600 words a minute, at five letters to a word.
 pub const WORDS_PER_MINUTE: u64 = 600;
@@ -21,11 +25,13 @@ const MS_PER_PIXEL: f32 = 0.4;
 const BOW: f32 = 0.2;
 /// The speed curve: a quick start, then a long gentle settle onto the target.
 const EASE: [f32; 4] = [0.3, 0.0, 0.1, 1.0];
-/// How far the arrow leans per pixel a second of speed on a 100% screen, the most it leans either
-/// way, and how quickly it follows the speed, in milliseconds.
-const LEAN_PER_SPEED: f32 = 0.12;
-pub const LEAN_MOST: f32 = 150.0;
-const LEAN_MS: f32 = 130.0;
+/// The arrow turns toward where it heads, as on qlinter.org: not at all below this speed, fully
+/// from this speed, in pixels a second on a 100% screen, at most this far either way, and how
+/// quickly it follows, in milliseconds.
+const HEAD_FROM: f32 = 40.0;
+const HEAD_FULL: f32 = 600.0;
+pub const LEAN_MOST: f32 = 160.0;
+const LEAN_MS: f32 = 110.0;
 /// Where the resting arrow points, from the middle of its back to its tip: up and to the left.
 const POINTING: (f32, f32) = (-6.7, -10.0);
 /// Each key typed pulls the name tag in a little and lets it spring back: how far, how long the
@@ -67,19 +73,17 @@ pub struct Pose {
 }
 
 /// The lean, in degrees clockwise, that turns the arrow toward this velocity in pixels a second:
-/// more the faster it goes, never past the direction itself or LEAN_MOST. Heading straight back
-/// from the tip, either way round would do, so it fades out there instead of flipping.
+/// the turn from where it rests to the way it heads, at most LEAN_MOST, in full from HEAD_FULL
+/// and in part below it, and none at all under HEAD_FROM.
 fn lean_toward(velocity: (f32, f32)) -> f32 {
     let speed = velocity.0.hypot(velocity.1);
-    if speed < 1.0 {
+    if speed <= HEAD_FROM {
         return 0.0;
     }
     let cross = POINTING.0 * velocity.1 - POINTING.1 * velocity.0;
     let dot = POINTING.0 * velocity.0 + POINTING.1 * velocity.1;
     let turn = cross.atan2(dot).to_degrees();
-    let backward = (turn.abs() / 180.0).powi(16);
-    let size = (speed * LEAN_PER_SPEED).min(LEAN_MOST).min(turn.abs()) * (1.0 - backward);
-    size.copysign(turn)
+    turn.clamp(-LEAN_MOST, LEAN_MOST) * (speed / HEAD_FULL).min(1.0)
 }
 
 impl Pose {
@@ -162,6 +166,9 @@ impl Pose {
 /// The middle of a slightly curved path, so travel never looks ruled.
 pub fn bow(from: Point, to: Point, side: f32) -> Point {
     let (dx, dy) = (to.0 - from.0, to.1 - from.1);
+    // A mostly sideways move arcs up over what lies between, as on qlinter.org; a mostly upright
+    // one bows to the side it is given.
+    let side = if dx.abs() > dy.abs() { -dx.signum() } else { side };
     ((from.0 + to.0) / 2.0 - dy * BOW * side, (from.1 + to.1) / 2.0 + dx * BOW * side)
 }
 
@@ -264,7 +271,55 @@ pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
     out
 }
 
-/// Visit each point of a stroke on schedule, at a steady speed. False if stopped on the way.
+/// When to reach each point of a stroke, in seconds from its start, with a handwriting rhythm as
+/// on qlinter.org: on average `speed` pixels a second, slower where the stroke turns, and easing
+/// in and out over its first and last tenth.
+pub fn schedule(path: &[(f32, f32)], speed: f32) -> Vec<f32> {
+    let count = path.len();
+    if count < 2 {
+        return vec![0.0; count];
+    }
+    let length = |a: (f32, f32), b: (f32, f32)| (b.0 - a.0).hypot(b.1 - a.1);
+    let segments: Vec<f32> = (0..count).map(|i| if i == 0 { 0.0 } else { length(path[i - 1], path[i]) }).collect();
+    let total: f32 = segments.iter().sum();
+    if total <= 0.0 {
+        return vec![0.0; count];
+    }
+    // How sharply the stroke turns at each point, per pixel, then smoothed over its neighbours.
+    let bend: Vec<f32> = (0..count)
+        .map(|i| {
+            if i == 0 || i + 1 == count || segments[i] <= 0.0 || segments[i + 1] <= 0.0 {
+                return 0.0;
+            }
+            let (a, b, c) = (path[i - 1], path[i], path[i + 1]);
+            let (before, after) = ((b.1 - a.1).atan2(b.0 - a.0), (c.1 - b.1).atan2(c.0 - b.0));
+            let mut turn = (after - before).abs();
+            if turn > std::f32::consts::PI {
+                turn = 2.0 * std::f32::consts::PI - turn;
+            }
+            turn / segments[i].max(1e-3)
+        })
+        .collect();
+    let smooth = |i: usize| {
+        let (low, high) = (i.saturating_sub(4), (i + 4).min(count - 1));
+        bend[low..=high].iter().sum::<f32>() / (high - low + 1) as f32
+    };
+    let ramp = |x: f32| {
+        let k = (x / RAMP_SHARE).clamp(0.0, 1.0);
+        1.0 + RAMP_SLOWS * (1.0 - k * k * (3.0 - 2.0 * k))
+    };
+    let mut times = vec![0.0f32; count];
+    let mut along = 0.0;
+    for i in 1..count {
+        along += segments[i];
+        let share = along / total;
+        times[i] = times[i - 1] + segments[i] * (1.0 + CURVE_SLOWS * smooth(i)) * ramp(share) * ramp(1.0 - share);
+    }
+    let scale = total / speed / times[count - 1].max(1e-6);
+    times.iter().map(|t| t * scale).collect()
+}
+
+/// Visit each point of a stroke on its handwriting schedule. False if stopped on the way.
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, visit: impl FnMut(usize, i32, i32)) -> bool {
     pace_at(path, PIXELS_PER_SECOND, stop, visit)
@@ -273,11 +328,12 @@ pub fn pace(path: &[(f32, f32)], stop: &AtomicBool, visit: impl FnMut(usize, i32
 /// `pace` at another speed, in pixels a second.
 pub fn pace_at(path: &[(f32, f32)], speed: f32, stop: &AtomicBool, mut visit: impl FnMut(usize, i32, i32)) -> bool {
     let started = Instant::now();
+    let due_at = schedule(path, speed);
     for (at, point) in path.iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return false;
         }
-        let due = Duration::from_secs_f32(at as f32 * STEP_PIXELS / speed);
+        let due = Duration::from_secs_f32(due_at[at]);
         while let Some(left) = due.checked_sub(started.elapsed()) {
             if left > Duration::from_millis(2) {
                 thread::sleep(left - Duration::from_millis(2));
@@ -744,9 +800,12 @@ mod tests {
             up.follow(frame(i), (0.0, -(i as f32) * 24.0), 1.0);
         }
         assert!(up.lean > 25.0 && up.lean < 34.0, "{}", up.lean);
-        // Along the way it already points, or straight back from the tip, it stays upright.
+        // Along the way it already points it stays upright; slow moves do not turn it; the turn
+        // grows with speed up to 600 pixels a second, and never passes LEAN_MOST.
         assert_eq!(lean_toward((-670.0, -1000.0)).round(), 0.0);
-        assert!(lean_toward((670.0, 1000.0)).abs() < 1.0);
+        assert_eq!(lean_toward((30.0, 0.0)), 0.0);
+        assert!((lean_toward((300.0, 0.0)) - lean_toward((600.0, 0.0)) / 2.0).abs() < 0.01);
+        assert!(lean_toward((670.0, 1000.0)).abs() <= LEAN_MOST);
     }
 
     #[test]
@@ -771,8 +830,30 @@ mod tests {
         let middle = bow(from, to, 1.0);
         assert_eq!(along(from, middle, to, 0.0), from);
         assert_eq!(along(from, middle, to, 1.0), to);
-        assert!(along(from, middle, to, 0.5).1 > 20.0);
+        // A sideways move arcs up whichever side it is given, going right or left.
+        assert!(along(from, middle, to, 0.5).1 < 20.0);
         assert!(bow(from, to, -1.0).1 < 20.0);
+        assert!(bow(to, from, 1.0).1 < 20.0);
+        // An upright move bows to the side it is given.
+        let (top, bottom) = ((50.0, 0.0), (50.0, 400.0));
+        assert!(bow(top, bottom, 1.0).0 < 50.0 && bow(top, bottom, -1.0).0 > 50.0);
+    }
+
+    #[test]
+    fn strokes_keep_a_handwriting_rhythm() {
+        // A straight stroke takes its length over the average speed, and its ends go slower.
+        let line: Vec<(f32, f32)> = (0..=100).map(|i| (i as f32 * 6.0, 0.0)).collect();
+        let due = schedule(&line, PIXELS_PER_SECOND);
+        assert_eq!(due[0], 0.0);
+        assert!((due[100] - 600.0 / PIXELS_PER_SECOND).abs() < 1e-3, "{}", due[100]);
+        let (start, middle) = (due[1] - due[0], due[51] - due[50]);
+        assert!(start > middle * 2.0, "{start} vs {middle}");
+        assert!(due.windows(2).all(|w| w[1] >= w[0]));
+        // A sharp corner takes longer than the straight part before it.
+        let mut corner: Vec<(f32, f32)> = (0..=50).map(|i| (i as f32 * 6.0, 0.0)).collect();
+        corner.extend((1..=50).map(|i| (300.0, i as f32 * 6.0)));
+        let due = schedule(&corner, PIXELS_PER_SECOND);
+        assert!(due[51] - due[49] > (due[31] - due[29]) * 1.4);
     }
 
     #[test]

@@ -606,14 +606,19 @@ pub fn stroke(by: By, path: &[(f32, f32)], button: Button, stop: &dyn Fn() -> bo
     thread::sleep(MOVE_SETTLE);
     button_by(by, button.number(), true)?;
     let mut finished = true;
+    // The handwriting rhythm the Windows and Mac strokes keep too.
+    let due = crate::motion::schedule(path, crate::motion::PIXELS_PER_SECOND);
+    let started = std::time::Instant::now();
     for (at, point) in path.iter().enumerate().skip(1) {
         if stop() {
             finished = false;
             break;
         }
+        if let Some(wait) = Duration::from_secs_f32(due[at]).checked_sub(started.elapsed()) {
+            thread::sleep(wait);
+        }
         move_by(by, point.0 as i32, point.1 as i32)?;
         moved(at, point.0 as i32, point.1 as i32);
-        thread::sleep(Duration::from_millis(4));
     }
     button_by(by, button.number(), false)?;
     Ok(finished)

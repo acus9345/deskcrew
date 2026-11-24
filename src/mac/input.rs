@@ -7,8 +7,6 @@ use std::{ptr::null, thread, time::Duration};
 const CLICK_GAP: Duration = Duration::from_millis(30);
 const KEY_GAP: Duration = Duration::from_millis(8);
 const TYPE_PIECE: usize = 16;
-// Stroke points are 6 px apart, so this draws at the same 1000 px/s as on Windows.
-const STROKE_GAP: Duration = Duration::from_millis(6);
 
 #[derive(Clone, Copy, PartialEq)]
 pub enum Button {
@@ -133,12 +131,18 @@ pub fn stroke(
     post(To::App(pid), make(down, first))?;
     let mut last = first;
     let mut finished = true;
+    // The handwriting rhythm the Windows and Linux strokes keep too.
+    let path: Vec<(f32, f32)> = points.iter().map(|p| (p.0 as f32, p.1 as f32)).collect();
+    let due = crate::motion::schedule(&path, crate::motion::PIXELS_PER_SECOND);
+    let started = std::time::Instant::now();
     for (at, point) in points.iter().enumerate().skip(1) {
         if stop() {
             finished = false;
             break;
         }
-        thread::sleep(STROKE_GAP);
+        if let Some(wait) = Duration::from_secs_f32(due[at]).checked_sub(started.elapsed()) {
+            thread::sleep(wait);
+        }
         post(To::App(pid), make(drag, *point))?;
         moved(at, point.0, point.1);
         last = *point;
