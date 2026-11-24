@@ -334,7 +334,7 @@ mod tests {
         let label = Mask { w: 30, h: 16, alpha: vec![255; 480] };
         let colour = (208, 111, 89);
         let (still, x, y) = posed(colour, &label, 2.0, 0.0, 1.0).unwrap();
-        let (leaning, lx, ly) = posed(colour, &label, 2.0, -LEAN_MOST, 1.0).unwrap();
+        let (leaning, lx, ly) = posed(colour, &label, 2.0, -32.0, 1.0).unwrap();
         let (squeezed, _, _) = posed(colour, &label, 2.0, 0.0, 0.9).unwrap();
         // Same size and the same tip, whatever the pose.
         assert_eq!((still.width(), still.height(), x, y), (leaning.width(), leaning.height(), lx, ly));

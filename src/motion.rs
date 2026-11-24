@@ -23,8 +23,8 @@ const BOW: f32 = 0.2;
 const EASE: [f32; 4] = [0.3, 0.0, 0.1, 1.0];
 /// How far the arrow leans per pixel a second of speed on a 100% screen, the most it leans either
 /// way, and how quickly it follows the speed, in milliseconds.
-const LEAN_PER_SPEED: f32 = 0.035;
-pub const LEAN_MOST: f32 = 32.0;
+const LEAN_PER_SPEED: f32 = 0.12;
+pub const LEAN_MOST: f32 = 150.0;
 const LEAN_MS: f32 = 130.0;
 /// Where the resting arrow points, from the middle of its back to its tip: up and to the left.
 const POINTING: (f32, f32) = (-6.7, -10.0);
@@ -77,7 +77,7 @@ fn lean_toward(velocity: (f32, f32)) -> f32 {
     let cross = POINTING.0 * velocity.1 - POINTING.1 * velocity.0;
     let dot = POINTING.0 * velocity.0 + POINTING.1 * velocity.1;
     let turn = cross.atan2(dot).to_degrees();
-    let backward = (turn.abs() / 180.0).powi(4);
+    let backward = (turn.abs() / 180.0).powi(16);
     let size = (speed * LEAN_PER_SPEED).min(LEAN_MOST).min(turn.abs()) * (1.0 - backward);
     size.copysign(turn)
 }
