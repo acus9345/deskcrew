@@ -207,6 +207,17 @@ fn open_clipboard() -> Result<(), String> {
 
 pub const NO_CLIPBOARD_TEXT: &str = "(no text on the clipboard)";
 
+/// Decode NUL-terminated UTF-16 clipboard text up to `max_units`, backing off before a trailing
+/// high surrogate so non-BMP characters (e.g. emoji) are never split at the limit.
+fn decode_utf16_capped(units: &[u16], max_units: usize) -> String {
+    let nul = units.iter().position(|&u| u == 0).unwrap_or(units.len());
+    let mut take = nul.min(max_units);
+    if take > 0 && nul > take && (0xD800..=0xDBFF).contains(&units[take - 1]) {
+        take -= 1;
+    }
+    String::from_utf16_lossy(&units[..take])
+}
+
 pub fn clipboard_text() -> Result<String, String> {
     unsafe {
         if IsClipboardFormatAvailable(CF_UNICODETEXT) == 0 {
@@ -220,8 +231,7 @@ pub fn clipboard_text() -> Result<String, String> {
             if !locked.is_null() {
                 let units = GlobalSize(data) / 2;
                 let slice = std::slice::from_raw_parts(locked, units);
-                let end = slice.iter().position(|u| *u == 0).unwrap_or(units);
-                text = String::from_utf16_lossy(&slice[..end.min(MAX_CLIPBOARD_CHARS)]);
+                text = decode_utf16_capped(slice, MAX_CLIPBOARD_CHARS);
                 GlobalUnlock(data);
             }
         }
@@ -244,28 +254,38 @@ fn units_as_bytes(units: &[u16]) -> Vec<u8> {
 }
 
 /// Empty the clipboard and put these formats on it, opening it once so no one sees half of it.
-fn put_on_clipboard(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
+/// Returns `Err((message, emptied))`, where `emptied` tells callers whether `EmptyClipboard` ran.
+fn put_on_clipboard_checked(formats: &[(u32, Vec<u8>)]) -> Result<(), (String, bool)> {
     unsafe {
-        open_clipboard()?;
+        open_clipboard().map_err(|e| (e, false))?;
         EmptyClipboard();
         for (format, bytes) in formats {
             let memory = GlobalAlloc(GMEM_MOVEABLE, bytes.len().max(1));
             if memory.is_null() {
                 CloseClipboard();
-                return Err("not enough memory for the clipboard".into());
+                return Err(("not enough memory for the clipboard".into(), true));
             }
             let locked = GlobalLock(memory) as *mut u8;
+            if locked.is_null() {
+                GlobalFree(memory);
+                CloseClipboard();
+                return Err(("Windows could not lock the clipboard memory".into(), true));
+            }
             copy_nonoverlapping(bytes.as_ptr(), locked, bytes.len());
             GlobalUnlock(memory);
             if SetClipboardData(*format, memory).is_null() {
                 GlobalFree(memory);
                 CloseClipboard();
-                return Err("Windows refused the clipboard text".into());
+                return Err(("Windows refused the clipboard text".into(), true));
             }
         }
         CloseClipboard();
         Ok(())
     }
+}
+
+fn put_on_clipboard(formats: &[(u32, Vec<u8>)]) -> Result<(), String> {
+    put_on_clipboard_checked(formats).map_err(|(e, _)| e)
 }
 
 /// Clipboard formats that are a handle to something other than a block of memory (a bitmap, a
@@ -318,7 +338,9 @@ impl SavedClipboard {
                 if locked.is_null() {
                     continue;
                 }
-                formats.push((format, std::slice::from_raw_parts(locked, GlobalSize(data)).to_vec()));
+                let size = GlobalSize(data);
+                let copy = if size == 0 { Vec::new() } else { std::slice::from_raw_parts(locked, size).to_vec() };
+                formats.push((format, copy));
                 GlobalUnlock(data);
             }
             CloseClipboard();
@@ -326,9 +348,23 @@ impl SavedClipboard {
         Ok(SavedClipboard { _loan: loan, formats, lent: None, restored: false })
     }
 
+    fn write_kept(&mut self) -> Result<(), String> {
+        let quiet = quiet_format();
+        let mut formats = std::mem::take(&mut self.formats);
+        if !formats.iter().any(|(format, _)| *format == quiet) {
+            formats.push((quiet, vec![0; 4]));
+        }
+        put_on_clipboard(&formats)
+    }
+
     /// Put the agent's text on the clipboard, kept out of the person's clipboard history.
     pub fn lend(&mut self, text: &str) -> Result<(), String> {
-        put_on_clipboard(&[(CF_UNICODETEXT, units_as_bytes(&wide(text))), (quiet_format(), vec![0; 4])])?;
+        if let Err((err, emptied)) = put_on_clipboard_checked(&[(CF_UNICODETEXT, units_as_bytes(&wide(text))), (quiet_format(), vec![0; 4])]) {
+            if emptied {
+                let _ = self.write_kept();
+            }
+            return Err(err);
+        }
         self.lent = Some(unsafe { GetClipboardSequenceNumber() });
         Ok(())
     }
@@ -345,12 +381,7 @@ impl SavedClipboard {
             return Ok(());
         }
         // Putting it back is not a new copy, so history does not get it twice.
-        let quiet = quiet_format();
-        let mut formats = std::mem::take(&mut self.formats);
-        if !formats.iter().any(|(format, _)| *format == quiet) {
-            formats.push((quiet, vec![0; 4]));
-        }
-        put_on_clipboard(&formats)
+        self.write_kept()
     }
 
     /// Put the person's clipboard back, unless they copied something new in the meantime.
@@ -376,5 +407,16 @@ mod tests {
         assert_eq!(taking_input_covered(""), "--disable-features=CalculateNativeWinOcclusion");
         assert_eq!(taking_input_covered("--new-window x"), "--disable-features=CalculateNativeWinOcclusion --new-window x");
         assert_eq!(taking_input_covered("--disable-features=Foo x"), "--disable-features=CalculateNativeWinOcclusion,Foo x");
+    }
+
+    #[test]
+    fn decode_utf16_capped_respects_nul_and_surrogate_pairs() {
+        assert_eq!(decode_utf16_capped(&[], 10), "");
+        assert_eq!(decode_utf16_capped(&[b'a' as u16, 0, b'b' as u16], 10), "a");
+        // Non-BMP emoji U+1F600 encodes as [0xD83D, 0xDE00]; capping at 1 unit must not leave a lone surrogate.
+        let emoji: Vec<u16> = "a\u{1F600}b".encode_utf16().collect();
+        assert_eq!(decode_utf16_capped(&emoji, 2), "a");
+        assert_eq!(decode_utf16_capped(&emoji, 3), "a\u{1F600}");
+        assert_eq!(decode_utf16_capped(&emoji, 4), "a\u{1F600}b");
     }
 }

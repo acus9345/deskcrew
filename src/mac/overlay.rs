@@ -20,6 +20,7 @@ const RESTACK_EVERY: Duration = Duration::from_millis(150);
 const REST_AFTER: Duration = Duration::from_secs(4);
 const LABEL_PX: f64 = 11.0;
 const PRESS_LINGER_MS: f32 = 450.0;
+const MAX_FLASHES: usize = 64;
 const IMAGE_ALPHA_LAST: u32 = 1;
 /// The name tag's font, as on Windows; CoreText falls back to Helvetica without it.
 const LABEL_FONT: &str = "Arial-BoldMT";
@@ -40,7 +41,7 @@ pub enum Command {
     Over { agent: String, window: u32 },
     Press { agent: String, target: Rect },
     Type { agent: String, keys: usize },
-    Aside(bool),
+    Aside(bool, Sender<()>),
 }
 
 #[derive(Clone)]
@@ -81,25 +82,38 @@ impl Overlay {
 
     /// Hide every cursor while the screen is copied.
     pub fn aside(&self, on: bool) {
-        let _ = self.commands.send(Command::Aside(on));
-        std::thread::sleep(FRAME * 2);
+        let (done, wait) = mpsc::channel();
+        if self.commands.send(Command::Aside(on, done)).is_ok() {
+            let _ = wait.recv_timeout(Duration::from_millis(500));
+        }
     }
 }
 
 /// White text on nothing, as coverage, in the name tag's font.
 pub fn text_mask(text: &str, px: f64) -> Mask {
+    if !px.is_finite() || px <= 0.0 {
+        return Mask { w: 1, h: 1, alpha: vec![0] };
+    }
+    let clipped: String = text.chars().take(64).collect();
+    if clipped.is_empty() {
+        return Mask { w: 1, h: 1, alpha: vec![0] };
+    }
     unsafe {
         let name = cf_string(LABEL_FONT);
         let font = Owned::new(CTFontCreateWithName(name.0, px, null()));
         let Some(font) = font else { return Mask { w: 1, h: 1, alpha: vec![0] } };
         let attributes = dictionary_of(&[kCTFontAttributeName, kCTForegroundColorFromContextAttributeName], &[font.0, kCFBooleanTrue]);
-        let string = cf_string(text);
+        let string = cf_string(&clipped);
         let Some(attributed) = Owned::new(CFAttributedStringCreate(null(), string.0, attributes.0)) else { return Mask { w: 1, h: 1, alpha: vec![0] } };
         let Some(line) = Owned::new(CTLineCreateWithAttributedString(attributed.0)) else { return Mask { w: 1, h: 1, alpha: vec![0] } };
         let (mut ascent, mut descent, mut leading) = (0.0, 0.0, 0.0);
         let width = CTLineGetTypographicBounds(line.0, &mut ascent, &mut descent, &mut leading);
-        let (w, h) = ((width.ceil() as usize + 2).max(1), ((ascent + descent).ceil() as usize + 2).max(1));
-        let mut pixels = vec![0u8; w * h * 4];
+        let w = (width.ceil().clamp(0.0, 8190.0) as usize + 2).max(1);
+        let h = ((ascent + descent).ceil().clamp(0.0, 8190.0) as usize + 2).max(1);
+        let Some(len) = w.checked_mul(h).and_then(|n| n.checked_mul(4)) else {
+            return Mask { w: 1, h: 1, alpha: vec![0] };
+        };
+        let mut pixels = vec![0u8; len];
         let space = CGColorSpaceCreateDeviceRGB();
         let context = CGBitmapContextCreate(pixels.as_mut_ptr().cast(), w, h, 8, w * 4, space, IMAGE_ALPHA_LAST);
         CGColorSpaceRelease(space);
@@ -253,13 +267,16 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
         // An accessory app has no Dock icon and never becomes the front app.
         let _: bool = msg_send![app, setActivationPolicy: 1isize];
         let _: () = msg_send![app, finishLaunching];
-        let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        let primary: *mut AnyObject = if !screens.is_null() { msg_send![screens, firstObject] } else { null::<AnyObject>().cast_mut() };
+        let screen: *mut AnyObject = if !primary.is_null() { primary } else { msg_send![class!(NSScreen), mainScreen] };
         let scale: f64 = if screen.is_null() { 2.0 } else { msg_send![screen, backingScaleFactor] };
+        let scale = if scale.is_finite() && scale > 0.0 { scale } else { 2.0 };
         let screen_h = crate::mac::apps::main_height();
         let mut agents: HashMap<String, Agent> = HashMap::new();
         let mut waiting: HashMap<String, u32> = HashMap::new();
         let mut presses: Vec<Press> = Vec::new();
-        let mut aside = false;
+        let mut aside_depth: usize = 0;
         let mut restacked = Instant::now();
         while !stop() {
             autoreleasepool(|_| {
@@ -274,6 +291,7 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                 }
             });
             while let Ok(command) = inbox.try_recv() {
+                let aside = aside_depth > 0;
                 match command {
                     Command::Move { agent, x, y, instant, done } => {
                         let taken: Vec<Rgb> = agents.values().map(|a| a.colour).collect();
@@ -349,8 +367,16 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                         }
                     }
                     Command::Press { agent, target } => {
+                        let target = Rect {
+                            w: target.w.clamp(1, 8192),
+                            h: target.h.clamp(1, 8192),
+                            ..target
+                        };
                         if let Some(entry) = agents.get_mut(&agent) {
                             entry.last_active = Instant::now();
+                            if presses.len() >= MAX_FLASHES {
+                                presses.remove(0);
+                            }
                             presses.push(Press { colour: entry.colour, target, layer: Layer::new(), started: Instant::now(), above: entry.above, stacked: false });
                         }
                     }
@@ -364,25 +390,35 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                             }
                         }
                     }
-                    Command::Aside(on) => {
-                        aside = on;
-                        for agent in agents.values_mut() {
-                            if on {
-                                agent.layer.hide();
-                            } else if agent.visible && agent.above != 0 {
-                                agent.layer.stack(agent.above);
+                    Command::Aside(on, done) => {
+                        let was = aside_depth > 0;
+                        if on {
+                            aside_depth = aside_depth.saturating_add(1);
+                        } else {
+                            aside_depth = aside_depth.saturating_sub(1);
+                        }
+                        let now_aside = aside_depth > 0;
+                        if now_aside != was {
+                            for agent in agents.values_mut() {
+                                if now_aside {
+                                    agent.layer.hide();
+                                } else if agent.visible && agent.above != 0 {
+                                    agent.layer.stack(agent.above);
+                                }
+                            }
+                            for press in &presses {
+                                if now_aside {
+                                    press.layer.hide();
+                                } else if press.above != 0 {
+                                    press.layer.stack(press.above);
+                                }
                             }
                         }
-                        for press in &presses {
-                            if on {
-                                press.layer.hide();
-                            } else if press.above != 0 {
-                                press.layer.stack(press.above);
-                            }
-                        }
+                        let _ = done.send(());
                     }
                 }
             }
+            let aside = aside_depth > 0;
             let now = Instant::now();
             for agent in agents.values_mut() {
                 if agent.visible && agent.glide.is_none() && now.duration_since(agent.last_active) > REST_AFTER {
@@ -422,7 +458,10 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                     return false;
                 }
                 let margin = draw::outline_margin(scale as f32) as f64 / scale;
-                let (w, h) = ((press.target.w as f64 * scale) as i32, (press.target.h as f64 * scale) as i32);
+                let (w, h) = (
+                    ((press.target.w as f64 * scale).round() as i32).clamp(1, 8192),
+                    ((press.target.h as f64 * scale).round() as i32).clamp(1, 8192),
+                );
                 if let Some(picture) = draw::press(press.colour, w, h, scale as f32, ms.min(draw::PRESS_SETTLE_MS)) {
                     press.layer.show(&picture, scale, press.target.x as f64 - margin, press.target.y as f64 - margin, screen_h);
                     if !aside && !press.stacked && press.above != 0 {

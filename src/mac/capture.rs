@@ -5,21 +5,28 @@ use crate::shot::Frame;
 
 /// The picture as blue-green-red-alpha pixels, drawn into memory laid out the way Frame wants.
 pub fn frame_of(image: CGImageRef) -> Option<Frame> {
+    if image.is_null() {
+        return None;
+    }
     unsafe {
         let (w, h) = (CGImageGetWidth(image), CGImageGetHeight(image));
         if w == 0 || h == 0 {
             return None;
         }
-        let mut pixels = vec![0u8; w * h * 4];
+        let width = u32::try_from(w).ok()?;
+        let height = u32::try_from(h).ok()?;
+        let row_bytes = w.checked_mul(4)?;
+        let total_bytes = row_bytes.checked_mul(h)?;
+        let mut pixels = vec![0u8; total_bytes];
         let space = CGColorSpaceCreateDeviceRGB();
-        let context = CGBitmapContextCreate(pixels.as_mut_ptr().cast(), w, h, 8, w * 4, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
+        let context = CGBitmapContextCreate(pixels.as_mut_ptr().cast(), w, h, 8, row_bytes, space, kCGImageAlphaPremultipliedFirst | kCGBitmapByteOrder32Little);
         CGColorSpaceRelease(space);
         if context.is_null() {
             return None;
         }
         CGContextDrawImage(context, CGRect::new(0.0, 0.0, w as f64, h as f64), image);
         CGContextRelease(context);
-        Some(Frame { w: w as u32, h: h as u32, pixels })
+        Some(Frame { w: width, h: height, pixels })
     }
 }
 
@@ -68,7 +75,7 @@ impl<T> Slot<T> {
     }
 
     fn finish(&self, value: Option<T>) {
-        let mut guard = self.ready.lock().unwrap();
+        let mut guard = self.ready.lock().unwrap_or_else(|e| e.into_inner());
         if guard.is_none() {
             *guard = Some(value);
             self.signal.notify_all();
@@ -76,8 +83,8 @@ impl<T> Slot<T> {
     }
 
     fn wait(&self, timeout: Duration) -> Option<T> {
-        let guard = self.ready.lock().unwrap();
-        let (mut guard, _) = self.signal.wait_timeout_while(guard, timeout, |v| v.is_none()).unwrap();
+        let guard = self.ready.lock().unwrap_or_else(|e| e.into_inner());
+        let (mut guard, _) = self.signal.wait_timeout_while(guard, timeout, |v| v.is_none()).unwrap_or_else(|e| e.into_inner());
         guard.take().flatten()
     }
 }
@@ -384,12 +391,16 @@ fn capture_window_sck(id: u32, size_points: (i32, i32)) -> Option<Frame> {
     })
 }
 
+fn units_for(width_points: i32, pixel_width: u32) -> f32 {
+    if width_points > 0 && pixel_width > 0 { width_points as f32 / pixel_width as f32 } else { 1.0 }
+}
+
 /// The window's own picture, and the points on screen per pixel of it (0.5 on a Retina screen).
 pub fn window(id: u32, size_points: (i32, i32)) -> Result<(Frame, f32), String> {
     allowed()?;
     let width_points = size_points.0;
     if let Some(frame) = capture_window_sck(id, size_points) {
-        let units = if frame.w > 0 { width_points as f32 / frame.w as f32 } else { 1.0 };
+        let units = units_for(width_points, frame.w);
         return Ok((frame, units));
     }
     let null_rect = CGRect::new(f64::INFINITY, f64::INFINITY, 0.0, 0.0);
@@ -400,12 +411,15 @@ pub fn window(id: u32, size_points: (i32, i32)) -> Result<(Frame, f32), String> 
     let frame = frame_of(image);
     unsafe { CGImageRelease(image) };
     let frame = frame.ok_or("macOS would not draw that window")?;
-    let units = if frame.w > 0 { width_points as f32 / frame.w as f32 } else { 1.0 };
+    let units = units_for(width_points, frame.w);
     Ok((frame, units))
 }
 
 /// What is on screen in this rectangle of points, at full resolution.
 pub fn screen(x: i32, y: i32, w: i32, h: i32) -> Result<(Frame, f32), String> {
+    if w <= 0 || h <= 0 {
+        return Err("nothing to capture: empty screen area".into());
+    }
     allowed()?;
     let rect = CGRect::new(x as f64, y as f64, w as f64, h as f64);
     let image = unsafe { CGWindowListCreateImage(rect, kCGWindowListOptionOnScreenOnly, kCGNullWindowID, kCGWindowImageBestResolution) };
@@ -415,6 +429,24 @@ pub fn screen(x: i32, y: i32, w: i32, h: i32) -> Result<(Frame, f32), String> {
     let frame = frame_of(image);
     unsafe { CGImageRelease(image) };
     let frame = frame.ok_or("macOS would not copy the screen")?;
-    let units = w as f32 / frame.w.max(1) as f32;
+    let units = units_for(w, frame.w);
     Ok((frame, units))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn units_for_guards_non_positive_dimensions() {
+        assert_eq!(units_for(0, 100), 1.0);
+        assert_eq!(units_for(-50, 100), 1.0);
+        assert_eq!(units_for(100, 0), 1.0);
+        assert_eq!(units_for(500, 1000), 0.5);
+    }
+
+    #[test]
+    fn frame_of_rejects_null_image() {
+        assert!(frame_of(std::ptr::null()).is_none());
+    }
 }

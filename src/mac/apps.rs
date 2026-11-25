@@ -312,6 +312,7 @@ impl SavedClipboard {
             let kind = ns_string(PLAIN_TEXT.to_str().unwrap_or_default());
             let done: bool = msg_send![board, setString: ns_string(text), forType: kind];
             if !done {
+                let _ = self.write_kept_items(board);
                 return Err("macOS refused the clipboard text".into());
             }
             mark_left_alone(board);
@@ -320,10 +321,30 @@ impl SavedClipboard {
         })
     }
 
-    fn restore_inner(&mut self) -> Result<(), String> {
+    unsafe fn write_kept_items(&self, board: *mut objc2::runtime::AnyObject) -> bool {
         use objc2::runtime::AnyObject;
         use objc2::{class, msg_send};
         use std::ffi::c_void;
+        if self.items.is_empty() {
+            return true;
+        }
+        unsafe {
+            let list: *mut AnyObject = msg_send![class!(NSMutableArray), array];
+            for kept in &self.items {
+                let item: *mut AnyObject = msg_send![class!(NSPasteboardItem), new];
+                for (kind, bytes) in kept {
+                    let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() as *const c_void, length: bytes.len()];
+                    let _: bool = msg_send![item, setData: data, forType: ns_string(kind)];
+                }
+                let _: () = msg_send![list, addObject: item];
+                let _: () = msg_send![item, release];
+            }
+            msg_send![board, writeObjects: list]
+        }
+    }
+
+    fn restore_inner(&mut self) -> Result<(), String> {
+        use objc2::msg_send;
         if self.restored {
             return Ok(());
         }
@@ -338,21 +359,11 @@ impl SavedClipboard {
                 return Ok(());
             }
             let _: isize = msg_send![board, clearContents];
-            if self.items.is_empty() {
-                return Ok(());
+            if self.write_kept_items(board) {
+                Ok(())
+            } else {
+                Err("macOS would not take the clipboard back".into())
             }
-            let list: *mut AnyObject = msg_send![class!(NSMutableArray), array];
-            for kept in &self.items {
-                let item: *mut AnyObject = msg_send![class!(NSPasteboardItem), new];
-                for (kind, bytes) in kept {
-                    let data: *mut AnyObject = msg_send![class!(NSData), dataWithBytes: bytes.as_ptr() as *const c_void, length: bytes.len()];
-                    let _: bool = msg_send![item, setData: data, forType: ns_string(kind)];
-                }
-                let _: () = msg_send![list, addObject: item];
-                let _: () = msg_send![item, release];
-            }
-            let done: bool = msg_send![board, writeObjects: list];
-            if done { Ok(()) } else { Err("macOS would not take the clipboard back".into()) }
         })
     }
 

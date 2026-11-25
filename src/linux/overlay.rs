@@ -24,6 +24,7 @@ const FRAME: Duration = Duration::from_millis(16);
 const RESTACK_EVERY: Duration = Duration::from_millis(250);
 const REST_AFTER: Duration = Duration::from_secs(4);
 const PRESS_LINGER_MS: f32 = 450.0;
+const MAX_FLASHES: usize = 64;
 const LABEL_PX: f32 = 11.0;
 /// Without a compositor a window has no see-through pixels, so it is cut to the parts at least
 /// this opaque.
@@ -136,6 +137,9 @@ impl Overlay {
 /// The name in the tag's font, as coverage. Without a font the tag is drawn without a name.
 pub fn text_mask(text: &str, px: f32) -> Mask {
     use ab_glyph::{Font, FontVec, PxScale, ScaleFont};
+    if !px.is_finite() || px <= 0.0 {
+        return Mask { w: 1, h: 1, alpha: vec![0] };
+    }
     static FONT: OnceLock<Option<FontVec>> = OnceLock::new();
     let font = FONT.get_or_init(|| FONTS.iter().find_map(|path| std::fs::read(path).ok().and_then(|bytes| FontVec::try_from_vec(bytes).ok())));
     let Some(font) = font else { return Mask { w: 1, h: 1, alpha: vec![0] } };
@@ -153,8 +157,12 @@ pub fn text_mask(text: &str, px: f32) -> Mask {
         pen += scaled.h_advance(id);
         last = Some(id);
     }
-    let (w, h) = ((pen.ceil() as i32 + 1).max(1), ((ascent - descent).ceil() as i32 + 1).max(1));
-    let mut alpha = vec![0u8; (w * h) as usize];
+    let w = (pen.ceil().clamp(0.0, 8190.0) as i32 + 1).max(1);
+    let h = ((ascent - descent).ceil().clamp(0.0, 8190.0) as i32 + 1).max(1);
+    let Some(len) = (w as usize).checked_mul(h as usize) else {
+        return Mask { w: 1, h: 1, alpha: vec![0] };
+    };
+    let mut alpha = vec![0u8; len];
     for glyph in glyphs {
         let Some(outline) = font.outline_glyph(glyph) else { continue };
         let bounds = outline.px_bounds();
@@ -412,6 +420,13 @@ fn run(inbox: Receiver<Command>) {
         let aside = aside_depth > 0;
         let Ok(first) = inbox.recv_timeout(FRAME) else {
             if matches!(inbox.try_recv(), Err(mpsc::TryRecvError::Disconnected)) {
+                for (_, agent) in agents.drain() {
+                    agent.layer.destroy(&conn);
+                }
+                for press in presses.drain(..) {
+                    press.layer.destroy(&conn);
+                }
+                let _ = conn.flush();
                 return;
             }
             tick(&conn, &look, scale, &mut agents, &mut presses, aside, &mut restacked);
@@ -505,6 +520,9 @@ fn run(inbox: Receiver<Command>) {
                     let target = (target.0, target.1, target.2.clamp(1, 8192), target.3.clamp(1, 8192));
                     if let Some(entry) = agents.get_mut(&agent) {
                         entry.last_active = Instant::now();
+                        if presses.len() >= MAX_FLASHES {
+                            presses.remove(0).layer.destroy(&conn);
+                        }
                         if let Some(layer) = Layer::new(&conn, &look) {
                             presses.push(Press { colour: entry.colour, target, layer, started: Instant::now(), above: entry.above });
                         }

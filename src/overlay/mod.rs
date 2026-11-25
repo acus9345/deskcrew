@@ -43,6 +43,7 @@ const FLASH_HOLD_MS: f32 = 480.0;
 const FLASH_OUT_MS: f32 = 300.0;
 /// Past this size the glow is too much to redraw every frame, so a big control just fades in.
 const FLASH_MOST_PIXELS: i64 = 500_000;
+const MAX_FLASHES: usize = 64;
 const REST_AFTER: Duration = Duration::from_secs(6);
 const REST_FADE_MS: f32 = 160.0;
 const ARRIVE_FROM: f32 = 90.0;
@@ -110,7 +111,7 @@ pub struct Overlay {
     commands: Sender<Command>,
     thread: u32,
     stop_keys_error: Option<u32>,
-    worker: JoinHandle<Stats>,
+    worker: Option<JoinHandle<Stats>>,
 }
 
 impl Overlay {
@@ -120,7 +121,7 @@ impl Overlay {
         let (ready, started) = mpsc::channel();
         let worker = thread::spawn(move || run(inbox, ready, stop));
         let (thread, stop_keys_error) = started.recv().unwrap_or((0, None));
-        Overlay { commands, thread, stop_keys_error, worker }
+        Overlay { commands, thread, stop_keys_error, worker: Some(worker) }
     }
 
     /// Win32 error code if registering the Ctrl+Alt+Esc stop hotkey failed.
@@ -201,9 +202,18 @@ impl Overlay {
         let _ = wait.recv_timeout(CARET_WAIT);
     }
 
-    pub fn stop(self) -> Stats {
+    pub fn stop(mut self) -> Stats {
         self.send(Command::Quit);
-        self.worker.join().unwrap_or_default()
+        self.worker.take().and_then(|worker| worker.join().ok()).unwrap_or_default()
+    }
+}
+
+impl Drop for Overlay {
+    fn drop(&mut self) {
+        if let Some(worker) = self.worker.take() {
+            self.send(Command::Quit);
+            let _ = worker.join();
+        }
     }
 }
 
@@ -405,12 +415,22 @@ struct Flash {
     over: Option<Hwnd>,
 }
 
+fn clamp_flash_size(w: i32, h: i32) -> (i32, i32) {
+    (w.clamp(1, 8192), h.clamp(1, 8192))
+}
+
+fn next_shield_count(current: usize, on: bool) -> usize {
+    if on { current.saturating_add(1) } else { current.saturating_sub(1) }
+}
+
 impl Flash {
     fn new(colour: Rgb, target: Rect, scale: f32, over: Option<Hwnd>) -> Option<Flash> {
+        let (w, h) = clamp_flash_size(target.w, target.h);
+        let target = Rect { w, h, ..target };
         let margin = outline_margin(scale);
-        let animated = (target.w as i64) * (target.h as i64) <= FLASH_MOST_PIXELS;
+        let animated = (w as i64) * (h as i64) <= FLASH_MOST_PIXELS;
         let first = if animated { 0.0 } else { PRESS_SETTLE_MS };
-        let layer = Layer::new(&press(colour, target.w, target.h, scale, first)?);
+        let layer = Layer::new(&press(colour, w, h, scale, first)?);
         let settled = !animated;
         let flash = Flash { layer, x: target.x - margin, y: target.y - margin, started: Instant::now(), aside: false, colour, target, scale, animated, settled, over };
         flash.layer.present(flash.x, flash.y, 0);
@@ -454,7 +474,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
     let mut flashes: Vec<Flash> = Vec::new();
     let mut last_frame: Option<Instant> = None;
     let mut aside = false;
-    let mut shields = 0;
+    let mut shields: usize = 0;
     let mut hook: HHOOK = null_mut();
     let mut stacked = Instant::now();
     let mut waiting: Vec<(String, Hwnd)> = Vec::new();
@@ -551,6 +571,9 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
                 Command::Press { agent, target } => {
                     if let Some(found) = agents.iter_mut().find(|a| a.name == agent) {
                         found.last_active = Instant::now();
+                        if flashes.len() >= MAX_FLASHES {
+                            flashes.remove(0);
+                        }
                         flashes.extend(Flash::new(found.colour, target, scale, found.over));
                         found.stack(true);
                     }
@@ -579,7 +602,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
                     let _ = shown.send(());
                 }
                 Command::Shield { on, ready } => {
-                    shields = if on { shields + 1 } else { shields - 1 };
+                    shields = next_shield_count(shields, on);
                     unsafe {
                         if shields == 1 && hook.is_null() {
                             hook = SetWindowsHookExW(WH_MOUSE_LL, Some(shield), GetModuleHandleW(std::ptr::null()), 0);
@@ -655,5 +678,25 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
             .map(|left| left.min(STACK_EVERY.as_millis() as u32))
             .unwrap_or(INFINITE);
         unsafe { MsgWaitForMultipleObjects(0, std::ptr::null(), 0, wake, QS_ALLINPUT) };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamp_flash_size_bounds_extreme_dimensions() {
+        assert_eq!(clamp_flash_size(0, -10), (1, 1));
+        assert_eq!(clamp_flash_size(120, 40), (120, 40));
+        assert_eq!(clamp_flash_size(500_000, i32::MAX), (8192, 8192));
+    }
+
+    #[test]
+    fn shield_refcount_never_underflows() {
+        assert_eq!(next_shield_count(0, false), 0);
+        assert_eq!(next_shield_count(0, true), 1);
+        assert_eq!(next_shield_count(1, false), 0);
+        assert_eq!(next_shield_count(usize::MAX, true), usize::MAX);
     }
 }

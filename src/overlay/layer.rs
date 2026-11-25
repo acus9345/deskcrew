@@ -48,8 +48,14 @@ struct Surface {
 
 impl Surface {
     fn new(w: i32, h: i32) -> Surface {
+        if w <= 0 || h <= 0 || (w as i64).saturating_mul(h as i64) > (i32::MAX as i64 / 4) {
+            return Surface { dc: null_mut(), bitmap: null_mut(), bits: null_mut(), w: 0, h: 0 };
+        }
         unsafe {
             let dc = CreateCompatibleDC(null_mut());
+            if dc.is_null() {
+                return Surface { dc: null_mut(), bitmap: null_mut(), bits: null_mut(), w: 0, h: 0 };
+            }
             let mut info: BITMAPINFO = zeroed();
             info.bmiHeader.biSize = size_of_val(&info.bmiHeader) as u32;
             info.bmiHeader.biWidth = w;
@@ -58,16 +64,33 @@ impl Surface {
             info.bmiHeader.biBitCount = 32;
             let mut bits = null_mut();
             let bitmap = CreateDIBSection(dc, &info, DIB_RGB_COLORS, &mut bits, null_mut(), 0);
+            if bitmap.is_null() || bits.is_null() {
+                if !bitmap.is_null() {
+                    DeleteObject(bitmap);
+                }
+                DeleteDC(dc);
+                return Surface { dc: null_mut(), bitmap: null_mut(), bits: null_mut(), w: 0, h: 0 };
+            }
             SelectObject(dc, bitmap);
             Surface { dc, bitmap, bits: bits.cast(), w, h }
         }
+    }
+
+    fn is_valid(&self) -> bool {
+        !self.dc.is_null() && !self.bitmap.is_null() && !self.bits.is_null() && self.w > 0 && self.h > 0
     }
 }
 
 impl Surface {
     /// The picture is premultiplied RGBA and the window wants premultiplied BGRA.
     fn paint(&self, picture: &Pixmap) {
-        let target = unsafe { std::slice::from_raw_parts_mut(self.bits, (self.w * self.h * 4) as usize) };
+        if !self.is_valid() {
+            return;
+        }
+        let Some(len) = (self.w as usize).checked_mul(self.h as usize).and_then(|n| n.checked_mul(4)) else {
+            return;
+        };
+        let target = unsafe { std::slice::from_raw_parts_mut(self.bits, len) };
         for (to, from) in target.as_chunks_mut::<4>().0.iter_mut().zip(picture.data().as_chunks::<4>().0) {
             *to = [from[2], from[1], from[0], from[3]];
         }
@@ -77,30 +100,51 @@ impl Surface {
 impl Drop for Surface {
     fn drop(&mut self) {
         unsafe {
-            DeleteDC(self.dc);
-            DeleteObject(self.bitmap);
+            if !self.dc.is_null() {
+                DeleteDC(self.dc);
+            }
+            if !self.bitmap.is_null() {
+                DeleteObject(self.bitmap);
+            }
         }
     }
 }
 
 /// Measure and draw a line of text white on black, and keep the coverage.
 pub fn text_mask(text: &str, px: i32) -> Mask {
-    coverage(text, unsafe { CreateFontW(-px, 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 4, 0, wide(FONT).as_ptr()) })
+    let font = unsafe { CreateFontW(-px.max(1), 0, 0, 0, 700, 0, 0, 0, 1, 0, 0, 4, 0, wide(FONT).as_ptr()) };
+    if font.is_null() {
+        return Mask { w: 1, h: 1, alpha: vec![0] };
+    }
+    coverage(text, font)
 }
 
 /// The coverage of text drawn in this font, which it then deletes.
 fn coverage(text: &str, font: HFONT) -> Mask {
-    let line: Vec<u16> = text.encode_utf16().collect();
+    let clipped: String = text.chars().take(64).collect();
+    let line: Vec<u16> = clipped.encode_utf16().collect();
     unsafe {
+        if line.is_empty() {
+            DeleteObject(font);
+            return Mask { w: 1, h: 1, alpha: vec![0] };
+        }
         let probe = CreateCompatibleDC(null_mut());
+        if probe.is_null() {
+            DeleteObject(font);
+            return Mask { w: 1, h: 1, alpha: vec![0] };
+        }
         let old = SelectObject(probe, font);
         let mut size: SIZE = zeroed();
         GetTextExtentPoint32W(probe, line.as_ptr(), line.len() as i32, &mut size);
         SelectObject(probe, old);
         DeleteDC(probe);
 
-        let (w, h) = (size.cx.max(1), size.cy.max(1));
+        let (w, h) = (size.cx.clamp(1, 8192), size.cy.clamp(1, 8192));
         let surface = Surface::new(w, h);
+        if !surface.is_valid() {
+            DeleteObject(font);
+            return Mask { w: 1, h: 1, alpha: vec![0] };
+        }
         let old = SelectObject(surface.dc, font);
         SetBkMode(surface.dc, 1);
         SetTextColor(surface.dc, 0x00FF_FFFF);
@@ -121,7 +165,7 @@ pub struct Layer {
 impl Layer {
     pub fn new(picture: &Pixmap) -> Layer {
         register();
-        let (w, h) = (picture.width() as i32, picture.height() as i32);
+        let (w, h) = (picture.width().min(8192) as i32, picture.height().min(8192) as i32);
         let surface = Surface::new(w, h);
         surface.paint(picture);
         let hwnd = unsafe {
@@ -132,8 +176,8 @@ impl Layer {
                 WS_POPUP,
                 0,
                 0,
-                w,
-                h,
+                w.max(1),
+                h.max(1),
                 null_mut(),
                 null_mut(),
                 GetModuleHandleW(std::ptr::null()),
@@ -150,7 +194,7 @@ impl Layer {
 
     /// Swap in a picture of any size.
     pub fn reshape(&mut self, picture: &Pixmap) {
-        let (w, h) = (picture.width() as i32, picture.height() as i32);
+        let (w, h) = (picture.width().min(8192) as i32, picture.height().min(8192) as i32);
         if (w, h) != (self.surface.w, self.surface.h) {
             self.surface = Surface::new(w, h);
         }
@@ -159,6 +203,9 @@ impl Layer {
 
     /// Put the window at `x,y` at this opacity. Cheap enough to call every frame.
     pub fn present(&self, x: i32, y: i32, alpha: u8) {
+        if self.hwnd.is_null() || !self.surface.is_valid() {
+            return;
+        }
         let at = POINT { x, y };
         let origin = POINT { x: 0, y: 0 };
         let size = SIZE { cx: self.surface.w, cy: self.surface.h };
@@ -169,25 +216,35 @@ impl Layer {
     }
 
     pub fn show(&self) {
-        unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+        if !self.hwnd.is_null() {
+            unsafe { ShowWindow(self.hwnd, SW_SHOWNOACTIVATE) };
+        }
     }
 
     pub fn hide(&self) {
-        unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        if !self.hwnd.is_null() {
+            unsafe { ShowWindow(self.hwnd, SW_HIDE) };
+        }
     }
 
     /// Back above everything, so cursors stay over the outlines they leave.
     pub fn above(&self, window: Hwnd, force: bool) {
-        win::stack_above(self.hwnd as Hwnd, window, force);
+        if !self.hwnd.is_null() {
+            win::stack_above(self.hwnd as Hwnd, window, force);
+        }
     }
 
     pub fn raise(&self) {
-        unsafe { SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+        if !self.hwnd.is_null() {
+            unsafe { SetWindowPos(self.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE) };
+        }
     }
 }
 
 impl Drop for Layer {
     fn drop(&mut self) {
-        unsafe { DestroyWindow(self.hwnd) };
+        if !self.hwnd.is_null() {
+            unsafe { DestroyWindow(self.hwnd) };
+        }
     }
 }

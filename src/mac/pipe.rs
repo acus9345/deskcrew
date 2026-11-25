@@ -151,6 +151,13 @@ fn lock_for(path: &Path) -> io::Result<std::fs::File> {
     Ok(file)
 }
 
+fn frame_len(len: usize) -> io::Result<u32> {
+    if len > MAX_MESSAGE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
+    }
+    u32::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message too large"))
+}
+
 pub struct Pipe(UnixStream);
 
 impl Pipe {
@@ -170,7 +177,7 @@ impl Pipe {
         let listener = UnixListener::bind(&path)?;
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
         if let Ok(meta) = std::fs::symlink_metadata(&path) {
-            *BOUND_SOCKET.lock().unwrap() = Some((meta.dev(), meta.ino()));
+            *BOUND_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) = Some((meta.dev(), meta.ino()));
         }
         Ok(listener)
     }
@@ -194,8 +201,9 @@ impl Pipe {
     }
 
     pub fn send(&self, message: &[u8]) -> io::Result<()> {
+        let len = frame_len(message.len())?;
         let mut stream = &self.0;
-        stream.write_all(&(message.len() as u32).to_le_bytes())?;
+        stream.write_all(&len.to_le_bytes())?;
         stream.write_all(message)
     }
 
@@ -220,7 +228,7 @@ impl Pipe {
 }
 
 pub fn remove() {
-    let Some(bound) = *BOUND_SOCKET.lock().unwrap() else { return };
+    let Some(bound) = *BOUND_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) else { return };
     if let Ok(path) = path_for(false) {
         let Ok(_lock) = lock_for(&path) else { return };
         if let Ok(meta) = std::fs::symlink_metadata(&path)
@@ -228,7 +236,20 @@ pub fn remove() {
             && (meta.dev(), meta.ino()) == bound
         {
             let _ = std::fs::remove_file(&path);
-            *BOUND_SOCKET.lock().unwrap() = None;
+            *BOUND_SOCKET.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_len_rejects_oversized_messages() {
+        assert_eq!(frame_len(0).unwrap(), 0);
+        assert_eq!(frame_len(MAX_MESSAGE).unwrap(), MAX_MESSAGE as u32);
+        let err = frame_len(MAX_MESSAGE + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }

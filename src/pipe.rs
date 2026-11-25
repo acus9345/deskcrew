@@ -55,6 +55,7 @@ fn read_desktop() -> String {
 /// The account a process runs as, as the bytes of its security id.
 fn account_of(pid: u32) -> Option<Vec<u8>> {
     use windows_sys::Win32::{
+        Foundation::ERROR_INSUFFICIENT_BUFFER,
         Security::{GetLengthSid, GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser},
         System::Threading::{OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION},
     };
@@ -66,20 +67,38 @@ fn account_of(pid: u32) -> Option<Vec<u8>> {
         let mut token = std::ptr::null_mut();
         let opened = OpenProcessToken(process, TOKEN_QUERY, &mut token);
         CloseHandle(process);
-        if opened == 0 {
+        if opened == 0 || token.is_null() {
             return None;
         }
         // A TOKEN_USER and the SID it points into, aligned for the struct.
         let mut buffer = vec![0u64; 64];
         let mut needed = 0;
-        let read = GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), (buffer.len() * 8) as u32, &mut needed);
+        let mut read = GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), (buffer.len() * 8) as u32, &mut needed);
+        if read == 0 && GetLastError() == ERROR_INSUFFICIENT_BUFFER && needed > 0 && (needed as usize) <= MAX_MESSAGE {
+            buffer.resize((needed as usize).div_ceil(8), 0);
+            read = GetTokenInformation(token, TokenUser, buffer.as_mut_ptr().cast(), (buffer.len() * 8) as u32, &mut needed);
+        }
         CloseHandle(token);
         if read == 0 {
             return None;
         }
         let sid = (*(buffer.as_ptr() as *const TOKEN_USER)).User.Sid;
-        Some(std::slice::from_raw_parts(sid as *const u8, GetLengthSid(sid) as usize).to_vec())
+        if sid.is_null() {
+            return None;
+        }
+        let sid_len = GetLengthSid(sid) as usize;
+        if sid_len == 0 {
+            return None;
+        }
+        Some(std::slice::from_raw_parts(sid as *const u8, sid_len).to_vec())
     }
+}
+
+fn frame_len(len: usize) -> io::Result<u32> {
+    if len > MAX_MESSAGE {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "message too large"));
+    }
+    u32::try_from(len).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "message too large"))
 }
 
 pub struct Pipe(HANDLE);
@@ -150,9 +169,13 @@ impl Pipe {
     fn read_exact(&self, mut buffer: &mut [u8]) -> io::Result<()> {
         while !buffer.is_empty() {
             let mut got = 0;
-            let ok = unsafe { ReadFile(self.0, buffer.as_mut_ptr(), buffer.len() as u32, &mut got, std::ptr::null_mut()) };
-            if ok == 0 || got == 0 {
+            let chunk = buffer.len().min(u32::MAX as usize) as u32;
+            let ok = unsafe { ReadFile(self.0, buffer.as_mut_ptr(), chunk, &mut got, std::ptr::null_mut()) };
+            if ok == 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if got == 0 {
+                return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "pipe closed"));
             }
             buffer = &mut buffer[got as usize..];
         }
@@ -162,9 +185,13 @@ impl Pipe {
     fn write_all(&self, mut bytes: &[u8]) -> io::Result<()> {
         while !bytes.is_empty() {
             let mut put = 0;
-            let ok = unsafe { WriteFile(self.0, bytes.as_ptr(), bytes.len() as u32, &mut put, std::ptr::null_mut()) };
+            let chunk = bytes.len().min(u32::MAX as usize) as u32;
+            let ok = unsafe { WriteFile(self.0, bytes.as_ptr(), chunk, &mut put, std::ptr::null_mut()) };
             if ok == 0 {
                 return Err(io::Error::last_os_error());
+            }
+            if put == 0 {
+                return Err(io::Error::new(io::ErrorKind::WriteZero, "pipe wrote zero bytes"));
             }
             bytes = &bytes[put as usize..];
         }
@@ -172,7 +199,8 @@ impl Pipe {
     }
 
     pub fn send(&self, message: &[u8]) -> io::Result<()> {
-        self.write_all(&(message.len() as u32).to_le_bytes())?;
+        let len = frame_len(message.len())?;
+        self.write_all(&len.to_le_bytes())?;
         self.write_all(message)
     }
 
@@ -276,5 +304,13 @@ mod tests {
         server.send(b"pong").unwrap();
         server.finish();
         client.join().unwrap();
+    }
+
+    #[test]
+    fn frame_len_checks_max_message_bounds() {
+        assert_eq!(frame_len(0).unwrap(), 0);
+        assert_eq!(frame_len(MAX_MESSAGE).unwrap(), MAX_MESSAGE as u32);
+        let err = frame_len(MAX_MESSAGE + 1).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
 }
