@@ -609,18 +609,30 @@ pub fn stroke(by: By, path: &[(f32, f32)], button: Button, stop: &dyn Fn() -> bo
     // The handwriting rhythm the Windows and Mac strokes keep too.
     let due = crate::motion::schedule(path, crate::motion::PIXELS_PER_SECOND);
     let started = std::time::Instant::now();
+    let mut step_err = None;
     for (at, point) in path.iter().enumerate().skip(1) {
         if stop() {
             finished = false;
             break;
         }
-        if let Some(wait) = Duration::from_secs_f32(due[at]).checked_sub(started.elapsed()) {
+        let secs = due[at];
+        if secs.is_finite()
+            && secs > 0.0
+            && let Some(wait) = Duration::from_secs_f32(secs).checked_sub(started.elapsed())
+        {
             thread::sleep(wait);
         }
-        move_by(by, point.0 as i32, point.1 as i32)?;
+        if let Err(err) = move_by(by, point.0 as i32, point.1 as i32) {
+            step_err = Some(err);
+            break;
+        }
         moved(at, point.0 as i32, point.1 as i32);
     }
-    button_by(by, button.number(), false)?;
+    let up_res = button_by(by, button.number(), false);
+    if let Some(err) = step_err {
+        return Err(err);
+    }
+    up_res?;
     Ok(finished)
 }
 
@@ -876,9 +888,15 @@ pub fn send_stroke(window: u32, path: &[(f32, f32)], button: Button, modifiers: 
     send_enter(x, target, fx, fy, flx, fly, mods)?;
     send_motion(x, target, fx, fy, flx, fly, mods)?;
     send_button(x, target, button.number(), true, (fx, fy), (flx, fly), mods)?;
-    x.conn.flush().map_err(|e| e.to_string())?;
+    if let Err(err) = x.conn.flush() {
+        let (llx, lly) = ((fx - origin_dx) as i16, (fy - origin_dy) as i16);
+        let _ = send_button(x, target, button.number(), false, (fx, fy), (llx, lly), held_state);
+        let _ = x.conn.flush();
+        return Err(err.to_string());
+    }
     let mut finished = true;
     let (mut last_x, mut last_y) = (fx, fy);
+    let mut step_err = None;
     for (at, point) in path.iter().enumerate().skip(1) {
         if stop() {
             finished = false;
@@ -886,16 +904,23 @@ pub fn send_stroke(window: u32, path: &[(f32, f32)], button: Button, modifiers: 
         }
         let (px, py) = (point.0 as i32, point.1 as i32);
         let (lx, ly) = ((px - origin_dx) as i16, (py - origin_dy) as i16);
-        send_motion(x, target, px, py, lx, ly, held_state)?;
-        x.conn.flush().map_err(|e| e.to_string())?;
+        if let Err(err) = send_motion(x, target, px, py, lx, ly, held_state).and_then(|()| x.conn.flush().map_err(|e| e.to_string())) {
+            step_err = Some(err);
+            break;
+        }
         moved(at, px, py);
         last_x = px;
         last_y = py;
         thread::sleep(Duration::from_millis(4));
     }
     let (llx, lly) = ((last_x - origin_dx) as i16, (last_y - origin_dy) as i16);
-    send_button(x, target, button.number(), false, (last_x, last_y), (llx, lly), held_state)?;
-    x.conn.flush().map_err(|e| e.to_string())?;
+    let up_res = send_button(x, target, button.number(), false, (last_x, last_y), (llx, lly), held_state);
+    let flush_res = x.conn.flush().map_err(|e| e.to_string());
+    if let Some(err) = step_err {
+        return Err(err);
+    }
+    up_res?;
+    flush_res?;
     Ok(finished)
 }
 
@@ -1089,7 +1114,13 @@ fn named(name: &str) -> Option<u32> {
         "down" => 0xff54,
         "pageup" | "pgup" => 0xff55,
         "pagedown" | "pgdn" => 0xff56,
-        "space" => 0x20,
+        "space" | "spacebar" => 0x20,
+        "pause" | "break" => 0xff13,
+        "plus" => 0x002b,
+        "minus" => 0x002d,
+        "equal" | "equals" => 0x003d,
+        "comma" => 0x002c,
+        "period" => 0x002e,
         "menu" | "apps" => 0xff67,
         "printscreen" | "print" => 0xff61,
         "capslock" => 0xffe5,
@@ -1124,9 +1155,16 @@ pub fn keysym_of(c: char) -> u32 {
 }
 
 pub fn chord(spec: &str) -> Result<Chord, String> {
+    if spec.trim().is_empty() {
+        return Err("which key?".into());
+    }
     let mut modifiers = Vec::new();
     let mut key = None;
-    for part in spec.to_lowercase().split('+').map(str::trim).filter(|p| !p.is_empty()) {
+    let lower = spec.to_lowercase();
+    for part in lower.split('+').map(str::trim) {
+        if part.is_empty() {
+            return Err(format!("empty key in '{spec}': use 'plus' for '+'"));
+        }
         if let Some(m) = modifier(part) {
             modifiers.push(m);
         } else if key.is_none() {
@@ -1195,34 +1233,52 @@ fn key_event(x: &X, code: u8, down: bool) -> Result<(), String> {
 /// Press a keysym, borrowing a spare keycode if no key types it.
 fn tap(x: &X, map: &Keymap, sym: u32, held: &[u8]) -> Result<(), String> {
     let shift = map.find(0xffe1).map(|k| k.0);
+    let mut _keymap_guard = None;
     let (code, needs_shift, borrowed) = match map.find(sym) {
         Some((code, shifted)) => (code, shifted, false),
         None => {
+            _keymap_guard = Some(KEYMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
             let code = map.spare().ok_or("no free key to type that character with")?;
             let row = vec![sym; map.per.max(1)];
             x.conn.change_keyboard_mapping(1, code, map.per as u8, &row).map_err(|e| e.to_string())?;
-            x.conn.flush().map_err(|e| e.to_string())?;
-            thread::sleep(KEY_GAP);
             (code, false, true)
         }
     };
     let shift_now = needs_shift && !held.contains(&shift.unwrap_or(0));
-    if shift_now && let Some(s) = shift {
-        key_event(x, s, true)?;
-    }
-    key_event(x, code, true)?;
-    key_event(x, code, false)?;
-    if shift_now && let Some(s) = shift {
-        key_event(x, s, false)?;
-    }
-    x.conn.flush().map_err(|e| e.to_string())?;
-    thread::sleep(KEY_GAP);
-    if borrowed {
-        let row = vec![0u32; map.per.max(1)];
-        x.conn.change_keyboard_mapping(1, code, map.per as u8, &row).map_err(|e| e.to_string())?;
+    let mut shift_down = false;
+    let sent = (|| -> Result<(), String> {
+        if borrowed {
+            x.conn.flush().map_err(|e| e.to_string())?;
+            thread::sleep(KEY_GAP);
+        }
+        if shift_now && let Some(s) = shift {
+            key_event(x, s, true)?;
+            shift_down = true;
+        }
+        key_event(x, code, true)?;
+        key_event(x, code, false)?;
         x.conn.flush().map_err(|e| e.to_string())?;
-    }
-    Ok(())
+        thread::sleep(KEY_GAP);
+        Ok(())
+    })();
+    let shift_up_res = if shift_down && let Some(s) = shift {
+        let res = key_event(x, s, false);
+        let _ = x.conn.flush();
+        res
+    } else {
+        Ok(())
+    };
+    let restore_res = if borrowed {
+        let row = vec![0u32; map.per.max(1)];
+        let res = x.conn.change_keyboard_mapping(1, code, map.per as u8, &row).map(|_| ()).map_err(|e| e.to_string());
+        let _ = x.conn.flush();
+        res
+    } else {
+        Ok(())
+    };
+    sent?;
+    shift_up_res?;
+    restore_res
 }
 
 /// Press a chord in the focused window, holding the key for `hold`.
@@ -1230,30 +1286,52 @@ pub fn press(chord: &Chord, hold: Duration) -> Result<(), String> {
     let x = x()?;
     let map = keymap(x)?;
     let mods: Vec<u8> = chord.modifiers.iter().filter_map(|m| map.find(*m).map(|k| k.0)).collect();
-    for m in &mods {
-        key_event(x, *m, true)?;
+    let mut pressed = Vec::with_capacity(mods.len());
+    let mut mod_err = None;
+    for &m in &mods {
+        if let Err(err) = key_event(x, m, true) {
+            mod_err = Some(err);
+            break;
+        }
+        pressed.push(m);
     }
-    let result = match chord.key {
-        Some(sym) if hold.is_zero() => tap(x, &map, sym, &mods),
-        Some(sym) => match map.find(sym) {
-            Some((code, _)) => {
-                key_event(x, code, true)?;
-                x.conn.flush().map_err(|e| e.to_string())?;
+    let result = if let Some(err) = mod_err {
+        Err(err)
+    } else {
+        match chord.key {
+            Some(sym) if hold.is_zero() => tap(x, &map, sym, &mods),
+            Some(sym) => match map.find(sym) {
+                Some((code, _)) => match key_event(x, code, true) {
+                    Ok(()) => {
+                        let flush_res = x.conn.flush().map_err(|e| e.to_string());
+                        thread::sleep(hold);
+                        let up_res = key_event(x, code, false);
+                        flush_res.and(up_res)
+                    }
+                    Err(err) => Err(err),
+                },
+                None => tap(x, &map, sym, &mods),
+            },
+            None => {
                 thread::sleep(hold);
-                key_event(x, code, false)
+                Ok(())
             }
-            None => tap(x, &map, sym, &mods),
-        },
-        None => {
-            thread::sleep(hold);
-            Ok(())
         }
     };
-    for m in mods.iter().rev() {
-        key_event(x, *m, false)?;
+    let mut up_err = None;
+    for &m in pressed.iter().rev() {
+        if let Err(err) = key_event(x, m, false)
+            && up_err.is_none()
+        {
+            up_err = Some(err);
+        }
     }
-    x.conn.flush().map_err(|e| e.to_string())?;
-    result
+    let flush_res = x.conn.flush().map_err(|e| e.to_string());
+    result?;
+    if let Some(err) = up_err {
+        return Err(err);
+    }
+    flush_res
 }
 
 /// Hold or let go of modifier keys.
@@ -1778,5 +1856,20 @@ mod tests {
         let t3 = next_timestamp(t2, 500);
         assert_eq!(t3, 500);
         assert_eq!(next_timestamp(u32::MAX, 0), 1);
+    }
+
+    #[test]
+    fn chord_aliases_and_empty_parts_behave_consistently() {
+        assert_eq!(chord("plus").unwrap().key, Some(0x002b));
+        assert_eq!(chord("minus").unwrap().key, Some(0x002d));
+        assert_eq!(chord("equal").unwrap().key, Some(0x003d));
+        assert_eq!(chord("comma").unwrap().key, Some(0x002c));
+        assert_eq!(chord("period").unwrap().key, Some(0x002e));
+        assert_eq!(chord("pause").unwrap().key, Some(0xff13));
+        assert_eq!(chord("spacebar").unwrap().key, Some(0x20));
+        assert!(chord("").is_err());
+        assert!(chord("  ").is_err());
+        assert!(chord("ctrl++").is_err());
+        assert!(chord("win+").is_err());
     }
 }

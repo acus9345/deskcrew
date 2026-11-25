@@ -20,8 +20,9 @@ use windows_sys::Win32::{
             KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, LASTINPUTINFO, MOUSE_EVENT_FLAGS, MOUSEEVENTF_ABSOLUTE, MOUSEEVENTF_LEFTDOWN,
             MOUSEEVENTF_LEFTUP, MOUSEEVENTF_MOVE, MOUSEEVENTF_RIGHTDOWN, MOUSEEVENTF_RIGHTUP, MOUSEEVENTF_VIRTUALDESK,
             MOUSEEVENTF_WHEEL, MOUSEINPUT, SendInput, VIRTUAL_KEY, VK_BACK, VK_CONTROL, VK_DELETE, VK_DOWN, VK_END, VK_ESCAPE,
-            VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_PLUS, VK_PAUSE,
-            VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT, VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VkKeyScanW,
+            VK_F1, VK_HOME, VK_INSERT, VK_LCONTROL, VK_LEFT, VK_LMENU, VK_LSHIFT, VK_LWIN, VK_MENU, VK_NEXT, VK_OEM_COMMA,
+            VK_OEM_MINUS, VK_OEM_PERIOD, VK_OEM_PLUS, VK_PAUSE, VK_PRIOR, VK_RCONTROL, VK_RETURN, VK_RIGHT, VK_RMENU, VK_RSHIFT,
+            VK_RWIN, VK_SHIFT, VK_SPACE, VK_TAB, VK_UP, VkKeyScanW,
         },
         WindowsAndMessaging::{GetCursorPos, GetSystemMetrics, SM_CXVIRTUALSCREEN, SM_CYVIRTUALSCREEN, SM_XVIRTUALSCREEN, SM_YVIRTUALSCREEN},
     },
@@ -155,8 +156,14 @@ impl Modifiers {
 
     /// "shift", "ctrl+alt" and so on.
     pub fn parse(spec: &str) -> Result<Modifiers, String> {
+        if spec.trim().is_empty() {
+            return Err("--with needs a key: use shift, ctrl or alt, joined with +".into());
+        }
         let mut bits = 0;
-        for part in spec.split('+').map(str::trim).filter(|p| !p.is_empty()) {
+        for part in spec.split('+').map(str::trim) {
+            if part.is_empty() {
+                return Err(format!("empty modifier in '{spec}': use shift, ctrl or alt, joined with +"));
+            }
             bits |= match part.to_lowercase().as_str() {
                 "shift" => Self::SHIFT,
                 "ctrl" | "control" => Self::CONTROL,
@@ -319,14 +326,14 @@ fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
         "enter" | "return" => (VK_RETURN, false),
         "tab" => (VK_TAB, false),
         "esc" | "escape" => (VK_ESCAPE, false),
-        "space" => (VK_SPACE, false),
-        "backspace" => (VK_BACK, false),
+        "space" | "spacebar" => (VK_SPACE, false),
+        "backspace" | "back" => (VK_BACK, false),
         "delete" | "del" => (VK_DELETE, true),
-        "insert" => (VK_INSERT, true),
+        "insert" | "ins" => (VK_INSERT, true),
         "home" => (VK_HOME, true),
         "end" => (VK_END, true),
-        "pageup" => (VK_PRIOR, true),
-        "pagedown" => (VK_NEXT, true),
+        "pageup" | "pgup" => (VK_PRIOR, true),
+        "pagedown" | "pgdn" => (VK_NEXT, true),
         "left" => (VK_LEFT, true),
         "right" => (VK_RIGHT, true),
         "up" => (VK_UP, true),
@@ -335,7 +342,10 @@ fn named_key(name: &str) -> Option<(VIRTUAL_KEY, bool)> {
         "shift" => (VK_SHIFT, false),
         "alt" => (VK_MENU, false),
         "pause" | "break" => (VK_PAUSE, false),
-        "plus" => (VK_OEM_PLUS, false),
+        "plus" | "equal" | "equals" => (VK_OEM_PLUS, false),
+        "minus" => (VK_OEM_MINUS, false),
+        "comma" => (VK_OEM_COMMA, false),
+        "period" => (VK_OEM_PERIOD, false),
         "win" | "meta" | "cmd" | "windows" | "super" => (VK_LWIN, true),
         _ => {
             if let Some(number) = lower.strip_prefix('f').and_then(|n| n.parse::<u16>().ok())
@@ -415,11 +425,11 @@ impl Chord {
 }
 
 pub fn chord(spec: &str) -> Result<Chord, String> {
-    if spec.is_empty() {
+    if spec.trim().is_empty() {
         return Err("no key given".into());
     }
     let mut keys = Vec::new();
-    for part in spec.split('+') {
+    for part in spec.split('+').map(str::trim) {
         if part.is_empty() {
             return Err(format!("empty key in '{spec}': use 'plus' for '+'"));
         }
@@ -650,6 +660,21 @@ mod tests {
         assert!(chord("win++").is_err());
         assert!(chord("ctrl++").is_err());
         assert!(chord("win+").is_err());
+        assert!(chord("  ").is_err());
         assert!(chord("\u{10061}").is_err());
+        assert_eq!(chord("ctrl + s").unwrap().keys, chord("ctrl+s").unwrap().keys);
+        assert_eq!(chord("pgup").unwrap().keys[0].0, VK_PRIOR);
+        assert_eq!(chord("pgdn").unwrap().keys[0].0, VK_NEXT);
+        assert_eq!(chord("ins").unwrap().keys[0].0, VK_INSERT);
+        assert_eq!(chord("back").unwrap().keys[0].0, VK_BACK);
+        assert_eq!(chord("spacebar").unwrap().keys[0].0, VK_SPACE);
+        assert_eq!(chord("minus").unwrap().keys[0].0, VK_OEM_MINUS);
+        assert_eq!(chord("equal").unwrap().keys[0].0, VK_OEM_PLUS);
+        assert_eq!(chord("comma").unwrap().keys[0].0, VK_OEM_COMMA);
+        assert_eq!(chord("period").unwrap().keys[0].0, VK_OEM_PERIOD);
+        assert!(Modifiers::parse("").is_err());
+        assert!(Modifiers::parse("   ").is_err());
+        assert!(Modifiers::parse("ctrl+").is_err());
+        assert_eq!(Modifiers::parse("ctrl + shift").unwrap().virtual_keys(), vec![VK_SHIFT, VK_CONTROL]);
     }
 }

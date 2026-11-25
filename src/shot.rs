@@ -59,6 +59,10 @@ impl Frames {
 
 #[cfg(windows)]
 fn read_bitmap(dc: *mut core::ffi::c_void, bitmap: *mut core::ffi::c_void, w: i32, h: i32) -> Option<Vec<u8>> {
+    if w <= 0 || h <= 0 {
+        return None;
+    }
+    let len = (w as usize).checked_mul(h as usize)?.checked_mul(4)?;
     unsafe {
         let mut info: BITMAPINFO = zeroed();
         info.bmiHeader.biSize = size_of_val(&info.bmiHeader) as u32;
@@ -66,7 +70,7 @@ fn read_bitmap(dc: *mut core::ffi::c_void, bitmap: *mut core::ffi::c_void, w: i3
         info.bmiHeader.biHeight = -h;
         info.bmiHeader.biPlanes = 1;
         info.bmiHeader.biBitCount = 32;
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let mut pixels = vec![0u8; len];
         let lines = GetDIBits(dc, bitmap, 0, h as u32, pixels.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS);
         (lines == h).then_some(pixels)
     }
@@ -101,11 +105,15 @@ pub fn window(hwnd: Hwnd) -> Result<(Frame, f32), String> {
         pixels
     };
     let full = full.ok_or("Windows would not draw that window")?;
-    let scale = win::app_scale(hwnd);
-    let units = |value: i32| (value as f32 / scale).round() as usize;
+    let raw_scale = win::app_scale(hwnd);
+    let scale = if raw_scale.is_finite() && raw_scale > 0.0 { raw_scale } else { 1.0 };
+    let units = |value: i32| (value as f32 / scale).round().max(0.0) as usize;
     let (left, top) = (units((x - ox).clamp(0, ow)), units((y - oy).clamp(0, oh)));
-    let (w, h) = (units(w).min(ow as usize - left), units(h).min(oh as usize - top));
-    let mut pixels = Vec::with_capacity(w * h * 4);
+    let (w, h) = (units(w).min((ow as usize).saturating_sub(left)), units(h).min((oh as usize).saturating_sub(top)));
+    if w == 0 || h == 0 {
+        return Err("that window has no size".into());
+    }
+    let mut pixels = Vec::with_capacity(w.saturating_mul(h).saturating_mul(4));
     for row in top..top + h {
         let start = (row * ow as usize + left) * 4;
         pixels.extend_from_slice(&full[start..start + w * 4]);
@@ -116,6 +124,9 @@ pub fn window(hwnd: Hwnd) -> Result<(Frame, f32), String> {
 /// What is on screen in this rectangle. The caller clears the overlay first.
 #[cfg(windows)]
 pub fn screen(x: i32, y: i32, w: i32, h: i32) -> Result<Frame, String> {
+    if w <= 0 || h <= 0 {
+        return Err("screen region needs a positive width and height".into());
+    }
     let pixels = unsafe {
         let source = GetDC(null_mut());
         let dc = CreateCompatibleDC(source);
@@ -140,44 +151,57 @@ impl Frame {
     }
 
     pub fn crop(&self, x: u32, y: u32, w: u32, h: u32) -> Frame {
-        let (x, y) = (x.min(self.w), y.min(self.h));
+        let expected = (self.w as usize).checked_mul(self.h as usize).and_then(|n| n.checked_mul(4));
+        if self.w == 0 || self.h == 0 || expected.is_none_or(|len| self.pixels.len() < len) || x >= self.w || y >= self.h || w == 0 || h == 0 {
+            return Frame { w: 0, h: 0, pixels: Vec::new() };
+        }
         let (w, h) = (w.min(self.w - x), h.min(self.h - y));
-        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        let Some(cap) = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)) else {
+            return Frame { w: 0, h: 0, pixels: Vec::new() };
+        };
+        let mut pixels = Vec::with_capacity(cap);
         for row in y..y + h {
-            let start = ((row * self.w + x) * 4) as usize;
-            pixels.extend_from_slice(&self.pixels[start..start + (w * 4) as usize]);
+            let start = (row as usize * self.w as usize + x as usize) * 4;
+            pixels.extend_from_slice(&self.pixels[start..start + w as usize * 4]);
         }
         Frame { w, h, pixels }
     }
 
     /// Shrink by averaging, which keeps small text readable where skipping pixels would not.
     pub fn shrink(self, edge: u32) -> (Frame, f32) {
+        let expected = (self.w as usize).checked_mul(self.h as usize).and_then(|n| n.checked_mul(4));
         let longest = self.w.max(self.h);
-        if longest <= edge || edge == 0 {
+        if self.w == 0 || self.h == 0 || edge == 0 || longest <= edge || expected.is_none_or(|len| self.pixels.len() < len) {
             return (self, 1.0);
         }
         let scale = longest as f32 / edge as f32;
         let (w, h) = (((self.w as f32 / scale) as u32).max(1), ((self.h as f32 / scale) as u32).max(1));
-        let mut pixels = vec![0u8; (w * h * 4) as usize];
+        let Some(len) = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)) else {
+            return (self, 1.0);
+        };
+        let mut pixels = vec![0u8; len];
         for y in 0..h {
-            let (top, bottom) = (y * self.h / h, ((y + 1) * self.h / h).max(y * self.h / h + 1).min(self.h));
+            let top = (y as u64 * self.h as u64 / h as u64) as u32;
+            let bottom = ((y as u64 + 1) * self.h as u64 / h as u64).max(top as u64 + 1).min(self.h as u64) as u32;
             for x in 0..w {
-                let (left, right) = (x * self.w / w, ((x + 1) * self.w / w).max(x * self.w / w + 1).min(self.w));
+                let left = (x as u64 * self.w as u64 / w as u64) as u32;
+                let right = ((x as u64 + 1) * self.w as u64 / w as u64).max(left as u64 + 1).min(self.w as u64) as u32;
                 let mut sum = [0u32; 3];
                 for sy in top..bottom {
-                    let row = (sy * self.w * 4) as usize;
+                    let row = sy as usize * self.w as usize * 4;
                     for sx in left..right {
-                        let at = row + (sx * 4) as usize;
+                        let at = row + sx as usize * 4;
                         for (channel, total) in sum.iter_mut().enumerate() {
                             *total += self.pixels[at + channel] as u32;
                         }
                     }
                 }
                 let count = (bottom - top) * (right - left);
-                let at = ((y * w + x) * 4) as usize;
+                let at = (y as usize * w as usize + x as usize) * 4;
                 for channel in 0..3 {
                     pixels[at + channel] = (sum[channel] / count) as u8;
                 }
+                pixels[at + 3] = 255;
             }
         }
         (Frame { w, h, pixels }, scale)
@@ -185,15 +209,27 @@ impl Frame {
 
     fn dot(&mut self, x: i32, y: i32, colour: [u8; 3]) {
         if x >= 0 && y >= 0 && (x as u32) < self.w && (y as u32) < self.h {
-            let at = ((y as u32 * self.w + x as u32) * 4) as usize;
-            self.pixels[at..at + 3].copy_from_slice(&colour);
+            let at = (y as usize * self.w as usize + x as usize) * 4;
+            if let Some(slot) = self.pixels.get_mut(at..at + 3) {
+                slot.copy_from_slice(&colour);
+            }
         }
     }
 
     fn block(&mut self, x: i32, y: i32, w: i32, h: i32, colour: [u8; 3]) {
-        for dy in 0..h {
-            for dx in 0..w {
-                self.dot(x + dx, y + dy, colour);
+        if w <= 0 || h <= 0 || self.w == 0 || self.h == 0 {
+            return;
+        }
+        let x0 = (x as i64).max(0);
+        let y0 = (y as i64).max(0);
+        let x1 = (x as i64 + w as i64).min(self.w as i64);
+        let y1 = (y as i64 + h as i64).min(self.h as i64);
+        if x0 >= x1 || y0 >= y1 {
+            return;
+        }
+        for py in y0..y1 {
+            for px in x0..x1 {
+                self.dot(px as i32, py as i32, colour);
             }
         }
     }
@@ -274,6 +310,13 @@ impl Frame {
     }
 
     pub fn save(&self, path: &PathBuf) -> Result<(), String> {
+        let expected = (self.w as usize).checked_mul(self.h as usize).and_then(|n| n.checked_mul(4));
+        if self.w == 0 || self.h == 0 || expected.is_none_or(|len| self.pixels.len() < len) {
+            return Err("cannot save an empty image".into());
+        }
+        let Some(rgb_cap) = (self.w as usize).checked_mul(self.h as usize).and_then(|n| n.checked_mul(3)) else {
+            return Err("image is too large to save".into());
+        };
         if let Some(folder) = path.parent() {
             fs::create_dir_all(folder).map_err(|e| e.to_string())?;
         }
@@ -283,8 +326,8 @@ impl Frame {
         encoder.set_depth(png::BitDepth::Eight);
         encoder.set_compression(png::Compression::Fast);
         let mut writer = encoder.write_header().map_err(|e| e.to_string())?;
-        let mut rgb = Vec::with_capacity((self.w * self.h * 3) as usize);
-        for pixel in self.pixels.as_chunks::<4>().0 {
+        let mut rgb = Vec::with_capacity(rgb_cap);
+        for pixel in self.pixels.as_chunks::<4>().0.iter().take((self.w as usize) * (self.h as usize)) {
             rgb.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
         }
         writer.write_image_data(&rgb).map_err(|e| e.to_string())
@@ -335,6 +378,7 @@ mod tests {
         assert_eq!((small.w, small.h), (1356, 847));
         assert!((scale - 1.888).abs() < 0.01);
         assert_eq!(small.pixels[0], 200);
+        assert_eq!(small.pixels[3], 255);
     }
 
     #[test]
@@ -376,5 +420,30 @@ mod tests {
         let mut drawn = solid(4, 4, 0);
         drawn.pixels[20] = 9;
         assert!(!drawn.is_blank());
+    }
+
+    #[test]
+    fn edge_cases_crop_block_shrink_and_save_are_safe() {
+        let mut picture = solid(20, 20, 0);
+        // Huge/overflowing rects clip fast without hanging or panicking.
+        picture.block(i32::MIN, -100, 2_000_000, 2_000_000, [99, 99, 99]);
+        assert_eq!(&picture.pixels[..3], &[0, 0, 0]);
+        picture.block(-100, -100, 2_000_000, 2_000_000, [10, 20, 30]);
+        picture.block(5, 5, -10, 10, [40, 50, 60]);
+        assert_eq!(&picture.pixels[..3], &[10, 20, 30]);
+
+        let empty_crop = picture.crop(100, 0, 10, 10);
+        assert_eq!((empty_crop.w, empty_crop.h), (0, 0));
+        let truncated = Frame { w: 100, h: 100, pixels: vec![0; 4] };
+        assert_eq!(truncated.crop(0, 0, 10, 10).w, 0);
+
+        let (zero_edge, scale) = solid(10, 10, 5).shrink(0);
+        assert_eq!((zero_edge.w, zero_edge.h, scale), (10, 10, 1.0));
+        let (empty_shrink, empty_scale) = Frame { w: 0, h: 0, pixels: Vec::new() }.shrink(100);
+        assert_eq!((empty_shrink.w, empty_shrink.h, empty_scale), (0, 0, 1.0));
+
+        let path = std::env::temp_dir().join("deskcrew_empty_save_test.png");
+        assert!(Frame { w: 0, h: 0, pixels: Vec::new() }.save(&path).is_err());
+        assert!(Frame { w: 4, h: 4, pixels: vec![0; 8] }.save(&path).is_err());
     }
 }

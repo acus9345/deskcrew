@@ -251,8 +251,16 @@ pub fn colour_for(name: &str, taken: &[Rgb]) -> Rgb {
         .unwrap_or(PALETTE[start % PALETTE.len()])
 }
 
+/// Hard caps on shape extent and generated stroke sizes to prevent OOM or hangs from extreme inputs.
+const MAX_SHAPE_EXTENT: f32 = 100_000.0;
+const MAX_STROKE_POINTS: usize = 20_000;
+const MAX_FILL_STROKES: usize = 5_000;
+
 /// Points every few pixels along a stroke, through a smooth curve if asked for.
 pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
+    if points.is_empty() {
+        return Vec::new();
+    }
     let at = |i: isize| {
         let p = points[i.clamp(0, points.len() as isize - 1) as usize];
         (p.0 as f32, p.1 as f32)
@@ -260,7 +268,9 @@ pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
     let mut out = vec![at(0)];
     for i in 0..points.len().saturating_sub(1) as isize {
         let (a, b, c, d) = (at(i - 1), at(i), at(i + 1), at(i + 2));
-        let steps = (((c.0 - b.0).hypot(c.1 - b.1) / STEP_PIXELS).ceil() as usize).max(1);
+        let dist = (c.0 - b.0).hypot(c.1 - b.1);
+        let raw_steps = if dist.is_finite() { (dist / STEP_PIXELS).ceil() } else { 1.0 };
+        let steps = (raw_steps.clamp(1.0, MAX_STROKE_POINTS as f32) as usize).max(1);
         for step in 1..=steps {
             let t = step as f32 / steps as f32;
             out.push(if smooth {
@@ -274,6 +284,9 @@ pub fn trace(points: &[(i32, i32)], smooth: bool) -> Vec<(f32, f32)> {
             } else {
                 (b.0 + (c.0 - b.0) * t, b.1 + (c.1 - b.1) * t)
             });
+            if out.len() >= MAX_STROKE_POINTS {
+                return out;
+            }
         }
     }
     out
@@ -287,10 +300,14 @@ pub fn schedule(path: &[(f32, f32)], speed: f32) -> Vec<f32> {
     if count < 2 {
         return vec![0.0; count];
     }
-    let length = |a: (f32, f32), b: (f32, f32)| (b.0 - a.0).hypot(b.1 - a.1);
+    let speed = if speed.is_finite() && speed > 0.0 { speed } else { PIXELS_PER_SECOND };
+    let length = |a: (f32, f32), b: (f32, f32)| {
+        let d = (b.0 - a.0).hypot(b.1 - a.1);
+        if d.is_finite() { d } else { 0.0 }
+    };
     let segments: Vec<f32> = (0..count).map(|i| if i == 0 { 0.0 } else { length(path[i - 1], path[i]) }).collect();
     let total: f32 = segments.iter().sum();
-    if total <= 0.0 {
+    if !total.is_finite() || total <= 0.0 {
         return vec![0.0; count];
     }
     // How sharply the stroke turns at each point, per pixel, then smoothed over its neighbours.
@@ -305,7 +322,8 @@ pub fn schedule(path: &[(f32, f32)], speed: f32) -> Vec<f32> {
             if turn > std::f32::consts::PI {
                 turn = 2.0 * std::f32::consts::PI - turn;
             }
-            turn / segments[i].max(1e-3)
+            let ratio = turn / segments[i].max(1e-3);
+            if ratio.is_finite() { ratio } else { 0.0 }
         })
         .collect();
     let smooth = |i: usize| {
@@ -320,11 +338,21 @@ pub fn schedule(path: &[(f32, f32)], speed: f32) -> Vec<f32> {
     let mut along = 0.0;
     for i in 1..count {
         along += segments[i];
-        let share = along / total;
+        let share = (along / total).clamp(0.0, 1.0);
         times[i] = times[i - 1] + segments[i] * (1.0 + CURVE_SLOWS * smooth(i)) * ramp(share) * ramp(1.0 - share);
     }
-    let scale = total / speed / times[count - 1].max(1e-6);
-    times.iter().map(|t| t * scale).collect()
+    let last_time = times[count - 1];
+    if !last_time.is_finite() || last_time <= 0.0 {
+        return vec![0.0; count];
+    }
+    let scale = total / speed / last_time.max(1e-6);
+    if !scale.is_finite() {
+        return vec![0.0; count];
+    }
+    times.iter().map(|t| {
+        let v = t * scale;
+        if v.is_finite() && v >= 0.0 { v } else { 0.0 }
+    }).collect()
 }
 
 /// Visit each point of a stroke on its handwriting schedule. False if stopped on the way.
@@ -341,7 +369,8 @@ pub fn pace_at(path: &[(f32, f32)], speed: f32, stop: &AtomicBool, mut visit: im
         if stop.load(Ordering::Relaxed) {
             return false;
         }
-        let due = Duration::from_secs_f32(due_at[at]);
+        let secs = if due_at[at].is_finite() && due_at[at] > 0.0 { due_at[at] } else { 0.0 };
+        let due = Duration::from_secs_f32(secs);
         while let Some(left) = due.checked_sub(started.elapsed()) {
             if left > Duration::from_millis(2) {
                 thread::sleep(left - Duration::from_millis(2));
@@ -430,11 +459,32 @@ pub fn is_shape(word: &str) -> bool {
     SHAPES.contains(&word.to_lowercase().as_str())
 }
 
+fn finite_value(value: f32, label: &str) -> Result<f32, String> {
+    if !value.is_finite() {
+        return Err(format!("{label} must be finite"));
+    }
+    Ok(value)
+}
+
+fn bounded_extent(value: f32, label: &str) -> Result<f32, String> {
+    let value = finite_value(value, label)?;
+    if value.abs() > MAX_SHAPE_EXTENT {
+        return Err(format!("{label} exceeds maximum extent of {MAX_SHAPE_EXTENT}"));
+    }
+    Ok(value)
+}
+
 pub fn parse_point(s: &str) -> Result<Point, String> {
     let s = s.trim().trim_matches('\'').trim_matches('"').trim();
     let (x, y) = s.split_once(',').ok_or_else(|| format!("'{s}' is not x,y"))?;
     let x = x.trim().parse::<f32>().map_err(|_| format!("'{s}' is not x,y"))?;
     let y = y.trim().parse::<f32>().map_err(|_| format!("'{s}' is not x,y"))?;
+    if !x.is_finite() || !y.is_finite() {
+        return Err(format!("'{s}' is not x,y"));
+    }
+    if x.abs() > MAX_SHAPE_EXTENT || y.abs() > MAX_SHAPE_EXTENT {
+        return Err(format!("point '{s}' exceeds +/-{MAX_SHAPE_EXTENT}"));
+    }
     Ok((x, y))
 }
 
@@ -475,6 +525,8 @@ pub fn parse_shape(script: &str) -> Result<Option<ShapeKind>, String> {
                 let (x, y) = parse_point(args[0])?;
                 let w = args[1].parse::<f32>().map_err(|_| format!("invalid width '{}'", args[1]))?;
                 let h = args[2].parse::<f32>().map_err(|_| format!("invalid height '{}'", args[2]))?;
+                let w = bounded_extent(w, "width")?;
+                let h = bounded_extent(h, "height")?;
                 if w < 0.0 || h < 0.0 {
                     return Err("width and height must be non-negative".into());
                 }
@@ -498,6 +550,7 @@ pub fn parse_shape(script: &str) -> Result<Option<ShapeKind>, String> {
             }
             let (cx, cy) = parse_point(args[0])?;
             let r = args[1].parse::<f32>().map_err(|_| format!("invalid radius '{}'", args[1]))?;
+            let r = bounded_extent(r, "radius")?;
             if r <= 0.0 {
                 return Err("radius must be positive".into());
             }
@@ -520,11 +573,12 @@ pub fn parse_shape(script: &str) -> Result<Option<ShapeKind>, String> {
             }
             let (cx, cy) = parse_point(raw_tokens[1])?;
             let r = raw_tokens[2].parse::<f32>().map_err(|_| format!("invalid radius '{}'", raw_tokens[2]))?;
+            let r = bounded_extent(r, "radius")?;
             if r <= 0.0 {
                 return Err("radius must be positive".into());
             }
-            let start_deg = raw_tokens[3].parse::<f32>().map_err(|_| format!("invalid start angle '{}'", raw_tokens[3]))?;
-            let end_deg = raw_tokens[4].parse::<f32>().map_err(|_| format!("invalid end angle '{}'", raw_tokens[4]))?;
+            let start_deg = finite_value(raw_tokens[3].parse::<f32>().map_err(|_| format!("invalid start angle '{}'", raw_tokens[3]))?, "start angle")?;
+            let end_deg = finite_value(raw_tokens[4].parse::<f32>().map_err(|_| format!("invalid end angle '{}'", raw_tokens[4]))?, "end angle")?;
             Ok(Some(ShapeKind::Arc { cx, cy, r, start_deg, end_deg }))
         }
         "bezier" => {
@@ -563,10 +617,10 @@ pub fn parse_shape(script: &str) -> Result<Option<ShapeKind>, String> {
 
 fn generate_line(start: Point, end: Point) -> Vec<Point> {
     let d = (end.0 - start.0).hypot(end.1 - start.1);
-    if d == 0.0 {
+    if !d.is_finite() || d == 0.0 {
         return vec![start];
     }
-    let steps = ((d / STEP_PIXELS).ceil() as usize).max(1);
+    let steps = ((d / STEP_PIXELS).ceil().clamp(1.0, MAX_STROKE_POINTS as f32) as usize).max(1);
     (0..=steps)
         .map(|i| {
             let t = i as f32 / steps as f32;
@@ -590,6 +644,7 @@ fn generate_rect(x: f32, y: f32, w: f32, h: f32, fill: bool) -> Vec<Vec<Point>> 
     if seg1.len() > 1 { outline.extend_from_slice(&seg1[1..]); }
     if seg2.len() > 1 { outline.extend_from_slice(&seg2[1..]); }
     if seg3.len() > 1 { outline.extend_from_slice(&seg3[1..]); }
+    outline.truncate(MAX_STROKE_POINTS);
 
     if !fill {
         return vec![outline];
@@ -597,7 +652,8 @@ fn generate_rect(x: f32, y: f32, w: f32, h: f32, fill: bool) -> Vec<Vec<Point>> 
 
     let mut fill_stroke = Vec::new();
     let pitch = 4.0_f32;
-    let rows = ((h / pitch).ceil() as usize).max(1);
+    let raw_rows = if h.is_finite() && h > 0.0 { (h / pitch).ceil() } else { 1.0 };
+    let rows = (raw_rows.clamp(1.0, MAX_FILL_STROKES as f32) as usize).max(1);
     for row in 0..=rows {
         let y_curr = (y + row as f32 * pitch).min(y + h);
         let (row_start, row_end) = if row % 2 == 0 {
@@ -617,13 +673,20 @@ fn generate_rect(x: f32, y: f32, w: f32, h: f32, fill: bool) -> Vec<Vec<Point>> 
                 fill_stroke.extend_from_slice(&line[1..]);
             }
         }
+        if fill_stroke.len() >= MAX_STROKE_POINTS {
+            fill_stroke.truncate(MAX_STROKE_POINTS);
+            break;
+        }
     }
     vec![outline, fill_stroke]
 }
 
 fn generate_circle(cx: f32, cy: f32, r: f32, fill: bool) -> Vec<Vec<Point>> {
+    if !r.is_finite() || r <= 0.0 {
+        return Vec::new();
+    }
     let c = 2.0 * std::f32::consts::PI * r;
-    let steps = ((c / STEP_PIXELS).ceil() as usize).max(12);
+    let steps = ((c / STEP_PIXELS).ceil().clamp(12.0, MAX_STROKE_POINTS as f32) as usize).max(12);
     let outline: Vec<Point> = (0..=steps)
         .map(|i| {
             let theta = 2.0 * std::f32::consts::PI * (i as f32 / steps as f32);
@@ -637,7 +700,7 @@ fn generate_circle(cx: f32, cy: f32, r: f32, fill: bool) -> Vec<Vec<Point>> {
 
     let mut fill_stroke = Vec::new();
     let pitch = 4.0_f32;
-    let rows = ((2.0 * r / pitch).ceil() as usize).max(1);
+    let rows = (((2.0 * r / pitch).ceil()).clamp(1.0, MAX_FILL_STROKES as f32) as usize).max(1);
     for row in 0..=rows {
         let y_curr = (cy - r + row as f32 * pitch).min(cy + r);
         let dy = y_curr - cy;
@@ -661,15 +724,22 @@ fn generate_circle(cx: f32, cy: f32, r: f32, fill: bool) -> Vec<Vec<Point>> {
                     fill_stroke.extend_from_slice(&line[1..]);
                 }
             }
+            if fill_stroke.len() >= MAX_STROKE_POINTS {
+                fill_stroke.truncate(MAX_STROKE_POINTS);
+                break;
+            }
         }
     }
     vec![outline, fill_stroke]
 }
 
 fn generate_ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<Vec<Point>> {
+    if !rx.is_finite() || !ry.is_finite() || rx <= 0.0 || ry <= 0.0 {
+        return Vec::new();
+    }
     let h = ((rx - ry) / (rx + ry)).powi(2);
     let p = std::f32::consts::PI * (rx + ry) * (1.0 + 3.0 * h / (10.0 + (4.0 - 3.0 * h).max(0.0).sqrt()));
-    let steps = ((p / STEP_PIXELS).ceil() as usize).max(12);
+    let steps = ((p / STEP_PIXELS).ceil().clamp(12.0, MAX_STROKE_POINTS as f32) as usize).max(12);
     let points: Vec<Point> = (0..=steps)
         .map(|i| {
             let theta = 2.0 * std::f32::consts::PI * (i as f32 / steps as f32);
@@ -680,15 +750,15 @@ fn generate_ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<Vec<Point>> {
 }
 
 fn generate_arc(cx: f32, cy: f32, r: f32, start_deg: f32, end_deg: f32) -> Vec<Vec<Point>> {
-    let mut delta_deg = end_deg - start_deg;
-    if delta_deg < 0.0 {
-        delta_deg += 360.0;
+    if !r.is_finite() || r <= 0.0 || !start_deg.is_finite() || !end_deg.is_finite() {
+        return Vec::new();
     }
+    let mut delta_deg = (end_deg - start_deg).rem_euclid(360.0);
     if delta_deg == 0.0 {
         delta_deg = 360.0;
     }
     let arc_len = r * delta_deg.to_radians();
-    let steps = ((arc_len / STEP_PIXELS).ceil() as usize).max(2);
+    let steps = ((arc_len / STEP_PIXELS).ceil().clamp(2.0, MAX_STROKE_POINTS as f32) as usize).max(2);
     let points: Vec<Point> = (0..=steps)
         .map(|i| {
             let t = i as f32 / steps as f32;
@@ -706,7 +776,8 @@ fn generate_bezier(p0: Point, p1: Point, p2: Point, p3: Point) -> Vec<Vec<Point>
     let d3 = (p3.0 - p2.0).hypot(p3.1 - p2.1);
     let chord = (p3.0 - p0.0).hypot(p3.1 - p0.1);
     let approx_len = (d1 + d2 + d3 + chord) * 0.5;
-    let steps = ((approx_len / STEP_PIXELS).ceil() as usize).max(4);
+    let raw_steps = if approx_len.is_finite() { (approx_len / STEP_PIXELS).ceil() } else { 4.0 };
+    let steps = (raw_steps.clamp(4.0, MAX_STROKE_POINTS as f32) as usize).max(4);
     let points: Vec<Point> = (0..=steps)
         .map(|i| {
             let t = i as f32 / steps as f32;
@@ -736,6 +807,10 @@ fn generate_poly(points: &[Point], close: bool) -> Vec<Vec<Point>> {
             stroke.extend(seg);
         } else if seg.len() > 1 {
             stroke.extend_from_slice(&seg[1..]);
+        }
+        if stroke.len() >= MAX_STROKE_POINTS {
+            stroke.truncate(MAX_STROKE_POINTS);
+            break;
         }
     }
     vec![stroke]
@@ -1045,5 +1120,37 @@ mod tests {
         assert!(parse_shape("rect 10,10 -50,20").is_err());
         assert!(parse_shape("bezier 10,10 20,20").is_err());
         assert!(parse_shape("poly 10,10").is_err());
+        assert!(parse_shape("circle 100,100 NaN").is_err());
+        assert!(parse_shape("circle 100,100 inf").is_err());
+        assert!(parse_shape("circle 100,100 -inf").is_err());
+        assert!(parse_shape("circle 100,100 100000000 --fill").is_err());
+        assert!(parse_point("NaN,10").is_err());
+        assert!(parse_point("10,inf").is_err());
+        assert!(parse_point("1000000,0").is_err());
+    }
+
+    #[test]
+    fn trace_schedule_and_arc_handle_edge_cases_safely() {
+        assert!(trace(&[], false).is_empty());
+        assert!(trace(&[], true).is_empty());
+
+        let seg = vec![(0.0, 0.0), (60.0, 0.0)];
+        for bad_speed in [0.0, -5.0, f32::NAN, f32::INFINITY] {
+            let due = schedule(&seg, bad_speed);
+            assert_eq!(due.len(), 2);
+            assert!(due.iter().all(|t| t.is_finite() && *t >= 0.0));
+        }
+
+        let nan_path = vec![(0.0, 0.0), (f32::NAN, 10.0), (20.0, 10.0)];
+        let due_nan = schedule(&nan_path, 100.0);
+        assert!(due_nan.iter().all(|t| t.is_finite() && *t >= 0.0));
+
+        // Large negative and multi-turn arc sweeps remain bounded and valid.
+        let arc = generate_arc(100.0, 100.0, 50.0, 0.0, -450.0);
+        assert_eq!(arc.len(), 1);
+        assert!(arc[0].len() >= 3 && arc[0].len() <= MAX_STROKE_POINTS + 1);
+        for pt in &arc[0] {
+            assert!(((pt.0 - 100.0).hypot(pt.1 - 100.0) - 50.0).abs() < 0.05);
+        }
     }
 }

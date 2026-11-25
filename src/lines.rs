@@ -172,8 +172,9 @@ pub fn page(seen: &Seen, find: Option<&str>, from: usize) -> Vec<String> {
         .collect();
     let total = matched.len();
     let mut out: Vec<String> = matched.into_iter().skip(from).take(MAX_LINES).collect();
-    if from + out.len() < total {
-        out.push(format!("... {} more: see --from {} or --find word", total - from - out.len(), from + MAX_LINES));
+    let shown_end = from.saturating_add(out.len());
+    if shown_end < total {
+        out.push(format!("... {} more: see --from {} or --find word", total - shown_end, from.saturating_add(MAX_LINES)));
     }
     out
 }
@@ -185,8 +186,12 @@ pub fn split_steps(script: &str) -> Vec<Vec<String>> {
     let mut word = String::new();
     let mut quote = None;
     let mut started = false;
-    for c in script.chars() {
+    let mut chars = script.chars().peekable();
+    while let Some(c) = chars.next() {
         match quote {
+            Some(q) if c == '\\' && chars.peek() == Some(&q) => {
+                word.push(chars.next().unwrap());
+            }
             Some(q) if c == q => quote = None,
             Some(_) => word.push(c),
             None if c == '"' || c == '\'' => {
@@ -295,5 +300,19 @@ mod tests {
             vec![vec!["click", "e1"], vec!["set", "e2", "a; b"], vec!["key", "enter"]]
         );
         assert_eq!(split_steps("set e1 ''"), vec![vec!["set", "e1", ""]]);
+    }
+
+    #[test]
+    fn page_saturates_near_usize_max_and_steps_handle_escaped_quotes_and_windows_paths() {
+        let all = seen(&[(1, "a"), (2, "b")]);
+        assert!(page(&all, None, usize::MAX).is_empty());
+        assert_eq!(
+            split_steps(r#"set e1 "say \"hi\""; set e2 'it\'s fine'; set e3 "C:\Users\Alice\notes.txt""#),
+            vec![
+                vec!["set", "e1", r#"say "hi""#],
+                vec!["set", "e2", "it's fine"],
+                vec!["set", "e3", r#"C:\Users\Alice\notes.txt"#],
+            ]
+        );
     }
 }

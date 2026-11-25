@@ -135,19 +135,31 @@ pub fn stroke(
     let path: Vec<(f32, f32)> = points.iter().map(|p| (p.0 as f32, p.1 as f32)).collect();
     let due = crate::motion::schedule(&path, crate::motion::PIXELS_PER_SECOND);
     let started = std::time::Instant::now();
+    let mut drag_err = None;
     for (at, point) in points.iter().enumerate().skip(1) {
         if stop() {
             finished = false;
             break;
         }
-        if let Some(wait) = Duration::from_secs_f32(due[at]).checked_sub(started.elapsed()) {
+        let secs = due[at];
+        if secs.is_finite()
+            && secs > 0.0
+            && let Some(wait) = Duration::from_secs_f32(secs).checked_sub(started.elapsed())
+        {
             thread::sleep(wait);
         }
-        post(To::App(pid), make(drag, *point))?;
+        if let Err(err) = post(To::App(pid), make(drag, *point)) {
+            drag_err = Some(err);
+            break;
+        }
         moved(at, point.0, point.1);
         last = *point;
     }
-    post(To::App(pid), make(up, last))?;
+    let up_res = post(To::App(pid), make(up, last));
+    if let Some(err) = drag_err {
+        return Err(err);
+    }
+    up_res?;
     Ok(finished)
 }
 
@@ -218,18 +230,27 @@ fn key_code(name: &str) -> Option<u16> {
     let code = match name {
         "enter" | "return" => 36,
         "tab" => 48,
-        "space" => 49,
-        "backspace" | "delete" => 51,
+        "space" | "spacebar" => 49,
+        "backspace" | "back" => 51,
         "esc" | "escape" => 53,
         "del" | "forwarddelete" => 117,
+        "insert" | "ins" => 114,
         "home" => 115,
         "end" => 119,
-        "pageup" => 116,
-        "pagedown" => 121,
+        "pageup" | "pgup" => 116,
+        "pagedown" | "pgdn" => 121,
         "left" => 123,
         "right" => 124,
         "down" => 125,
         "up" => 126,
+        "plus" | "equal" | "equals" => 24,
+        "minus" => 27,
+        "quote" => 39,
+        "semicolon" => 41,
+        "backslash" => 42,
+        "comma" => 43,
+        "slash" => 44,
+        "period" => 47,
         "`" => 50,
         "f1" => 122,
         "f2" => 120,
@@ -243,6 +264,14 @@ fn key_code(name: &str) -> Option<u16> {
         "f10" => 109,
         "f11" => 103,
         "f12" => 111,
+        "f13" => 105,
+        "f14" => 107,
+        "f15" => 113,
+        "f16" => 106,
+        "f17" => 64,
+        "f18" => 79,
+        "f19" => 80,
+        "f20" => 90,
         _ => {
             let mut chars = name.chars();
             let (Some(c), None) = (chars.next(), chars.next()) else { return None };
@@ -257,7 +286,7 @@ fn key_code(name: &str) -> Option<u16> {
 
 fn modifier(name: &str) -> Option<u64> {
     Some(match name {
-        "cmd" | "command" | "win" | "meta" => kCGEventFlagMaskCommand,
+        "cmd" | "command" | "win" | "meta" | "super" => kCGEventFlagMaskCommand,
         "ctrl" | "control" => kCGEventFlagMaskControl,
         "alt" | "option" | "opt" => kCGEventFlagMaskAlternate,
         "shift" => kCGEventFlagMaskShift,
@@ -267,12 +296,26 @@ fn modifier(name: &str) -> Option<u64> {
 
 /// Modifier keys alone, as for `click --with ctrl+shift`.
 pub fn modifiers(spec: &str) -> Result<u64, String> {
-    spec.to_lowercase().split('+').map(str::trim).try_fold(0, |flags, part| modifier(part).map(|f| flags | f).ok_or(format!("unknown modifier '{part}'")))
+    if spec.trim().is_empty() {
+        return Err("no modifier given".into());
+    }
+    spec.to_lowercase().split('+').map(str::trim).try_fold(0, |flags, part| {
+        if part.is_empty() {
+            return Err(format!("empty modifier in '{spec}'"));
+        }
+        modifier(part).map(|f| flags | f).ok_or(format!("unknown modifier '{part}'"))
+    })
 }
 
 pub fn chord(spec: &str) -> Result<Chord, String> {
     let lower = spec.to_lowercase();
+    if lower.trim().is_empty() {
+        return Err("no key given".into());
+    }
     let parts: Vec<&str> = lower.split('+').map(str::trim).collect();
+    if parts.iter().any(|p| p.is_empty()) {
+        return Err(format!("empty key in '{spec}': use 'plus' for '+'"));
+    }
     let (last, rest) = parts.split_last().ok_or("no key given")?;
     let mut flags = 0;
     for part in rest {
@@ -341,10 +384,25 @@ mod tests {
         assert_eq!(chord("enter").unwrap().key, Some(36));
         assert_eq!(chord("m").unwrap().key, Some(46));
         assert_eq!(chord("shift").unwrap().key, None);
+        assert_eq!(chord("super+s").unwrap().flags, kCGEventFlagMaskCommand);
+        assert_eq!(chord("ctrl + pgup").unwrap().key, Some(116));
+        assert_eq!(chord("pgdn").unwrap().key, Some(121));
+        assert_eq!(chord("spacebar").unwrap().key, Some(49));
+        assert_eq!(chord("back").unwrap().key, Some(51));
+        assert_eq!(chord("ins").unwrap().key, Some(114));
+        assert_eq!(chord("plus").unwrap().key, Some(24));
+        assert_eq!(chord("minus").unwrap().key, Some(27));
+        assert_eq!(chord("comma").unwrap().key, Some(43));
+        assert_eq!(chord("period").unwrap().key, Some(47));
+        assert_eq!(chord("f20").unwrap().key, Some(90));
         assert!(chord("hyper+s").is_err());
+        assert!(chord("").is_err());
+        assert!(chord("cmd++").is_err());
         assert!(is_risky(&chord("cmd+q").unwrap()));
         assert!(!is_risky(&chord("cmd+c").unwrap()));
         assert_eq!(modifiers("ctrl+shift").unwrap(), kCGEventFlagMaskControl | kCGEventFlagMaskShift);
+        assert!(modifiers("").is_err());
+        assert!(modifiers("ctrl+").is_err());
     }
 
     #[test]

@@ -27,12 +27,22 @@ pub struct Pen {
     device: HSYNTHETICPOINTERDEVICE,
     /// Where the person's pointer was before the pen moved it.
     pointer: POINT,
-    /// Where the pen last was, so a pointer still there was left by the pen, not the person.
-    last: Cell<Option<POINT>>,
+    /// Where the pen last aimed, where it aimed just before that, and what GetCursorPos last saw.
+    sent: Cell<Option<POINT>>,
+    prev_sent: Cell<Option<POINT>>,
+    observed: Cell<Option<POINT>>,
 }
 
 /// How far a pointer may be from the pen's last spot and still count as left there by the pen.
-const LEFT_BY_PEN: i32 = 3;
+const LEFT_BY_PEN: i32 = 4;
+
+fn near(a: POINT, b: POINT) -> bool {
+    (a.x as i64 - b.x as i64).abs() <= LEFT_BY_PEN as i64 && (a.y as i64 - b.y as i64).abs() <= LEFT_BY_PEN as i64
+}
+
+fn should_restore_cursor(now: POINT, sent: Option<POINT>, prev_sent: Option<POINT>, observed: Option<POINT>) -> bool {
+    sent.is_some_and(|p| near(now, p)) || prev_sent.is_some_and(|p| near(now, p)) || observed.is_some_and(|p| near(now, p))
+}
 
 fn pointer() -> POINT {
     let mut at = POINT { x: 0, y: 0 };
@@ -46,7 +56,13 @@ unsafe impl Send for Pen {}
 impl Pen {
     pub fn new() -> Option<Pen> {
         let device = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) };
-        (!device.is_null()).then(|| Pen { device, pointer: pointer(), last: Cell::new(None) })
+        (!device.is_null()).then(|| Pen {
+            device,
+            pointer: pointer(),
+            sent: Cell::new(None),
+            prev_sent: Cell::new(None),
+            observed: Cell::new(None),
+        })
     }
 
     fn send(&self, x: i32, y: i32, flags: POINTER_FLAGS, pressure: u32) -> bool {
@@ -66,7 +82,11 @@ impl Pen {
             pen.pressure = pressure;
             InjectSyntheticPointerInput(self.device, &input, 1) != 0
         };
-        self.last.set(Some(pointer()));
+        if ok {
+            self.prev_sent.set(self.sent.get());
+            self.sent.set(Some(POINT { x, y }));
+            self.observed.set(Some(pointer()));
+        }
         ok
     }
 
@@ -153,11 +173,65 @@ impl Drop for Pen {
     fn drop(&mut self) {
         unsafe { DestroySyntheticPointerDevice(self.device) };
         // Give the pointer back, unless the person has taken it somewhere else meanwhile.
-        if let Some(last) = self.last.get() {
+        if self.sent.get().is_some() {
+            // Let any in-flight synthetic pointer event drain so it cannot move the cursor after SetCursorPos.
+            thread::sleep(SETTLE);
             let now = pointer();
-            if (now.x - last.x).abs() <= LEFT_BY_PEN && (now.y - last.y).abs() <= LEFT_BY_PEN {
+            if should_restore_cursor(now, self.sent.get(), self.prev_sent.get(), self.observed.get()) {
                 unsafe { SetCursorPos(self.pointer.x, self.pointer.y) };
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pt(x: i32, y: i32) -> POINT {
+        POINT { x, y }
+    }
+
+    #[test]
+    fn restores_cursor_when_async_win32k_lagged_observed_point() {
+        // Simulates InjectSyntheticPointerInput queued (300, 400), GetCursorPos immediately after
+        // still saw previous point (120, 120), then by Pen::drop the OS cursor arrived at (300, 400).
+        assert!(should_restore_cursor(
+            pt(300, 400),
+            Some(pt(300, 400)),
+            Some(pt(120, 120)),
+            Some(pt(120, 120)),
+        ));
+    }
+
+    #[test]
+    fn restores_cursor_for_prev_sent_observed_and_boundary_tolerance() {
+        assert!(should_restore_cursor(pt(120, 120), Some(pt(300, 400)), Some(pt(120, 120)), None));
+        assert!(should_restore_cursor(pt(500, 500), Some(pt(520, 520)), None, Some(pt(500, 500))));
+        assert!(should_restore_cursor(
+            pt(100 + LEFT_BY_PEN, 200 - LEFT_BY_PEN),
+            Some(pt(100, 200)),
+            None,
+            None,
+        ));
+        assert!(!should_restore_cursor(
+            pt(100 + LEFT_BY_PEN + 1, 200),
+            Some(pt(100, 200)),
+            None,
+            None,
+        ));
+    }
+
+    #[test]
+    fn skips_restore_when_user_moved_cursor_or_pen_was_unused() {
+        assert!(!should_restore_cursor(
+            pt(900, 900),
+            Some(pt(300, 400)),
+            Some(pt(280, 390)),
+            Some(pt(280, 390)),
+        ));
+        assert!(!should_restore_cursor(pt(300, 400), None, None, None));
+        // Extreme coordinate difference does not overflow i32 subtraction.
+        assert!(!should_restore_cursor(pt(i32::MAX, i32::MIN), Some(pt(i32::MIN, i32::MAX)), None, None));
     }
 }
