@@ -348,10 +348,13 @@ impl SavedClipboard {
         Ok(SavedClipboard { _loan: loan, formats, lent: None, restored: false })
     }
 
-    fn write_kept(&mut self) -> Result<(), String> {
+    fn write_kept(&self) -> Result<(), String> {
+        if self.formats.is_empty() {
+            return put_on_clipboard(&[]);
+        }
         let quiet = quiet_format();
-        let mut formats = std::mem::take(&mut self.formats);
-        if !formats.iter().any(|(format, _)| *format == quiet) {
+        let mut formats = self.formats.clone();
+        if quiet != 0 && !formats.iter().any(|(format, _)| *format == quiet) {
             formats.push((quiet, vec![0; 4]));
         }
         put_on_clipboard(&formats)
@@ -359,7 +362,14 @@ impl SavedClipboard {
 
     /// Put the agent's text on the clipboard, kept out of the person's clipboard history.
     pub fn lend(&mut self, text: &str) -> Result<(), String> {
-        if let Err((err, emptied)) = put_on_clipboard_checked(&[(CF_UNICODETEXT, units_as_bytes(&wide(text))), (quiet_format(), vec![0; 4])]) {
+        let quiet = quiet_format();
+        let text_entry = (CF_UNICODETEXT, units_as_bytes(&wide(text)));
+        let res = if quiet != 0 {
+            put_on_clipboard_checked(&[text_entry, (quiet, vec![0; 4])])
+        } else {
+            put_on_clipboard_checked(&[text_entry])
+        };
+        if let Err((err, emptied)) = res {
             if emptied {
                 let _ = self.write_kept();
             }
@@ -381,7 +391,11 @@ impl SavedClipboard {
             return Ok(());
         }
         // Putting it back is not a new copy, so history does not get it twice.
-        self.write_kept()
+        let res = self.write_kept();
+        if res.is_ok() {
+            self.formats.clear();
+        }
+        res
     }
 
     /// Put the person's clipboard back, unless they copied something new in the meantime.

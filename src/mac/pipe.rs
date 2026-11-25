@@ -252,4 +252,14 @@ mod tests {
         let err = frame_len(MAX_MESSAGE + 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn receive_rejects_oversized_length_header() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let client = Pipe(a);
+        let server = Pipe(b);
+        (&client.0).write_all(&(MAX_MESSAGE as u32 + 1).to_le_bytes()).unwrap();
+        let err = server.receive().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
 }

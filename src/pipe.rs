@@ -313,4 +313,22 @@ mod tests {
         let err = frame_len(MAX_MESSAGE + 1).unwrap_err();
         assert_eq!(err.kind(), io::ErrorKind::InvalidData);
     }
+
+    #[test]
+    fn receive_rejects_oversized_length_header() {
+        let pipe_name = test_pipe_name("oversize-recv");
+        let server = Pipe::listen_at(&pipe_name, true).unwrap();
+        let client_name = pipe_name.clone();
+        let client = thread::spawn(move || {
+            let handle = unsafe { CreateFileW(client_name.as_ptr(), GENERIC_READ | GENERIC_WRITE, 0, null(), OPEN_EXISTING, 0, std::ptr::null_mut()) };
+            assert_ne!(handle, INVALID_HANDLE_VALUE);
+            let pipe = Pipe(handle);
+            let bad_len = (MAX_MESSAGE as u32 + 1).to_le_bytes();
+            pipe.write_all(&bad_len).unwrap();
+        });
+        server.accept().unwrap();
+        let err = server.receive().unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        client.join().unwrap();
+    }
 }

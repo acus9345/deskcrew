@@ -423,6 +423,10 @@ fn next_shield_count(current: usize, on: bool) -> usize {
     if on { current.saturating_add(1) } else { current.saturating_sub(1) }
 }
 
+fn next_aside_depth(current: usize, on: bool) -> usize {
+    if on { current.saturating_add(1) } else { current.saturating_sub(1) }
+}
+
 impl Flash {
     fn new(colour: Rgb, target: Rect, scale: f32, over: Option<Hwnd>) -> Option<Flash> {
         let (w, h) = clamp_flash_size(target.w, target.h);
@@ -473,7 +477,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
     let mut agents: Vec<Agent> = Vec::new();
     let mut flashes: Vec<Flash> = Vec::new();
     let mut last_frame: Option<Instant> = None;
-    let mut aside = false;
+    let mut aside_depth: usize = 0;
     let mut shields: usize = 0;
     let mut hook: HHOOK = null_mut();
     let mut stacked = Instant::now();
@@ -539,7 +543,7 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
                             found.over = Some(waiting.swap_remove(at).1);
                         }
                         found.stack(false);
-                        found.aside = aside;
+                        found.aside = aside_depth > 0;
                         found.fly(to, arrived);
                         stats.flights += 1;
                     }
@@ -614,22 +618,26 @@ fn run(inbox: Receiver<Command>, ready: Sender<(u32, Option<u32>)>, stop: Arc<At
                     let _ = ready.send(());
                 }
                 Command::Aside { on, cleared } => {
-                    aside = on;
-                    for agent in &mut agents {
-                        agent.aside = on;
-                        if agent.visible {
-                            agent.draw();
+                    let was = aside_depth > 0;
+                    aside_depth = next_aside_depth(aside_depth, on);
+                    let now_aside = aside_depth > 0;
+                    if now_aside != was {
+                        for agent in &mut agents {
+                            agent.aside = now_aside;
+                            if agent.visible {
+                                agent.draw();
+                            }
                         }
-                    }
-                    for flash in &mut flashes {
-                        flash.aside = on;
-                        flash.step(Instant::now());
-                    }
-                    if on {
-                        // The second flush covers a composition already under way at the first.
-                        unsafe {
-                            DwmFlush();
-                            DwmFlush();
+                        for flash in &mut flashes {
+                            flash.aside = now_aside;
+                            flash.step(Instant::now());
+                        }
+                        if now_aside {
+                            // The second flush covers a composition already under way at the first.
+                            unsafe {
+                                DwmFlush();
+                                DwmFlush();
+                            }
                         }
                     }
                     let _ = cleared.send(());
@@ -698,5 +706,19 @@ mod tests {
         assert_eq!(next_shield_count(0, true), 1);
         assert_eq!(next_shield_count(1, false), 0);
         assert_eq!(next_shield_count(usize::MAX, true), usize::MAX);
+    }
+
+    #[test]
+    fn aside_refcount_handles_overlapping_calls() {
+        let mut d = 0;
+        d = next_aside_depth(d, true);
+        d = next_aside_depth(d, true);
+        assert_eq!(d, 2);
+        d = next_aside_depth(d, false);
+        assert_eq!(d, 1);
+        d = next_aside_depth(d, false);
+        assert_eq!(d, 0);
+        d = next_aside_depth(d, false);
+        assert_eq!(d, 0);
     }
 }

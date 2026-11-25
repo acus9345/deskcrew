@@ -336,8 +336,10 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                             entry.glide = None;
                             entry.at = to;
                             entry.layer.place(x as f64 - entry.tip.0, y as f64 - entry.tip.1, screen_h);
-                            if !aside && (created || !entry.visible || over_changed) && entry.above != 0 {
-                                entry.layer.stack(entry.above);
+                            if created || !entry.visible || over_changed {
+                                if !aside && entry.above != 0 {
+                                    entry.layer.stack(entry.above);
+                                }
                                 entry.visible = true;
                             }
                             if let Some(done) = done {
@@ -350,8 +352,8 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                         entry.side = -entry.side;
                         if !aside && entry.above != 0 {
                             entry.layer.stack(entry.above);
-                            entry.visible = true;
                         }
+                        entry.visible = true;
                     }
                     Command::Over { agent, window } => {
                         if let Some(entry) = agents.get_mut(&agent) {
@@ -368,8 +370,8 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                     }
                     Command::Press { agent, target } => {
                         let target = Rect {
-                            w: target.w.clamp(1, 8192),
-                            h: target.h.clamp(1, 8192),
+                            w: target.w.max(1),
+                            h: target.h.max(1),
                             ..target
                         };
                         if let Some(entry) = agents.get_mut(&agent) {
@@ -386,17 +388,13 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                             entry.pose.type_keys(Instant::now(), keys);
                             if !aside && entry.above != 0 && !entry.visible {
                                 entry.layer.stack(entry.above);
-                                entry.visible = true;
                             }
+                            entry.visible = true;
                         }
                     }
                     Command::Aside(on, done) => {
                         let was = aside_depth > 0;
-                        if on {
-                            aside_depth = aside_depth.saturating_add(1);
-                        } else {
-                            aside_depth = aside_depth.saturating_sub(1);
-                        }
+                        aside_depth = next_aside_depth(aside_depth, on);
                         let now_aside = aside_depth > 0;
                         if now_aside != was {
                             for agent in agents.values_mut() {
@@ -459,8 +457,8 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                 }
                 let margin = draw::outline_margin(scale as f32) as f64 / scale;
                 let (w, h) = (
-                    ((press.target.w as f64 * scale).round() as i32).clamp(1, 8192),
-                    ((press.target.h as f64 * scale).round() as i32).clamp(1, 8192),
+                    clamp_press_pixels(press.target.w, scale),
+                    clamp_press_pixels(press.target.h, scale),
                 );
                 if let Some(picture) = draw::press(press.colour, w, h, scale as f32, ms.min(draw::PRESS_SETTLE_MS)) {
                     press.layer.show(&picture, scale, press.target.x as f64 - margin, press.target.y as f64 - margin, screen_h);
@@ -480,5 +478,30 @@ pub fn run(inbox: Receiver<Command>, stop: &dyn Fn() -> bool) {
                 }
             }
         }
+    }
+}
+
+fn next_aside_depth(current: usize, on: bool) -> usize {
+    if on { current.saturating_add(1) } else { current.saturating_sub(1) }
+}
+
+fn clamp_press_pixels(points: i32, scale: f64) -> i32 {
+    let scaled = (points.max(1) as f64 * scale).round();
+    if !scaled.is_finite() { 1 } else { scaled.clamp(1.0, 8192.0) as i32 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aside_depth_and_press_clamping_handle_edges() {
+        assert_eq!(next_aside_depth(0, false), 0);
+        assert_eq!(next_aside_depth(next_aside_depth(0, true), true), 2);
+        assert_eq!(next_aside_depth(usize::MAX, true), usize::MAX);
+        assert_eq!(clamp_press_pixels(-10, 2.0), 2);
+        assert_eq!(clamp_press_pixels(5000, 2.0), 8192);
+        assert_eq!(text_mask("agent", 0.0).w, 1);
+        assert_eq!(text_mask("agent", f64::NAN).w, 1);
     }
 }

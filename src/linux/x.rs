@@ -1803,7 +1803,10 @@ impl SavedClipboard {
     }
 
     pub fn lend(&mut self, text: &str) -> Result<(), String> {
-        set_clipboard_unlocked(Some(text))?;
+        if let Err(err) = set_clipboard_unlocked(Some(text)) {
+            let _ = restore_kept(self.kept.as_ref());
+            return Err(err);
+        }
         self.lent = Some(text.to_string());
         Ok(())
     }
@@ -1819,17 +1822,8 @@ impl SavedClipboard {
         if clipboard().ok().flatten().as_deref() != Some(lent.as_str()) {
             return Ok(());
         }
-        let Some((kind, bytes)) = self.kept.take() else { return set_clipboard_unlocked(None) };
-        if kind == "UTF8_STRING" || kind.starts_with("text/plain") {
-            return set_clipboard_unlocked(Some(&String::from_utf8_lossy(&bytes)));
-        }
-        if use_wayland_clipboard()
-            && let Some(done) = own_clipboard("wl-copy", &["--type", &kind], &bytes, None)
-        {
-            return done;
-        }
-        own_clipboard("xclip", &["-selection", "clipboard", "-t", &kind, "-i"], &bytes, None)
-            .unwrap_or_else(|| Err("the clipboard needs xclip to put a picture or files back".into()))
+        let kept = self.kept.take();
+        restore_kept(kept.as_ref())
     }
 
     /// Put the person's clipboard back, unless they copied something new in the meantime.
@@ -1842,6 +1836,20 @@ impl Drop for SavedClipboard {
     fn drop(&mut self) {
         let _ = self.restore_inner();
     }
+}
+
+fn restore_kept(kept: Option<&(String, Vec<u8>)>) -> Result<(), String> {
+    let Some((kind, bytes)) = kept else { return set_clipboard_unlocked(None) };
+    if kind == "UTF8_STRING" || kind.starts_with("text/plain") {
+        return set_clipboard_unlocked(Some(&String::from_utf8_lossy(bytes)));
+    }
+    if use_wayland_clipboard()
+        && let Some(done) = own_clipboard("wl-copy", &["--type", kind], bytes, None)
+    {
+        return done;
+    }
+    own_clipboard("xclip", &["-selection", "clipboard", "-t", kind, "-i"], bytes, None)
+        .unwrap_or_else(|| Err("the clipboard needs xclip to put a picture or files back".into()))
 }
 
 #[cfg(test)]

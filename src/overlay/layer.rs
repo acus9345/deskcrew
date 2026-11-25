@@ -81,6 +81,26 @@ impl Surface {
     }
 }
 
+fn copy_rgba_to_bgra_rows(dst: &mut [u8], dst_w: usize, dst_h: usize, src: &[u8], src_w: usize, src_h: usize) {
+    let copy_w = dst_w.min(src_w);
+    let copy_h = dst_h.min(src_h);
+    let dst_stride = dst_w.saturating_mul(4);
+    let src_stride = src_w.saturating_mul(4);
+    let row_bytes = copy_w.saturating_mul(4);
+    for y in 0..copy_h {
+        let dst_off = y * dst_stride;
+        let src_off = y * src_stride;
+        if dst_off + row_bytes > dst.len() || src_off + row_bytes > src.len() {
+            break;
+        }
+        let dst_row = &mut dst[dst_off..dst_off + row_bytes];
+        let src_row = &src[src_off..src_off + row_bytes];
+        for (to, from) in dst_row.as_chunks_mut::<4>().0.iter_mut().zip(src_row.as_chunks::<4>().0) {
+            *to = [from[2], from[1], from[0], from[3]];
+        }
+    }
+}
+
 impl Surface {
     /// The picture is premultiplied RGBA and the window wants premultiplied BGRA.
     fn paint(&self, picture: &Pixmap) {
@@ -91,9 +111,7 @@ impl Surface {
             return;
         };
         let target = unsafe { std::slice::from_raw_parts_mut(self.bits, len) };
-        for (to, from) in target.as_chunks_mut::<4>().0.iter_mut().zip(picture.data().as_chunks::<4>().0) {
-            *to = [from[2], from[1], from[0], from[3]];
-        }
+        copy_rgba_to_bgra_rows(target, self.w as usize, self.h as usize, picture.data(), picture.width() as usize, picture.height() as usize);
     }
 }
 
@@ -246,5 +264,25 @@ impl Drop for Layer {
         if !self.hwnd.is_null() {
             unsafe { DestroyWindow(self.hwnd) };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copy_rgba_to_bgra_rows_preserves_row_alignment_when_clamped() {
+        // Source is 4x2 (wider than dst's 2x2): pixel at (0, 1) must land at dst (0, 1), not skewed.
+        let src = [
+            10, 20, 30, 40, 11, 21, 31, 41, 99, 99, 99, 99, 98, 98, 98, 98,
+            50, 60, 70, 80, 51, 61, 71, 81, 97, 97, 97, 97, 96, 96, 96, 96,
+        ];
+        let mut dst = vec![0u8; 2 * 2 * 4];
+        copy_rgba_to_bgra_rows(&mut dst, 2, 2, &src, 4, 2);
+        assert_eq!(dst, [
+            30, 20, 10, 40, 31, 21, 11, 41,
+            70, 60, 50, 80, 71, 61, 51, 81,
+        ]);
     }
 }

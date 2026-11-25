@@ -559,11 +559,7 @@ fn run(inbox: Receiver<Command>) {
                 }
                 Command::Aside { on, done } => {
                     let was = aside_depth > 0;
-                    if on {
-                        aside_depth += 1;
-                    } else {
-                        aside_depth = aside_depth.saturating_sub(1);
-                    }
+                    aside_depth = next_aside_depth(aside_depth, on);
                     let now_aside = aside_depth > 0;
                     if now_aside != was {
                         for agent in agents.values_mut() {
@@ -665,4 +661,22 @@ fn tick(conn: &RustConnection, look: &Look, scale: f32, agents: &mut HashMap<Str
         }
     }
     let _ = conn.flush();
+}
+
+fn next_aside_depth(current: usize, on: bool) -> usize {
+    if on { current.saturating_add(1) } else { current.saturating_sub(1) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn aside_depth_and_text_mask_handle_edge_inputs() {
+        assert_eq!(next_aside_depth(0, false), 0);
+        assert_eq!(next_aside_depth(next_aside_depth(0, true), true), 2);
+        assert_eq!(next_aside_depth(usize::MAX, true), usize::MAX);
+        assert_eq!(text_mask("agent", 0.0).w, 1);
+        assert_eq!(text_mask("agent", f32::NAN).w, 1);
+    }
 }

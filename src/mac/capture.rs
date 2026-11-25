@@ -449,4 +449,10 @@ mod tests {
     fn frame_of_rejects_null_image() {
         assert!(frame_of(std::ptr::null()).is_none());
     }
+
+    #[test]
+    fn screen_rejects_non_positive_dimensions() {
+        assert!(screen(0, 0, 0, 100).is_err());
+        assert!(screen(0, 0, 100, -5).is_err());
+    }
 }
