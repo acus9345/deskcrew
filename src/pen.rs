@@ -26,7 +26,7 @@ const PEN_FLAG_BARREL: u32 = 1;
 pub struct Pen {
     device: HSYNTHETICPOINTERDEVICE,
     /// Where the person's pointer was before the pen moved it.
-    pointer: POINT,
+    pointer: Cell<Option<POINT>>,
     /// Where the pen last aimed, where it aimed just before that, and what GetCursorPos last saw.
     sent: Cell<Option<POINT>>,
     prev_sent: Cell<Option<POINT>>,
@@ -44,10 +44,9 @@ fn should_restore_cursor(now: POINT, sent: Option<POINT>, prev_sent: Option<POIN
     sent.is_some_and(|p| near(now, p)) || prev_sent.is_some_and(|p| near(now, p)) || observed.is_some_and(|p| near(now, p))
 }
 
-fn pointer() -> POINT {
+fn pointer() -> Option<POINT> {
     let mut at = POINT { x: 0, y: 0 };
-    unsafe { GetCursorPos(&mut at) };
-    at
+    unsafe { GetCursorPos(&mut at) != 0 }.then_some(at)
 }
 
 // One thread uses a pen at a time, and real input is already one agent at a time.
@@ -58,7 +57,7 @@ impl Pen {
         let device = unsafe { CreateSyntheticPointerDevice(PT_PEN, 1, POINTER_FEEDBACK_NONE) };
         (!device.is_null()).then(|| Pen {
             device,
-            pointer: pointer(),
+            pointer: Cell::new(pointer()),
             sent: Cell::new(None),
             prev_sent: Cell::new(None),
             observed: Cell::new(None),
@@ -85,7 +84,11 @@ impl Pen {
         if ok {
             self.prev_sent.set(self.sent.get());
             self.sent.set(Some(POINT { x, y }));
-            self.observed.set(Some(pointer()));
+            if let Some(obs) = pointer()
+                && !self.pointer.get().is_some_and(|orig| near(obs, orig))
+            {
+                self.observed.set(Some(obs));
+            }
         }
         ok
     }
@@ -111,6 +114,9 @@ impl Pen {
     /// One press, or two for a double click. A right click is the pen's barrel button.
     pub fn tap(&self, x: i32, y: i32, right: bool, double: bool) -> bool {
         crate::real::wait_for_quiet();
+        if self.sent.get().is_none() {
+            self.pointer.set(pointer());
+        }
         if !self.hover(x, y) {
             return false;
         }
@@ -137,6 +143,9 @@ impl Pen {
     pub fn put_down(&self, path: &[(f32, f32)], button: Button) -> Result<(), String> {
         let Some(first) = path.first() else { return Ok(()) };
         crate::real::wait_for_quiet();
+        if self.sent.get().is_none() {
+            self.pointer.set(pointer());
+        }
         let (x, y) = (first.0.round() as i32, first.1.round() as i32);
         if !self.hover(x, y) {
             return Err("Windows would not take pen input".into());
@@ -173,12 +182,15 @@ impl Drop for Pen {
     fn drop(&mut self) {
         unsafe { DestroySyntheticPointerDevice(self.device) };
         // Give the pointer back, unless the person has taken it somewhere else meanwhile.
-        if self.sent.get().is_some() {
+        if self.sent.get().is_some()
+            && let Some(orig) = self.pointer.get()
+        {
             // Let any in-flight synthetic pointer event drain so it cannot move the cursor after SetCursorPos.
             thread::sleep(SETTLE);
-            let now = pointer();
-            if should_restore_cursor(now, self.sent.get(), self.prev_sent.get(), self.observed.get()) {
-                unsafe { SetCursorPos(self.pointer.x, self.pointer.y) };
+            if let Some(now) = pointer()
+                && should_restore_cursor(now, self.sent.get(), self.prev_sent.get(), self.observed.get())
+            {
+                unsafe { SetCursorPos(orig.x, orig.y) };
             }
         }
     }
@@ -229,6 +241,13 @@ mod tests {
             Some(pt(300, 400)),
             Some(pt(280, 390)),
             Some(pt(280, 390)),
+        ));
+        // Y-axis outside tolerance on negative coordinates must not restore.
+        assert!(!should_restore_cursor(
+            pt(-100, -200 - LEFT_BY_PEN - 1),
+            Some(pt(-100, -200)),
+            None,
+            None,
         ));
         assert!(!should_restore_cursor(pt(300, 400), None, None, None));
         // Extreme coordinate difference does not overflow i32 subtraction.

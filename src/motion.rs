@@ -369,8 +369,8 @@ pub fn pace_at(path: &[(f32, f32)], speed: f32, stop: &AtomicBool, mut visit: im
         if stop.load(Ordering::Relaxed) {
             return false;
         }
-        let secs = if due_at[at].is_finite() && due_at[at] > 0.0 { due_at[at] } else { 0.0 };
-        let due = Duration::from_secs_f32(secs);
+        let secs = due_at[at];
+        let due = Duration::try_from_secs_f32(secs).unwrap_or(Duration::ZERO);
         while let Some(left) = due.checked_sub(started.elapsed()) {
             if left > Duration::from_millis(2) {
                 thread::sleep(left - Duration::from_millis(2));
@@ -730,7 +730,11 @@ fn generate_circle(cx: f32, cy: f32, r: f32, fill: bool) -> Vec<Vec<Point>> {
             }
         }
     }
-    vec![outline, fill_stroke]
+    if fill_stroke.is_empty() {
+        vec![outline]
+    } else {
+        vec![outline, fill_stroke]
+    }
 }
 
 fn generate_ellipse(cx: f32, cy: f32, rx: f32, ry: f32) -> Vec<Vec<Point>> {
@@ -753,7 +757,9 @@ fn generate_arc(cx: f32, cy: f32, r: f32, start_deg: f32, end_deg: f32) -> Vec<V
     if !r.is_finite() || r <= 0.0 || !start_deg.is_finite() || !end_deg.is_finite() {
         return Vec::new();
     }
-    let mut delta_deg = (end_deg - start_deg).rem_euclid(360.0);
+    let start_norm = start_deg.rem_euclid(360.0);
+    let end_norm = end_deg.rem_euclid(360.0);
+    let mut delta_deg = (end_norm - start_norm).rem_euclid(360.0);
     if delta_deg == 0.0 {
         delta_deg = 360.0;
     }
@@ -762,7 +768,7 @@ fn generate_arc(cx: f32, cy: f32, r: f32, start_deg: f32, end_deg: f32) -> Vec<V
     let points: Vec<Point> = (0..=steps)
         .map(|i| {
             let t = i as f32 / steps as f32;
-            let deg = start_deg + delta_deg * t;
+            let deg = start_norm + delta_deg * t;
             let rad = deg.to_radians();
             (cx + r * rad.cos(), cy + r * rad.sin())
         })
@@ -1124,6 +1130,11 @@ mod tests {
         assert!(parse_shape("circle 100,100 inf").is_err());
         assert!(parse_shape("circle 100,100 -inf").is_err());
         assert!(parse_shape("circle 100,100 100000000 --fill").is_err());
+        assert!(parse_shape("rect 10,10 100001 20").is_err());
+        assert!(parse_shape("rect 10,10 20 inf").is_err());
+        assert!(parse_shape("ellipse 10,10 200000,20").is_err());
+        assert!(parse_shape("bezier 0,0 10,10 20,20 200000,0").is_err());
+        assert!(parse_shape("poly 0,0 200000,0").is_err());
         assert!(parse_point("NaN,10").is_err());
         assert!(parse_point("10,inf").is_err());
         assert!(parse_point("1000000,0").is_err());
@@ -1133,24 +1144,36 @@ mod tests {
     fn trace_schedule_and_arc_handle_edge_cases_safely() {
         assert!(trace(&[], false).is_empty());
         assert!(trace(&[], true).is_empty());
+        assert!(trace(&[(0, 0), (1_000_000, 0)], false).len() <= MAX_STROKE_POINTS);
 
         let seg = vec![(0.0, 0.0), (60.0, 0.0)];
-        for bad_speed in [0.0, -5.0, f32::NAN, f32::INFINITY] {
+        for bad_speed in [0.0, -5.0, f32::NAN, f32::INFINITY, 1e-35] {
             let due = schedule(&seg, bad_speed);
             assert_eq!(due.len(), 2);
             assert!(due.iter().all(|t| t.is_finite() && *t >= 0.0));
+            // Must never panic when converted to Duration.
+            let _ = Duration::try_from_secs_f32(due[1]);
         }
 
         let nan_path = vec![(0.0, 0.0), (f32::NAN, 10.0), (20.0, 10.0)];
         let due_nan = schedule(&nan_path, 100.0);
         assert!(due_nan.iter().all(|t| t.is_finite() && *t >= 0.0));
 
-        // Large negative and multi-turn arc sweeps remain bounded and valid.
-        let arc = generate_arc(100.0, 100.0, 50.0, 0.0, -450.0);
-        assert_eq!(arc.len(), 1);
-        assert!(arc[0].len() >= 3 && arc[0].len() <= MAX_STROKE_POINTS + 1);
-        for pt in &arc[0] {
-            assert!(((pt.0 - 100.0).hypot(pt.1 - 100.0) - 50.0).abs() < 0.05);
+        // Extreme and negative arc sweeps stay finite and valid.
+        for (start, end) in [(0.0, -450.0), (-3e38_f32, 3e38_f32)] {
+            let arc = generate_arc(100.0, 100.0, 50.0, start, end);
+            assert_eq!(arc.len(), 1);
+            assert!(arc[0].len() >= 3 && arc[0].len() <= MAX_STROKE_POINTS + 1);
+            for pt in &arc[0] {
+                assert!(pt.0.is_finite() && pt.1.is_finite());
+                assert!(((pt.0 - 100.0).hypot(pt.1 - 100.0) - 50.0).abs() < 0.05);
+            }
         }
+
+        // Fill generation caps cleanly and never emits empty fill strokes on tiny radius at large offset.
+        let rect_fill = generate_rect(0.0, 0.0, 100.0, 50_000.0, true);
+        assert!(rect_fill.iter().all(|s| !s.is_empty() && s.len() <= MAX_STROKE_POINTS));
+        let tiny_circle = generate_circle(1000.0, 1000.0, 0.1, true);
+        assert!(tiny_circle.iter().all(|s| !s.is_empty() && s.len() <= MAX_STROKE_POINTS));
     }
 }

@@ -142,9 +142,8 @@ pub fn stroke(
             break;
         }
         let secs = due[at];
-        if secs.is_finite()
-            && secs > 0.0
-            && let Some(wait) = Duration::from_secs_f32(secs).checked_sub(started.elapsed())
+        if let Ok(wait_for) = Duration::try_from_secs_f32(secs)
+            && let Some(wait) = wait_for.checked_sub(started.elapsed())
         {
             thread::sleep(wait);
         }
@@ -231,7 +230,7 @@ fn key_code(name: &str) -> Option<u16> {
         "enter" | "return" => 36,
         "tab" => 48,
         "space" | "spacebar" => 49,
-        "backspace" | "back" => 51,
+        "backspace" | "back" | "delete" => 51,
         "esc" | "escape" => 53,
         "del" | "forwarddelete" => 117,
         "insert" | "ins" => 114,
@@ -389,10 +388,20 @@ mod tests {
         assert_eq!(chord("pgdn").unwrap().key, Some(121));
         assert_eq!(chord("spacebar").unwrap().key, Some(49));
         assert_eq!(chord("back").unwrap().key, Some(51));
+        assert_eq!(chord("delete").unwrap().key, Some(51));
+        assert_eq!(chord("del").unwrap().key, Some(117));
+        assert_eq!(chord("forwarddelete").unwrap().key, Some(117));
+        assert_eq!(chord("insert").unwrap().key, Some(114));
         assert_eq!(chord("ins").unwrap().key, Some(114));
         assert_eq!(chord("plus").unwrap().key, Some(24));
+        assert_eq!(chord("equal").unwrap().key, Some(24));
+        assert_eq!(chord("equals").unwrap().key, Some(24));
         assert_eq!(chord("minus").unwrap().key, Some(27));
+        assert_eq!(chord("quote").unwrap().key, Some(39));
+        assert_eq!(chord("semicolon").unwrap().key, Some(41));
+        assert_eq!(chord("backslash").unwrap().key, Some(42));
         assert_eq!(chord("comma").unwrap().key, Some(43));
+        assert_eq!(chord("slash").unwrap().key, Some(44));
         assert_eq!(chord("period").unwrap().key, Some(47));
         assert_eq!(chord("f20").unwrap().key, Some(90));
         assert!(chord("hyper+s").is_err());

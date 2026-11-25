@@ -186,17 +186,17 @@ impl Frame {
             for x in 0..w {
                 let left = (x as u64 * self.w as u64 / w as u64) as u32;
                 let right = ((x as u64 + 1) * self.w as u64 / w as u64).max(left as u64 + 1).min(self.w as u64) as u32;
-                let mut sum = [0u32; 3];
+                let mut sum = [0u64; 3];
                 for sy in top..bottom {
                     let row = sy as usize * self.w as usize * 4;
                     for sx in left..right {
                         let at = row + sx as usize * 4;
                         for (channel, total) in sum.iter_mut().enumerate() {
-                            *total += self.pixels[at + channel] as u32;
+                            *total += self.pixels[at + channel] as u64;
                         }
                     }
                 }
-                let count = (bottom - top) * (right - left);
+                let count = (bottom - top) as u64 * (right - left) as u64;
                 let at = (y as usize * w as usize + x as usize) * 4;
                 for channel in 0..3 {
                     pixels[at + channel] = (sum[channel] / count) as u8;
@@ -434,6 +434,8 @@ mod tests {
 
         let empty_crop = picture.crop(100, 0, 10, 10);
         assert_eq!((empty_crop.w, empty_crop.h), (0, 0));
+        let max_crop = picture.crop(5, 5, u32::MAX, u32::MAX);
+        assert_eq!((max_crop.w, max_crop.h), (15, 15));
         let truncated = Frame { w: 100, h: 100, pixels: vec![0; 4] };
         assert_eq!(truncated.crop(0, 0, 10, 10).w, 0);
 
@@ -441,6 +443,8 @@ mod tests {
         assert_eq!((zero_edge.w, zero_edge.h, scale), (10, 10, 1.0));
         let (empty_shrink, empty_scale) = Frame { w: 0, h: 0, pixels: Vec::new() }.shrink(100);
         assert_eq!((empty_shrink.w, empty_shrink.h, empty_scale), (0, 0, 1.0));
+        let (shrunk_one, _) = solid(4096, 4096, 128).shrink(1);
+        assert_eq!((shrunk_one.w, shrunk_one.h, shrunk_one.pixels[0], shrunk_one.pixels[3]), (1, 1, 128, 255));
 
         let path = std::env::temp_dir().join("deskcrew_empty_save_test.png");
         assert!(Frame { w: 0, h: 0, pixels: Vec::new() }.save(&path).is_err());

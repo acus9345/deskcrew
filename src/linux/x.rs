@@ -616,9 +616,8 @@ pub fn stroke(by: By, path: &[(f32, f32)], button: Button, stop: &dyn Fn() -> bo
             break;
         }
         let secs = due[at];
-        if secs.is_finite()
-            && secs > 0.0
-            && let Some(wait) = Duration::from_secs_f32(secs).checked_sub(started.elapsed())
+        if let Ok(wait_for) = Duration::try_from_secs_f32(secs)
+            && let Some(wait) = wait_for.checked_sub(started.elapsed())
         {
             thread::sleep(wait);
         }
@@ -1200,11 +1199,16 @@ struct Keymap {
     syms: Vec<u32>,
 }
 
-fn keymap(x: &X) -> Result<Keymap, String> {
+fn keymap_unlocked(x: &X) -> Result<Keymap, String> {
     let setup = x.conn.setup();
     let (min, max) = (setup.min_keycode, setup.max_keycode);
     let reply = x.conn.get_keyboard_mapping(min, max - min + 1).map_err(|e| e.to_string())?.reply().map_err(|e| e.to_string())?;
     Ok(Keymap { min, per: reply.keysyms_per_keycode as usize, syms: reply.keysyms })
+}
+
+fn keymap(x: &X) -> Result<Keymap, String> {
+    let _guard = KEYMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    keymap_unlocked(x)
 }
 
 impl Keymap {
@@ -1234,14 +1238,21 @@ fn key_event(x: &X, code: u8, down: bool) -> Result<(), String> {
 fn tap(x: &X, map: &Keymap, sym: u32, held: &[u8]) -> Result<(), String> {
     let shift = map.find(0xffe1).map(|k| k.0);
     let mut _keymap_guard = None;
+    let mut active_per = map.per.max(1);
     let (code, needs_shift, borrowed) = match map.find(sym) {
         Some((code, shifted)) => (code, shifted, false),
         None => {
             _keymap_guard = Some(KEYMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-            let code = map.spare().ok_or("no free key to type that character with")?;
-            let row = vec![sym; map.per.max(1)];
-            x.conn.change_keyboard_mapping(1, code, map.per as u8, &row).map_err(|e| e.to_string())?;
-            (code, false, true)
+            let fresh = keymap_unlocked(x)?;
+            if let Some((code, shifted)) = fresh.find(sym) {
+                (code, shifted, false)
+            } else {
+                let code = fresh.spare().ok_or("no free key to type that character with")?;
+                active_per = fresh.per.max(1);
+                let row = vec![sym; active_per];
+                x.conn.change_keyboard_mapping(1, code, fresh.per as u8, &row).map_err(|e| e.to_string())?;
+                (code, false, true)
+            }
         }
     };
     let shift_now = needs_shift && !held.contains(&shift.unwrap_or(0));
@@ -1269,8 +1280,8 @@ fn tap(x: &X, map: &Keymap, sym: u32, held: &[u8]) -> Result<(), String> {
         Ok(())
     };
     let restore_res = if borrowed {
-        let row = vec![0u32; map.per.max(1)];
-        let res = x.conn.change_keyboard_mapping(1, code, map.per as u8, &row).map(|_| ()).map_err(|e| e.to_string());
+        let row = vec![0u32; active_per];
+        let res = x.conn.change_keyboard_mapping(1, code, active_per as u8, &row).map(|_| ()).map_err(|e| e.to_string());
         let _ = x.conn.flush();
         res
     } else {
@@ -1420,16 +1431,21 @@ static KEYMAP_LOCK: Mutex<()> = Mutex::new(());
 
 fn send_tap(x: &X, target: XWindow, coords: (i16, i16, i16, i16), map: &Keymap, sym: u32, base_state: KeyButMask, hold: Duration) -> Result<(), String> {
     let mut _keymap_guard = None;
+    let mut active_per = map.per.max(1);
     let (code, needs_shift, borrowed) = match map.find(sym) {
         Some((code, shifted)) => (code, shifted, false),
         None => {
             _keymap_guard = Some(KEYMAP_LOCK.lock().unwrap_or_else(|e| e.into_inner()));
-            let code = map.spare().ok_or("no free key to type that character with")?;
-            let row = vec![sym; map.per.max(1)];
-            x.conn.change_keyboard_mapping(1, code, map.per as u8, &row).map_err(|e| e.to_string())?;
-            x.conn.flush().map_err(|e| e.to_string())?;
-            thread::sleep(KEY_GAP);
-            (code, false, true)
+            let fresh = keymap_unlocked(x)?;
+            if let Some((code, shifted)) = fresh.find(sym) {
+                (code, shifted, false)
+            } else {
+                let code = fresh.spare().ok_or("no free key to type that character with")?;
+                active_per = fresh.per.max(1);
+                let row = vec![sym; active_per];
+                x.conn.change_keyboard_mapping(1, code, fresh.per as u8, &row).map_err(|e| e.to_string())?;
+                (code, false, true)
+            }
         }
     };
     let shift_code = (needs_shift && !base_state.contains(KeyButMask::SHIFT))
@@ -1437,6 +1453,10 @@ fn send_tap(x: &X, target: XWindow, coords: (i16, i16, i16, i16), map: &Keymap, 
         .flatten();
     let state = if needs_shift { base_state | KeyButMask::SHIFT } else { base_state };
     let sent = (|| -> Result<(), String> {
+        if borrowed {
+            x.conn.flush().map_err(|e| e.to_string())?;
+            thread::sleep(KEY_GAP);
+        }
         if let Some(sc) = shift_code {
             send_key_event(x, target, coords, sc, true, base_state)?;
         }
@@ -1454,8 +1474,8 @@ fn send_tap(x: &X, target: XWindow, coords: (i16, i16, i16, i16), map: &Keymap, 
         Ok(())
     })();
     if borrowed {
-        let row = vec![0u32; map.per.max(1)];
-        let _ = x.conn.change_keyboard_mapping(1, code, map.per as u8, &row);
+        let row = vec![0u32; active_per];
+        let _ = x.conn.change_keyboard_mapping(1, code, active_per as u8, &row);
         let _ = x.conn.flush();
     }
     sent
@@ -1863,13 +1883,24 @@ mod tests {
         assert_eq!(chord("plus").unwrap().key, Some(0x002b));
         assert_eq!(chord("minus").unwrap().key, Some(0x002d));
         assert_eq!(chord("equal").unwrap().key, Some(0x003d));
+        assert_eq!(chord("equals").unwrap().key, Some(0x003d));
         assert_eq!(chord("comma").unwrap().key, Some(0x002c));
         assert_eq!(chord("period").unwrap().key, Some(0x002e));
         assert_eq!(chord("pause").unwrap().key, Some(0xff13));
         assert_eq!(chord("spacebar").unwrap().key, Some(0x20));
+        assert_eq!(chord("pgup").unwrap().key, Some(0xff55));
+        assert_eq!(chord("pgdn").unwrap().key, Some(0xff56));
+        assert_eq!(chord("ins").unwrap().key, Some(0xff63));
+        assert_eq!(chord("back").unwrap().key, Some(0xff08));
+        assert_eq!(chord("del").unwrap().key, Some(0xffff));
+        assert_eq!(chord("delete").unwrap().key, Some(0xffff));
+        let spaced = chord("ctrl + s").unwrap();
+        assert_eq!(spaced.modifiers, vec![0xffe3]);
+        assert_eq!(spaced.key, Some(b's' as u32));
         assert!(chord("").is_err());
         assert!(chord("  ").is_err());
         assert!(chord("ctrl++").is_err());
         assert!(chord("win+").is_err());
+        assert!(chord("ctrl+a+b").is_err());
     }
 }

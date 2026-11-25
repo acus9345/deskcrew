@@ -189,8 +189,26 @@ pub fn split_steps(script: &str) -> Vec<Vec<String>> {
     let mut chars = script.chars().peekable();
     while let Some(c) = chars.next() {
         match quote {
-            Some(q) if c == '\\' && chars.peek() == Some(&q) => {
-                word.push(chars.next().unwrap());
+            // Match Windows CommandLineToArgvW semantics: backslashes are literal unless followed
+            // by the active quote, where 2n -> n backslashes + close, 2n+1 -> n backslashes + quote.
+            Some(q) if c == '\\' => {
+                let mut slashes = 1usize;
+                while chars.peek() == Some(&'\\') {
+                    chars.next();
+                    slashes += 1;
+                }
+                if chars.peek() == Some(&q) {
+                    for _ in 0..(slashes / 2) {
+                        word.push('\\');
+                    }
+                    if slashes % 2 == 1 {
+                        word.push(chars.next().unwrap());
+                    }
+                } else {
+                    for _ in 0..slashes {
+                        word.push('\\');
+                    }
+                }
             }
             Some(q) if c == q => quote = None,
             Some(_) => word.push(c),
@@ -306,12 +324,15 @@ mod tests {
     fn page_saturates_near_usize_max_and_steps_handle_escaped_quotes_and_windows_paths() {
         let all = seen(&[(1, "a"), (2, "b")]);
         assert!(page(&all, None, usize::MAX).is_empty());
+        assert!(page(&all, None, usize::MAX - 1).is_empty());
         assert_eq!(
-            split_steps(r#"set e1 "say \"hi\""; set e2 'it\'s fine'; set e3 "C:\Users\Alice\notes.txt""#),
+            split_steps(r#"set e1 "say \"hi\""; set e2 'it\'s fine'; set e3 "C:\Users\Alice\notes.txt"; set e4 "foo\\"; click e5"#),
             vec![
                 vec!["set", "e1", r#"say "hi""#],
                 vec!["set", "e2", "it's fine"],
                 vec!["set", "e3", r#"C:\Users\Alice\notes.txt"#],
+                vec!["set", "e4", r#"foo\"#],
+                vec!["click", "e5"],
             ]
         );
     }
