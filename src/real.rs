@@ -223,14 +223,14 @@ static HOLDS: AtomicU64 = AtomicU64::new(0);
 
 /// The real keyboard and mouse are shared, so only one agent holds anything at a time.
 fn may_hold(who: &str) -> Result<(), String> {
-    match HELD.lock().unwrap().iter().find(|(holder, _)| holder != who) {
+    match HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().find(|(holder, _)| holder != who) {
         Some((holder, _)) => Err(format!("{holder} is holding a key or button: wait for it to let go")),
         None => Ok(()),
     }
 }
 
 fn hold(who: &str, held: Held) {
-    HELD.lock().unwrap().push((who.to_string(), held));
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).push((who.to_string(), held));
     let this = HOLDS.fetch_add(1, Ordering::Relaxed) + 1;
     let who = who.to_string();
     thread::spawn(move || {
@@ -259,7 +259,7 @@ pub fn hold_button(who: &str, x: i32, y: i32, button: Button) -> Result<(), Stri
 }
 
 pub fn holding_button() -> bool {
-    HELD.lock().unwrap().iter().any(|(_, held)| matches!(held, Held::Mouse(_)))
+    HELD.lock().unwrap_or_else(|e| e.into_inner()).iter().any(|(_, held)| matches!(held, Held::Mouse(_)))
 }
 
 /// Let go of what one agent holds.
@@ -274,7 +274,7 @@ pub fn release_all() -> usize {
 
 fn release(chosen: impl Fn(&str) -> bool) -> usize {
     let held: Vec<Held> = {
-        let mut all = HELD.lock().unwrap();
+        let mut all = HELD.lock().unwrap_or_else(|e| e.into_inner());
         let (gone, kept): (Vec<_>, Vec<_>) = all.drain(..).partition(|(holder, _)| chosen(holder));
         *all = kept;
         gone.into_iter().map(|(_, held)| held).collect()
@@ -292,7 +292,10 @@ pub fn wheel(x: i32, y: i32, notches: i32, sideways: bool) {
     const MOUSEEVENTF_HWHEEL: windows_sys::Win32::UI::Input::KeyboardAndMouse::MOUSE_EVENT_FLAGS = 0x1000;
     move_to(x, y);
     thread::sleep(ARRIVE);
-    send(&[mouse(if sideways { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL }, 0, 0, (notches * 120) as u32)]);
+    let flag = if sideways { MOUSEEVENTF_HWHEEL } else { MOUSEEVENTF_WHEEL };
+    for chunk in crate::motion::wheel_chunks(notches, crate::motion::MAX_SCROLL_NOTCHES) {
+        send(&[mouse(flag, 0, 0, (chunk * 120) as u32)]);
+    }
 }
 
 /// Press, follow the path, and always let go of the button and any keys held for it.
@@ -458,7 +461,7 @@ fn normalize_vk(vk: VIRTUAL_KEY) -> VIRTUAL_KEY {
 /// Whether pressing this chord, with any keys agents already hold down, makes a risky shortcut.
 pub fn is_risky_chord(pressed: &Chord) -> bool {
     let mut down: Vec<VIRTUAL_KEY> = pressed.keys.iter().map(|(vk, _)| normalize_vk(*vk)).collect();
-    for (_, held) in HELD.lock().unwrap().iter() {
+    for (_, held) in HELD.lock().unwrap_or_else(|e| e.into_inner()).iter() {
         if let Held::Keys(keys) = held {
             down.extend(keys.iter().map(|(vk, _)| normalize_vk(*vk)));
         }
@@ -497,19 +500,29 @@ pub fn hold_chord(chord: &Chord, hold: Duration) {
 
 /// False if stopped on the way. Fails, having sent what it reports, if focus moves away.
 pub fn type_text(text: &str, root: Hwnd, surfaces: &[Hwnd], stop: &AtomicBool) -> Result<bool, String> {
-    for (sent, unit) in text.encode_utf16().enumerate() {
+    for (sent, step) in crate::motion::text_typing_steps(text).into_iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return Ok(false);
         }
         if !win::front_is(root, surfaces) {
             return Err(format!("{FOCUS_MOVED}: {sent} characters had been typed"));
         }
-        if unit == 10 {
-            send(&[key(VK_RETURN, 0, 0)]);
-            send(&[key(VK_RETURN, 0, KEYEVENTF_KEYUP)]);
-        } else {
-            send(&[key(0, unit, KEYEVENTF_UNICODE)]);
-            send(&[key(0, unit, KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]);
+        match step {
+            crate::motion::TypingStep::Enter => {
+                send(&[key(VK_RETURN, 0, 0), key(VK_RETURN, 0, KEYEVENTF_KEYUP)]);
+            }
+            crate::motion::TypingStep::Units(units, len) => {
+                if len == 2 {
+                    send(&[
+                        key(0, units[0], KEYEVENTF_UNICODE),
+                        key(0, units[1], KEYEVENTF_UNICODE),
+                        key(0, units[0], KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                        key(0, units[1], KEYEVENTF_UNICODE | KEYEVENTF_KEYUP),
+                    ]);
+                } else {
+                    send(&[key(0, units[0], KEYEVENTF_UNICODE), key(0, units[0], KEYEVENTF_UNICODE | KEYEVENTF_KEYUP)]);
+                }
+            }
         }
         thread::sleep(crate::motion::KEY_EVERY);
     }

@@ -395,11 +395,10 @@ pub fn encloses(outer: Bounds, inner: Bounds) -> bool {
     if outer.2 <= 0 || outer.3 <= 0 || inner.2 <= 0 || inner.3 <= 0 {
         return false;
     }
-    const SLACK: i32 = 4;
-    inner.0 >= outer.0 - SLACK
-        && inner.1 >= outer.1 - SLACK
-        && inner.0 + inner.2 <= outer.0 + outer.2 + SLACK
-        && inner.1 + inner.3 <= outer.1 + outer.3 + SLACK
+    const SLACK: i64 = 4;
+    let (ox0, oy0, ox1, oy1) = (outer.0 as i64, outer.1 as i64, outer.0 as i64 + outer.2 as i64, outer.1 as i64 + outer.3 as i64);
+    let (ix0, iy0, ix1, iy1) = (inner.0 as i64, inner.1 as i64, inner.0 as i64 + inner.2 as i64, inner.1 as i64 + inner.3 as i64);
+    ix0 >= ox0 - SLACK && iy0 >= oy0 - SLACK && ix1 <= ox1 + SLACK && iy1 <= oy1 + SLACK
 }
 
 /// Drop static text nodes whose text duplicates a named control enclosing them, returning
@@ -443,11 +442,12 @@ struct Walk<'a> {
     window: Bounds,
     all: bool,
     seen: usize,
+    visited: std::collections::HashSet<Obj>,
 }
 
 impl Walk<'_> {
     fn walk(&mut self, obj: &Obj, parent: &str, row: Option<usize>, depth: usize) {
-        if depth > MAX_DEPTH || self.seen >= MAX_NODES {
+        if depth > MAX_DEPTH || self.seen >= MAX_NODES || !self.visited.insert(obj.clone()) {
             return;
         }
         self.seen += 1;
@@ -586,7 +586,7 @@ fn hash_of(bus: &str, path: &str) -> usize {
 pub fn read(frame: &Obj, window: Bounds, all: bool) -> (Vec<Node>, usize) {
     let mut nodes = Vec::new();
     let mut hidden = 0;
-    let mut walk = Walk { nodes: &mut nodes, hidden: &mut hidden, window, all, seen: 0 };
+    let mut walk = Walk { nodes: &mut nodes, hidden: &mut hidden, window, all, seen: 0, visited: std::collections::HashSet::new() };
     for child in children(frame) {
         walk.walk(&child, "", None, 1);
     }
@@ -660,13 +660,15 @@ pub fn set_text(obj: &Obj, text: &str) -> Result<(), String> {
 /// Add text to the end of a field, as typing into it does on Windows and macOS, and leave the
 /// caret after it.
 pub fn insert_text(obj: &Obj, text: &str) -> Result<(), String> {
-    let end: i32 = property(obj, "org.a11y.atspi.Text", "CharacterCount").unwrap_or(0);
+    let bytes = i32::try_from(text.len()).map_err(|_| "that text is too long to insert at once".to_string())?;
+    let end: i32 = property(obj, "org.a11y.atspi.Text", "CharacterCount").unwrap_or(0).max(0);
     // The length is in bytes: GTK hands it to gtk_editable_insert_text, which counts bytes.
-    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(end, text, text.len() as i32))?;
+    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(end, text, bytes))?;
     if !done {
         return Err("the app refused the text".into());
     }
-    let _ = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetCaretOffset", &(end + text.chars().count() as i32,));
+    let count = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
+    let _ = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetCaretOffset", &(end.saturating_add(count),));
     Ok(())
 }
 
@@ -731,6 +733,7 @@ pub fn insert_at_caret(obj: &Obj, text: &str) -> Result<(), String> {
     if !editable(obj) {
         return Err("that control is not editable".into());
     }
+    let bytes = i32::try_from(text.len()).map_err(|_| "that text is too long to insert at once".to_string())?;
     let count: i32 = property(obj, "org.a11y.atspi.Text", "CharacterCount").unwrap_or(0).max(0);
     let pos = if let Some((lo, hi)) = selection_range(obj) {
         let _ = call::<_, bool>(obj, "org.a11y.atspi.EditableText", "DeleteText", &(lo, hi));
@@ -738,11 +741,12 @@ pub fn insert_at_caret(obj: &Obj, text: &str) -> Result<(), String> {
     } else {
         property::<i32>(obj, "org.a11y.atspi.Text", "CaretOffset").unwrap_or(count).clamp(0, count)
     };
-    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(pos, text, text.len() as i32))?;
+    let done: bool = call(obj, "org.a11y.atspi.EditableText", "InsertText", &(pos, text, bytes))?;
     if !done {
         return append_text(obj, text);
     }
-    let _ = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetCaretOffset", &(pos + text.chars().count() as i32,));
+    let chars = i32::try_from(text.chars().count()).unwrap_or(i32::MAX);
+    let _ = call::<_, bool>(obj, "org.a11y.atspi.Text", "SetCaretOffset", &(pos.saturating_add(chars),));
     Ok(())
 }
 
@@ -784,6 +788,7 @@ fn bar_of(pane: &Obj, vertical: bool) -> Option<Obj> {
 fn bar_inside(obj: &Obj, vertical: bool) -> Option<Obj> {
     const LOOKED_AT_MOST: usize = 120;
     let mut queue = std::collections::VecDeque::from([obj.clone()]);
+    let mut visited = std::collections::HashSet::from([obj.clone()]);
     let mut looked = 0;
     while let Some(here) = queue.pop_front() {
         looked += 1;
@@ -793,7 +798,11 @@ fn bar_inside(obj: &Obj, vertical: bool) -> Option<Obj> {
         if let Some(bar) = bar_of(&here, vertical) {
             return Some(bar);
         }
-        queue.extend(children(&here));
+        for child in children(&here) {
+            if visited.insert(child.clone()) {
+                queue.push_back(child);
+            }
+        }
     }
     None
 }
@@ -821,7 +830,8 @@ pub fn scroll(obj: &Obj, vertical: bool, notches: i32) -> Result<(), String> {
     }
     let inc = value_of(&bar, "MinimumIncrement").filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
     let step = ((high - low) / 10.0).max(inc);
-    let wanted = (now + step * notches as f64).clamp(low, high);
+    let target = now + step * notches as f64;
+    let wanted = if target.is_finite() { target.clamp(low, high) } else if notches > 0 { high } else { low };
     set_value(&bar, wanted)?;
     if (value_of(&bar, "CurrentValue").unwrap_or(now) - now).abs() < f64::EPSILON && wanted != now {
         return Err("that scroll bar did not move".into());
@@ -838,18 +848,29 @@ pub fn show(obj: &Obj) -> Result<(), String> {
 
 /// A descendant whose name is this, looking a few levels down: an entry in a list or menu.
 pub fn find_named(obj: &Obj, wanted: &str, depth: usize) -> Option<Obj> {
+    const MAX_FIND_VISITED: usize = 1000;
     let wanted = wanted.to_lowercase();
     let mut level = vec![obj.clone()];
+    let mut visited = std::collections::HashSet::from([obj.clone()]);
     for _ in 0..depth {
         let mut next = Vec::new();
         for parent in &level {
             for child in children(parent) {
+                if !visited.insert(child.clone()) {
+                    continue;
+                }
                 let own = name(&child).to_lowercase();
                 if own == wanted || (!own.is_empty() && own.contains(&wanted) && wanted.len() > 2) {
                     return Some(child);
                 }
+                if visited.len() >= MAX_FIND_VISITED {
+                    return None;
+                }
                 next.push(child);
             }
+        }
+        if next.is_empty() {
+            break;
         }
         level = next;
     }
@@ -1054,5 +1075,13 @@ mod tests {
         assert_eq!(kept.len(), 2);
         assert_eq!(kept[0].parts.role, "button");
         assert_eq!(kept[1].parts.name, "Status: ready");
+    }
+
+    #[test]
+    fn encloses_handles_extreme_bounds_without_overflow() {
+        assert!(encloses((0, 0, 100, 50), (10, 10, 40, 20)));
+        assert!(encloses((i32::MIN, i32::MIN, 100, 100), (i32::MIN + 2, i32::MIN + 2, 10, 10)));
+        assert!(encloses((i32::MAX - 50, i32::MAX - 50, 50, 50), (i32::MAX - 40, i32::MAX - 40, 30, 30)));
+        assert!(!encloses((i32::MAX - 10, 0, 10, 10), (0, 0, 10, 10)));
     }
 }

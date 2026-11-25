@@ -25,6 +25,8 @@ const INVOKE_WAIT: Duration = Duration::from_millis(1500);
 const MAX_TEXT: i32 = 200_000;
 const MAX_DEPTH: usize = 64;
 const MAX_LIVE_NODES: usize = 4000;
+const MAX_LIVE_VISITED: usize = MAX_LIVE_NODES * 4;
+const MAX_SAFEARRAY_ITEMS: usize = 65_536;
 
 pub fn enter_com() {
     let _ = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -105,7 +107,10 @@ unsafe fn runtime_id(el: &IUIAutomationElement) -> Vec<i32> {
         if let (Ok(low), Ok(high)) = (SafeArrayGetLBound(array, 1), SafeArrayGetUBound(array, 1)) {
             let mut data = std::ptr::null_mut();
             if SafeArrayAccessData(array, &mut data).is_ok() {
-                out.extend_from_slice(std::slice::from_raw_parts(data as *const i32, (high - low + 1).max(0) as usize));
+                if !data.is_null() {
+                    let count = (high as i64 - low as i64 + 1).clamp(0, MAX_SAFEARRAY_ITEMS as i64) as usize;
+                    out.extend_from_slice(std::slice::from_raw_parts(data as *const i32, count));
+                }
                 let _ = SafeArrayUnaccessData(array);
             }
         }
@@ -125,7 +130,10 @@ fn rects_of(range: &IUIAutomationTextRange) -> Vec<(i32, i32, i32, i32)> {
         if let (Ok(low), Ok(high)) = (SafeArrayGetLBound(array, 1), SafeArrayGetUBound(array, 1)) {
             let mut data = std::ptr::null_mut();
             if SafeArrayAccessData(array, &mut data).is_ok() {
-                numbers.extend_from_slice(std::slice::from_raw_parts(data as *const f64, (high - low + 1).max(0) as usize));
+                if !data.is_null() {
+                    let count = (high as i64 - low as i64 + 1).clamp(0, MAX_SAFEARRAY_ITEMS as i64) as usize;
+                    numbers.extend_from_slice(std::slice::from_raw_parts(data as *const f64, count));
+                }
                 let _ = SafeArrayUnaccessData(array);
             }
         }
@@ -141,7 +149,7 @@ fn rects_of(range: &IUIAutomationTextRange) -> Vec<(i32, i32, i32, i32)> {
 }
 
 fn rect_of(r: RECT) -> (i32, i32, i32, i32) {
-    (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    (r.left, r.top, r.right.saturating_sub(r.left), r.bottom.saturating_sub(r.top))
 }
 
 fn say(error: windows::core::Error) -> String {
@@ -257,7 +265,9 @@ impl Uia {
                     let Ok(walker) = self.auto.ControlViewWalker() else {
                         return Err(say(error));
                     };
-                    walk_live(&walker, &root, "", 0, None, all, nodes, hidden, 0);
+                    let mut visited = 0usize;
+                    let mut seen_ids = std::collections::HashSet::new();
+                    walk_live(&walker, &root, "", 0, None, all, nodes, hidden, 0, &mut visited, &mut seen_ids);
                 }
             }
             if !all {
@@ -308,7 +318,11 @@ unsafe fn cells_of(el: &IUIAutomationElement) -> Option<(Vec<String>, IUIAutomat
 
 /// True if `outer` holds all of `inner`.
 pub fn encloses(outer: (i32, i32, i32, i32), inner: (i32, i32, i32, i32)) -> bool {
-    outer != inner && outer.0 <= inner.0 && outer.1 <= inner.1 && outer.0 + outer.2 >= inner.0 + inner.2 && outer.1 + outer.3 >= inner.1 + inner.3
+    outer != inner
+        && outer.0 <= inner.0
+        && outer.1 <= inner.1
+        && (outer.0 as i64) + (outer.2 as i64) >= (inner.0 as i64) + (inner.2 as i64)
+        && (outer.1 as i64) + (outer.3 as i64) >= (inner.1 as i64) + (inner.3 as i64)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -323,7 +337,7 @@ unsafe fn walk(
     depth: usize,
 ) {
     unsafe {
-        if depth > MAX_DEPTH {
+        if depth > MAX_DEPTH || nodes.len() >= MAX_LIVE_NODES {
             return;
         }
         let kind = el.CachedControlType().map(|k| k.0).unwrap_or(0);
@@ -534,9 +548,16 @@ unsafe fn walk_live(
     nodes: &mut Vec<Node>,
     hidden: &mut usize,
     depth: usize,
+    visited: &mut usize,
+    seen_ids: &mut std::collections::HashSet<Vec<i32>>,
 ) {
     unsafe {
-        if depth > MAX_DEPTH || nodes.len() >= MAX_LIVE_NODES {
+        if depth > MAX_DEPTH || nodes.len() >= MAX_LIVE_NODES || *visited >= MAX_LIVE_VISITED {
+            return;
+        }
+        *visited += 1;
+        let id = runtime_id(el);
+        if !id.is_empty() && !seen_ids.insert(id.clone()) {
             return;
         }
         let kind = el.CurrentControlType().map(|k| k.0).unwrap_or(0);
@@ -576,7 +597,7 @@ unsafe fn walk_live(
                 if !shown.is_empty() && shown != parent && !nodes[at].parts.cells.contains(&shown) {
                     nodes[at].parts.cells.push(shown);
                 }
-                walk_live_children(walker, el, &name, kind, row, all, nodes, hidden, depth);
+                walk_live_children(walker, el, &name, kind, row, all, nodes, hidden, depth, visited, seen_ids);
                 return;
             }
 
@@ -600,7 +621,7 @@ unsafe fn walk_live(
                 let control_id = text(el.CurrentAutomationId());
                 let automation_id = Some(control_id.clone()).filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default();
                 if lines::is_window_chrome(&automation_id) {
-                    walk_live_children(walker, el, parent, kind, row, all, nodes, hidden, depth);
+                    walk_live_children(walker, el, parent, kind, row, all, nodes, hidden, depth, visited, seen_ids);
                     return;
                 }
                 let mut states = Vec::new();
@@ -656,7 +677,7 @@ unsafe fn walk_live(
                     cells: Vec::new(),
                 };
                 nodes.push(Node {
-                    runtime: runtime_id(el),
+                    runtime: id,
                     identity: format!("{kind}|{automation_id}|{name}"),
                     control_id,
                     parts,
@@ -671,7 +692,7 @@ unsafe fn walk_live(
             }
         }
         let carried = if listed { name.as_str() } else { parent };
-        walk_live_children(walker, el, carried, kind, own, all, nodes, hidden, depth);
+        walk_live_children(walker, el, carried, kind, own, all, nodes, hidden, depth, visited, seen_ids);
     }
 }
 
@@ -686,11 +707,19 @@ unsafe fn walk_live_children(
     nodes: &mut Vec<Node>,
     hidden: &mut usize,
     depth: usize,
+    visited: &mut usize,
+    seen_ids: &mut std::collections::HashSet<Vec<i32>>,
 ) {
     unsafe {
         let Ok(mut child) = walker.GetFirstChildElement(el) else { return };
         loop {
-            walk_live(walker, &child, parent, parent_kind, row, all, nodes, hidden, depth + 1);
+            if nodes.len() >= MAX_LIVE_NODES || *visited >= MAX_LIVE_VISITED {
+                break;
+            }
+            walk_live(walker, &child, parent, parent_kind, row, all, nodes, hidden, depth + 1, visited, seen_ids);
+            if nodes.len() >= MAX_LIVE_NODES || *visited >= MAX_LIVE_VISITED {
+                break;
+            }
             let Ok(next) = walker.GetNextSiblingElement(&child) else { break };
             child = next;
         }
@@ -711,6 +740,9 @@ unsafe fn walk_children(
     unsafe {
         let Ok(children) = el.GetCachedChildren() else { return };
         for at in 0..children.Length().unwrap_or(0) {
+            if nodes.len() >= MAX_LIVE_NODES {
+                break;
+            }
             if let Ok(child) = children.GetElement(at) {
                 walk(&child, parent, parent_kind, row, all, nodes, hidden, depth + 1);
             }
@@ -787,7 +819,7 @@ fn rows_of(element: &IUIAutomationElement, skip: usize, rows: usize, columns: us
         let keep = |at: &usize| !empty.contains(at);
         let cells: Vec<Vec<String>> = cells.into_iter().map(|row| row.into_iter().enumerate().filter(|(at, _)| keep(at)).map(|(_, c)| c).collect()).collect();
         let headers: Vec<String> = headers.into_iter().enumerate().filter(|(at, _)| keep(at)).map(|(_, h)| h).collect();
-        Ok(Table { headers, rows: cells, total_rows, total_columns: total_columns - empty.len() })
+        Ok(Table { headers, rows: cells, total_rows, total_columns: total_columns.saturating_sub(empty.len()) })
     }
 }
 
@@ -822,10 +854,10 @@ impl Element {
             let pattern = self.0.GetCurrentPatternAs::<IUIAutomationTextPattern>(UIA_TextPatternId).ok()?;
             let all = pattern.DocumentRange().ok()?;
             if let Some(&(left, top, width, height)) = rects_of(&all).last() {
-                return Some((left + width, top, height));
+                return Some((left.saturating_add(width), top, height));
             }
             let (x, y, _, h) = self.rect().ok()?;
-            Some((x + h / 4, y + h / 5, (h * 3 / 5).max(8)))
+            Some((x.saturating_add(h / 4), y.saturating_add(h / 5), (h.saturating_mul(3) / 5).max(8)))
         }
     }
 
@@ -859,7 +891,7 @@ impl Element {
             let _ = before.MoveEndpointByRange(TextPatternRangeEndpoint_End, &range, TextPatternRangeEndpoint_Start);
             before.MoveEndpointByUnit(TextPatternRangeEndpoint_Start, TextUnit_Character, -1).ok()?;
             let &(left, top, width, height) = rects_of(&before).last()?;
-            Some((left + width, top, height))
+            Some((left.saturating_add(width), top, height))
         }
     }
 
@@ -1048,22 +1080,26 @@ impl Element {
             let Ok(grid) = owner.GetCurrentPatternAs::<IUIAutomationGridPattern>(UIA_GridPatternId) else {
                 return rows_of(&owner, skip, rows, columns, auto);
             };
-            let (total_rows, total_columns) = (grid.CurrentRowCount().map_err(say)? as usize, grid.CurrentColumnCount().map_err(say)? as usize);
+            let total_rows = grid.CurrentRowCount().map_err(say)?.max(0) as usize;
+            let total_columns = grid.CurrentColumnCount().map_err(say)?.max(0) as usize;
             let mut headers = Vec::new();
             if let Ok(table) = owner.GetCurrentPatternAs::<IUIAutomationTablePattern>(UIA_TablePatternId)
                 && let Ok(list) = table.GetCurrentColumnHeaders()
             {
-                for at in 0..list.Length().unwrap_or(0).min(columns as i32) {
+                let max_headers = columns.min(i32::MAX as usize) as i32;
+                for at in 0..list.Length().unwrap_or(0).min(max_headers) {
                     if let Ok(header) = list.GetElement(at) {
                         headers.push(cell(&header));
                     }
                 }
             }
             let mut cells = Vec::new();
-            for row in skip.min(total_rows)..total_rows.min(skip + rows) {
+            for row in grid_row_range(skip, rows, total_rows) {
+                let Ok(r) = i32::try_from(row) else { break };
                 let mut line = Vec::new();
                 for column in 0..total_columns.min(columns) {
-                    line.push(grid.GetItem(row as i32, column as i32).map(|item| cell(&item)).unwrap_or_default());
+                    let Ok(c) = i32::try_from(column) else { break };
+                    line.push(grid.GetItem(r, c).map(|item| cell(&item)).unwrap_or_default());
                 }
                 cells.push(line);
             }
@@ -1138,6 +1174,10 @@ impl Uia {
     }
 }
 
+fn grid_row_range(skip: usize, rows: usize, total_rows: usize) -> std::ops::Range<usize> {
+    skip.min(total_rows)..total_rows.min(skip.saturating_add(rows))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1149,5 +1189,14 @@ mod tests {
         let newer = uia.auto.cast::<IUIAutomation2>().expect("CUIAutomation8 implements IUIAutomation2");
         let auto_focus = unsafe { newer.AutoSetFocus().expect("AutoSetFocus should succeed") };
         assert!(!auto_focus.as_bool(), "AutoSetFocus must be false so UIA actions do not steal focus or flash windows");
+    }
+
+    #[test]
+    fn encloses_rect_of_and_grid_row_range_handle_extreme_bounds() {
+        assert!(encloses((i32::MAX - 50, i32::MIN, 50, 100), (i32::MAX - 40, i32::MIN + 10, 30, 50)));
+        assert!(!encloses((i32::MAX - 10, 0, 10, 10), (0, 0, 10, 10)));
+        assert_eq!(rect_of(RECT { left: -100, top: 0, right: i32::MAX, bottom: i32::MIN }), (-100, 0, i32::MAX, i32::MIN));
+        assert_eq!(grid_row_range(usize::MAX - 1, 20, 50), 50..50);
+        assert_eq!(grid_row_range(10, 20, 50), 10..30);
     }
 }

@@ -99,7 +99,7 @@ impl Drop for PageWake {
             return;
         }
         let restore = {
-            let mut depths = PAGE_WAKE_DEPTH.lock().unwrap();
+            let mut depths = PAGE_WAKE_DEPTH.lock().unwrap_or_else(|e| e.into_inner());
             match depths.get_mut(&self.prev_chromium_front) {
                 Some(count) if *count > 1 => {
                     *count -= 1;
@@ -150,7 +150,7 @@ pub fn wake_page(root: Hwnd) -> PageWake {
     let mut ignored = 0;
     unsafe { SendMessageTimeoutW(host as HWND, WM_ACTIVATE, WA_ACTIVE as usize, 0, SMTO_ABORTIFHUNG, 500, &mut ignored) };
     let prev_chromium_front = if front != 0 && win::is_chromium(front) {
-        *PAGE_WAKE_DEPTH.lock().unwrap().entry(front).or_insert(0) += 1;
+        *PAGE_WAKE_DEPTH.lock().unwrap_or_else(|e| e.into_inner()).entry(front).or_insert(0) += 1;
         front
     } else {
         0
@@ -283,14 +283,18 @@ fn held_down<T>(keys: &[u16], work: impl FnOnce() -> T) -> T {
     unsafe { GetKeyboardState(saved.as_mut_ptr()) };
     let mut state = saved;
     for vk in keys {
-        state[*vk as usize] |= 0x80;
+        if (*vk as usize) < 256 {
+            state[*vk as usize] |= 0x80;
+        }
         let side = match *vk {
             VK_CONTROL => VK_LCONTROL,
             VK_SHIFT => VK_LSHIFT,
             VK_MENU => VK_LMENU,
             other => other,
         };
-        state[side as usize] |= 0x80;
+        if (side as usize) < 256 {
+            state[side as usize] |= 0x80;
+        }
     }
     unsafe { SetKeyboardState(state.as_ptr()) };
     let result = work();
@@ -611,8 +615,11 @@ pub fn post_wheel(root: Hwnd, x: i32, y: i32, notches: i32, sideways: bool) -> R
     if mouse_ignored_at(root, hwnd) {
         return Err(NEEDS_REAL.into());
     }
-    let wheel = ((notches * WHEEL_DELTA) as u32 & 0xFFFF) << 16;
-    post(hwnd, if sideways { WM_MOUSEHWHEEL } else { WM_MOUSEWHEEL }, wheel as usize, win::lparam(x, y))?;
+    let msg = if sideways { WM_MOUSEHWHEEL } else { WM_MOUSEWHEEL };
+    for chunk in crate::motion::wheel_chunks(notches, crate::motion::MAX_SCROLL_NOTCHES) {
+        let wheel = ((chunk * WHEEL_DELTA) as u32 & 0xFFFF) << 16;
+        post(hwnd, msg, wheel as usize, win::lparam(x, y))?;
+    }
     Ok("message".into())
 }
 
@@ -765,26 +772,31 @@ fn post_chars(hwnd: Hwnd, text: &str, stop: &AtomicBool, mut next: impl FnMut(Hw
     // require a posted Return keydown/keyup.
     const VK_RETURN: usize = 0x0D;
     let sync = win::is_wpf(hwnd);
-    let mut units = text.encode_utf16().peekable();
-    while let Some(unit) = units.next() {
+    for step in crate::motion::text_typing_steps(text) {
         if stop.load(Ordering::Relaxed) {
             return Err("stopped by the person with Ctrl+Alt+Esc".into());
         }
         let started = std::time::Instant::now();
-        next(hwnd, unit);
-        if sync && (unit == 10 || (unit == 13 && units.peek() == Some(&10))) {
-            if unit == 13 {
-                units.next();
+        match step {
+            crate::motion::TypingStep::Enter => {
+                next(hwnd, 13);
+                if sync {
+                    let scan = unsafe { MapVirtualKeyW(VK_RETURN as u32, MAPVK_VK_TO_VSC) } as isize;
+                    send(hwnd, WM_KEYDOWN, VK_RETURN, 1 | (scan << 16))?;
+                    let _ = send(hwnd, WM_KEYUP, VK_RETURN, 1 | (scan << 16) | (1 << 30) | (1 << 31));
+                } else {
+                    post(hwnd, WM_CHAR, 13, 1)?;
+                }
             }
-            let scan = unsafe { MapVirtualKeyW(VK_RETURN as u32, MAPVK_VK_TO_VSC) } as isize;
-            send(hwnd, WM_KEYDOWN, VK_RETURN, 1 | (scan << 16))?;
-            let _ = send(hwnd, WM_KEYUP, VK_RETURN, 1 | (scan << 16) | (1 << 30) | (1 << 31));
-        } else {
-            let ch = if unit == 10 { 13 } else { unit as usize };
-            if sync {
-                send(hwnd, WM_CHAR, ch, 1)?;
-            } else {
-                post(hwnd, WM_CHAR, ch, 1)?;
+            crate::motion::TypingStep::Units(units, len) => {
+                for &unit in &units[..len] {
+                    next(hwnd, unit);
+                    if sync {
+                        send(hwnd, WM_CHAR, unit as usize, 1)?;
+                    } else {
+                        post(hwnd, WM_CHAR, unit as usize, 1)?;
+                    }
+                }
             }
         }
         std::thread::sleep(crate::motion::KEY_EVERY.saturating_sub(started.elapsed()));
@@ -868,6 +880,7 @@ pub fn choose_in_popup(popup: Hwnd, label: &str) -> Option<Result<String, String
     }
     let entry = &entries[at];
     if entry.submenu == 0
+        && entry.command != 0
         && let Some(owner) = win::menu_owner(popup)
     {
         const WM_CANCELMODE: u32 = 0x001F;
@@ -930,6 +943,18 @@ pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &At
     }
 }
 
+fn release_pressed(target: Hwnd, up: u32, pressed: Vec<(u16, bool)>, bits: impl Fn(u16, bool) -> isize) -> Result<(), String> {
+    let mut first_err = None;
+    for (vk, extended) in pressed.into_iter().rev() {
+        if let Err(err) = release(target, up, vk as usize, bits(vk, extended))
+            && first_err.is_none()
+        {
+            first_err = Some(err);
+        }
+    }
+    first_err.map_or(Ok(()), Err)
+}
+
 fn hold_keys(target: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
     let Some(((key, extended), modifiers)) = chord.keys.split_last() else { return Err("no key given".into()) };
     let bits = |vk: u16, extended: bool, again: bool, release: bool| {
@@ -946,26 +971,31 @@ fn hold_keys(target: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &Atom
         }
         lparam
     };
-    for (vk, e) in modifiers {
-        post(target, WM_KEYDOWN, *vk as usize, bits(*vk, *e, false, false))?;
-    }
-    post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, false, false))?;
-    let started = std::time::Instant::now();
-    let mut next = REPEAT_DELAY;
-    while started.elapsed() < hold {
-        if stop.load(Ordering::Relaxed) {
-            break;
+    let mut pressed: Vec<(u16, bool)> = Vec::new();
+    let res: Result<(), String> = (|| {
+        for (vk, e) in modifiers {
+            post(target, WM_KEYDOWN, *vk as usize, bits(*vk, *e, false, false))?;
+            pressed.push((*vk, *e));
         }
-        if started.elapsed() >= next {
-            post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, true, false))?;
-            next += REPEAT_EVERY;
+        post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, false, false))?;
+        pressed.push((*key, *extended));
+        let started = std::time::Instant::now();
+        let mut next = REPEAT_DELAY;
+        while started.elapsed() < hold {
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+            if started.elapsed() >= next {
+                post(target, WM_KEYDOWN, *key as usize, bits(*key, *extended, true, false))?;
+                next += REPEAT_EVERY;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
         }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
-    release(target, WM_KEYUP, *key as usize, bits(*key, *extended, false, true))?;
-    for (vk, e) in modifiers.iter().rev() {
-        release(target, WM_KEYUP, *vk as usize, bits(*vk, *e, false, true))?;
-    }
+        Ok(())
+    })();
+    let release_res = release_pressed(target, WM_KEYUP, pressed, |vk, e| bits(vk, e, false, true));
+    res?;
+    release_res?;
     Ok("message".to_string())
 }
 
@@ -1017,22 +1047,31 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<St
         GetKeyboardState(saved.as_mut_ptr());
         let mut state = saved;
         for (vk, _) in held {
-            state[*vk as usize] |= 0x80;
-            if let Some(side) = left(*vk) {
+            if (*vk as usize) < 256 {
+                state[*vk as usize] |= 0x80;
+            }
+            if let Some(side) = left(*vk)
+                && (side as usize) < 256
+            {
                 state[side as usize] |= 0x80;
             }
         }
         SetKeyboardState(state.as_ptr());
         let sent = (|| {
-            for (vk, e) in held {
-                post(target, down, *vk as usize, bits(*vk, *e, false))?;
-            }
-            post(target, down, *key as usize, bits(*key, *extended, false))?;
-            std::thread::sleep(CHORD_SETTLE);
-            release(target, up, *key as usize, bits(*key, *extended, true))?;
-            for (vk, e) in held.iter().rev() {
-                release(target, up, *vk as usize, bits(*vk, *e, true))?;
-            }
+            let mut pressed: Vec<(u16, bool)> = Vec::new();
+            let press_res: Result<(), String> = (|| {
+                for (vk, e) in held {
+                    post(target, down, *vk as usize, bits(*vk, *e, false))?;
+                    pressed.push((*vk, *e));
+                }
+                post(target, down, *key as usize, bits(*key, *extended, false))?;
+                pressed.push((*key, *extended));
+                std::thread::sleep(CHORD_SETTLE);
+                Ok(())
+            })();
+            let release_res = release_pressed(target, up, pressed, |vk, e| bits(vk, e, true));
+            press_res?;
+            release_res?;
             std::thread::sleep(CHORD_SETTLE);
             Ok::<(), String>(())
         })();
@@ -1077,7 +1116,14 @@ fn attached<T>(target: Hwnd, spec: &str, focus: bool, work: impl FnOnce() -> Res
             }
             // A window focused for the first time, such as a dialog just opened in the back, picks
             // the control that takes its keys a moment later. Qt drops a key that comes before.
-            if FOCUSED.lock().unwrap().insert(target) {
+            let first_focus = {
+                let mut focused = FOCUSED.lock().unwrap_or_else(|e| e.into_inner());
+                if focused.len() > 256 {
+                    focused.retain(|&h| h == target || win::exists(h));
+                }
+                focused.insert(target)
+            };
+            if first_focus {
                 std::thread::sleep(FIRST_FOCUS_SETTLE);
             }
         }

@@ -9,6 +9,7 @@ use std::sync::Mutex;
 
 const MAX_DEPTH: usize = 40;
 const MAX_NODES: usize = 4000;
+const MAX_VISITED: usize = MAX_NODES * 4;
 const TIMEOUT_S: f32 = 1.5;
 
 // The order matters: values come back in this order.
@@ -329,18 +330,29 @@ pub fn children(element: &Owned) -> Vec<Owned> {
 
 /// The first element under this one, at most `depth` levels down, with a matching title or value.
 pub fn find_named(element: &Owned, wanted: &str, depth: usize) -> Option<Owned> {
+    const MAX_FIND_VISITED: usize = 1000;
     let wanted = wanted.to_lowercase();
     let mut level = vec![element.clone()];
+    let mut visited = HashSet::from([unsafe { CFHash(element.0) }]);
     for _ in 0..depth {
         let mut next = Vec::new();
         for parent in &level {
             for child in children(parent) {
+                if !visited.insert(unsafe { CFHash(child.0) }) {
+                    continue;
+                }
                 let name = full_text(&child).to_lowercase();
                 if name == wanted {
                     return Some(child);
                 }
+                if visited.len() >= MAX_FIND_VISITED {
+                    return None;
+                }
                 next.push(child);
             }
+        }
+        if next.is_empty() {
+            break;
         }
         level = next;
     }
@@ -431,7 +443,11 @@ pub fn popup_surfaces(pid: i32, main_window: &Owned) -> Vec<Owned> {
 
 /// True if `outer` holds all of `inner`.
 pub fn encloses(outer: Bounds, inner: Bounds) -> bool {
-    outer != inner && outer.0 <= inner.0 && outer.1 <= inner.1 && outer.0 + outer.2 >= inner.0 + inner.2 && outer.1 + outer.3 >= inner.1 + inner.3
+    outer != inner
+        && outer.0 <= inner.0
+        && outer.1 <= inner.1
+        && (outer.0 as i64) + (outer.2 as i64) >= (inner.0 as i64) + (inner.2 as i64)
+        && (outer.1 as i64) + (outer.3 as i64) >= (inner.1 as i64) + (inner.3 as i64)
 }
 
 /// A role for an AX role, or None for containers that only matter for what they hold.
@@ -508,14 +524,15 @@ struct Walk<'a> {
     nodes: &'a mut Vec<Node>,
     hidden: &'a mut usize,
     seen_keys: HashSet<usize>,
+    visited: usize,
     window: Bounds,
     all: bool,
     names: Owned,
 }
 
 fn outside(rect: Bounds, window: Bounds) -> bool {
-    let (x, y, w, h) = rect;
-    let (wx, wy, ww, wh) = window;
+    let (x, y, w, h) = (rect.0 as i64, rect.1 as i64, rect.2 as i64, rect.3 as i64);
+    let (wx, wy, ww, wh) = (window.0 as i64, window.1 as i64, window.2 as i64, window.3 as i64);
     w <= 0 || h <= 0 || x + w <= wx || y + h <= wy || x >= wx + ww || y >= wy + wh
 }
 
@@ -527,13 +544,14 @@ impl Walk<'_> {
     }
 
     fn walk(&mut self, element: CFTypeRef, parent: &str, row: Option<usize>, depth: usize) {
-        if depth > MAX_DEPTH || self.nodes.len() >= MAX_NODES {
+        if depth > MAX_DEPTH || self.nodes.len() >= MAX_NODES || self.visited >= MAX_VISITED {
             return;
         }
         let key = unsafe { CFHash(element) };
         if !self.seen_keys.insert(key) {
             return;
         }
+        self.visited += 1;
         let Some(values) = self.values(element) else { return };
         let got = items(values.0);
         if got.len() < ATTRIBUTES.len() {
@@ -663,6 +681,9 @@ impl Walk<'_> {
                         let extra = items(found.0);
                         if !extra.is_empty() {
                             for child in extra {
+                                if self.nodes.len() >= MAX_NODES || self.visited >= MAX_VISITED {
+                                    break;
+                                }
                                 if unsafe { CFGetTypeID(child) } == unsafe { AXUIElementGetTypeID() } {
                                     self.walk(child, parent, row, depth + 1);
                                 }
@@ -675,6 +696,9 @@ impl Walk<'_> {
             return;
         }
         for child in list.drain(..) {
+            if self.nodes.len() >= MAX_NODES || self.visited >= MAX_VISITED {
+                break;
+            }
             if unsafe { CFGetTypeID(child) } == unsafe { AXUIElementGetTypeID() } {
                 self.walk(child, parent, row, depth + 1);
             }
@@ -704,7 +728,7 @@ pub fn read(pid: i32, window: &Owned, window_rect: Bounds, all: bool) -> (Vec<No
     let mut quiet = Vec::new();
     let keys: Vec<Owned> = ATTRIBUTES.iter().map(|name| cf_string(name)).collect();
     let raw: Vec<CFTypeRef> = keys.iter().map(|k| k.0).collect();
-    let mut walk = Walk { nodes: &mut nodes, hidden: &mut hidden, seen_keys: HashSet::new(), window: window_rect, all, names: array_of(&raw) };
+    let mut walk = Walk { nodes: &mut nodes, hidden: &mut hidden, seen_keys: HashSet::new(), visited: 0, window: window_rect, all, names: array_of(&raw) };
     walk.walk(window.0, "", None, 0);
     for surface in popup_surfaces(pid, window) {
         let surface_rect = rect(&surface).unwrap_or(window_rect);
@@ -822,7 +846,10 @@ pub fn scroll_bar(element: &Owned, sideways: bool, down: bool, times: i32) -> Re
         return Ok(false);
     }
     let current = attribute(&bar, "AXValue").and_then(|v| number_of(v.0)).unwrap_or(0.0);
-    let step = 0.1 * times.max(1) as f64;
+    if !current.is_finite() {
+        return Ok(false);
+    }
+    let step = 0.1 * times.clamp(1, crate::motion::MAX_SCROLL_NOTCHES) as f64;
     let next = if down { (current + step).clamp(0.0, 1.0) } else { (current - step).clamp(0.0, 1.0) };
     set_number(&bar, "AXValue", next)?;
     Ok(true)
@@ -896,10 +923,14 @@ mod tests {
     }
 
     #[test]
-    fn encloses_detects_strict_containment() {
+    fn encloses_and_outside_handle_extreme_bounds_without_overflow() {
         assert!(encloses((0, 0, 100, 50), (10, 10, 40, 20)));
         assert!(!encloses((0, 0, 100, 50), (0, 0, 100, 50)));
         assert!(!encloses((10, 10, 40, 20), (0, 0, 100, 50)));
+        assert!(encloses((i32::MAX - 50, i32::MIN, 50, 100), (i32::MAX - 40, i32::MIN + 10, 30, 50)));
+        assert!(!encloses((i32::MAX - 10, 0, 10, 10), (0, 0, 10, 10)));
+        assert!(!outside((i32::MAX - 10, 0, 20, 20), (0, 0, i32::MAX, 100)));
+        assert!(outside((i32::MAX, 0, 20, 20), (0, 0, i32::MAX - 10, 100)));
     }
 
     #[test]

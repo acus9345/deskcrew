@@ -1139,7 +1139,7 @@ impl Service {
         let direction = words[at].as_str();
         let sideways = matches!(direction, "left" | "right");
         let down = matches!(direction, "down" | "right");
-        let amount: i32 = words.get(at + 1).and_then(|n| n.parse().ok()).unwrap_or(3);
+        let amount = motion::parse_scroll_count(words.get(at + 1).map(String::as_str), 3)?;
         let target_word = words[..at].first().map(String::as_str);
         let (element, (x, y)) = match target_word {
             Some(word) => match self.resolve(word, who, tracked, view)? {
@@ -1176,11 +1176,7 @@ impl Service {
     /// Press, follow each stroke and let go, with the drawn cursor following along.
     fn strokes(&self, who: &str, flags: &Flags, tracked: &Tracked, strokes: &[Vec<(f32, f32)>], button: input::Button, with: u64) -> Reply {
         let window = self.window_of(tracked)?.rect;
-        let inside = |p: &(f32, f32)| {
-            let (x, y) = (p.0 as i32, p.1 as i32);
-            x >= window.0 && y >= window.1 && x < window.0 + window.2 && y < window.1 + window.3
-        };
-        if !strokes.iter().flatten().all(inside) {
+        if !strokes.iter().flatten().all(|p| motion::point_in_rect(*p, window)) {
             return Err("refused: that stroke leaves the window".into());
         }
         let first = strokes.iter().flatten().next().ok_or("nothing to draw")?;

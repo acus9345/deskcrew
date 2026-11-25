@@ -2021,7 +2021,7 @@ impl Service {
         let at = words.iter().position(direction).ok_or("scroll [control] up|down|left|right [n]")?;
         let sideways = words[at] == "left" || words[at] == "right";
         let down = words[at] == "down" || words[at] == "right";
-        let times: i32 = words.get(at + 1).and_then(|n| n.parse().ok()).unwrap_or(1);
+        let times = crate::motion::parse_scroll_count(words.get(at + 1).map(String::as_str), 1)?;
         let id = match words[..at].first() {
             Some(word) => match self.resolve(word, who, tracked, view)? {
                 Target::Control(id) => Some(id),
@@ -2047,14 +2047,21 @@ impl Service {
                 (true, false) => "left",
             })?;
             self.with_front(tracked, view, &[(x, y)], || {
-                for _ in 0..times.max(1) {
+                for _ in 0..times {
+                    if self.stop.load(Ordering::Relaxed) {
+                        return Err(STOPPED.into());
+                    }
                     real::press_chord(&page);
                 }
-            })?;
+                Ok::<(), String>(())
+            })??;
             return Ok("keyboard".into());
         }
         if node.can.scroll {
-            for _ in 0..times.max(1) {
+            for _ in 0..times {
+                if self.stop.load(Ordering::Relaxed) {
+                    return Err(STOPPED.into());
+                }
                 node.element.scroll(down, true, sideways)?;
             }
             return Ok("scroll".into());

@@ -1524,7 +1524,7 @@ impl Service {
     fn scroll(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &mut View, words: &[String]) -> Reply {
         let direction = |word: &String| matches!(word.as_str(), "up" | "down" | "left" | "right");
         let at = words.iter().position(direction).ok_or("scroll [control] up|down|left|right [n]")?;
-        let times: i32 = words.get(at + 1).and_then(|n| n.parse::<i32>().ok()).unwrap_or(3).clamp(1, 200);
+        let times = motion::parse_scroll_count(words.get(at + 1).map(String::as_str), 3)?;
         let (px, py) = match words[..at].first() {
             Some(word) => self.point_of(word, who, tracked, view)?,
             None => centre(self.window_of(tracked)?.rect),
@@ -1585,11 +1585,7 @@ impl Service {
             return Ok("portal".into());
         };
         let window = self.window_of(tracked)?.rect;
-        let inside = |p: &(f32, f32)| {
-            let (px, py) = (p.0 as i32, p.1 as i32);
-            px >= window.0 && py >= window.1 && px < window.0 + window.2 && py < window.1 + window.3
-        };
-        if !strokes.iter().flatten().all(inside) {
+        if !strokes.iter().flatten().all(|p| motion::point_in_rect(*p, window)) {
             return Err("refused: that stroke leaves the window".into());
         }
         if let Some(&(px, py)) = strokes.first().and_then(|s| s.first()) {
