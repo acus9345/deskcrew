@@ -536,6 +536,9 @@ fn settle_behind(hwnd: Hwnd, front: Hwnd) {
     if front != 0 && front != hwnd && now != front && same_app(now, hwnd) && !bring_forward(front) {
         stop_flashing(front);
     }
+    if front != 0 && front != hwnd && foreground() == front {
+        lower_behind(hwnd, front);
+    }
     stop_flashing(hwnd);
 }
 
@@ -704,13 +707,13 @@ fn snap_rect(work: RECT, right: bool) -> (i32, i32, i32, i32) {
 
 fn move_monitor_rect(win: (i32, i32, i32, i32), src: RECT, dst: RECT) -> (i32, i32, i32, i32) {
     let (x, y, w, h) = win;
-    let dst_w = (dst.right - dst.left).max(1);
-    let dst_h = (dst.bottom - dst.top).max(1);
-    let nw = w.max(1).min(dst_w);
-    let nh = h.max(1).min(dst_h);
-    let nx = (dst.left + (x - src.left)).clamp(dst.left, dst.left + dst_w - nw);
-    let ny = (dst.top + (y - src.top)).clamp(dst.top, dst.top + dst_h - nh);
-    (nx, ny, nw, nh)
+    let dst_w = (dst.right as i64 - dst.left as i64).max(1);
+    let dst_h = (dst.bottom as i64 - dst.top as i64).max(1);
+    let nw = (w as i64).max(1).min(dst_w);
+    let nh = (h as i64).max(1).min(dst_h);
+    let nx = (dst.left as i64 + (x as i64 - src.left as i64)).clamp(dst.left as i64, dst.left as i64 + dst_w - nw);
+    let ny = (dst.top as i64 + (y as i64 - src.top as i64)).clamp(dst.top as i64, dst.top as i64 + dst_h - nh);
+    (nx as i32, ny as i32, nw as i32, nh as i32)
 }
 
 /// Snap `hwnd` to the left or right half of its monitor's work area without taking focus.
@@ -720,7 +723,7 @@ pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
     let front = foreground();
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
-    let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
+    let _fg_lock = is_background(hwnd).then(ForegroundLock::take);
     commit_shown_inner(hwnd);
     FILLED.lock().unwrap().remove(&hwnd);
     if unsafe { IsIconic(raw(hwnd)) } != 0 {
@@ -743,13 +746,14 @@ pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
     Ok(())
 }
 
-fn apply_move_monitor(hwnd: Hwnd, src_work: RECT, dst_work: RECT) -> Result<(), String> {
+fn apply_move_monitor(hwnd: Hwnd, pick: impl FnOnce(&[(isize, RECT)], isize) -> Result<RECT, String>) -> Result<(), String> {
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MAXIMIZE, SW_SHOWNOACTIVATE};
     let front = foreground();
     let theirs = front == hwnd;
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
-    let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
+    let _fg_lock = is_background(hwnd).then(ForegroundLock::take);
     let was_min = was_minimized(hwnd);
     let restored_maximized = commit_shown_inner(hwnd);
     if was_min {
@@ -758,6 +762,18 @@ fn apply_move_monitor(hwnd: Hwnd, src_work: RECT, dst_work: RECT) -> Result<(), 
     if unsafe { IsIconic(raw(hwnd)) } != 0 {
         show(hwnd, SW_SHOWNOACTIVATE)?;
     }
+    let monitors = enum_monitor_works();
+    let monitor = unsafe { MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST) };
+    let current = monitor as isize;
+    let mut info: MONITORINFO = unsafe { zeroed() };
+    info.cbSize = size_of::<MONITORINFO>() as u32;
+    let src_work = monitors
+        .iter()
+        .find(|(m, _)| *m == current)
+        .map(|(_, r)| *r)
+        .or_else(|| (unsafe { GetMonitorInfoW(monitor, &mut info) } != 0).then_some(info.rcWork));
+    let dst_work = pick(&monitors, current)?;
+    let src_work = src_work.unwrap_or(dst_work);
     let os_zoomed = unsafe { IsZoomed(raw(hwnd)) } != 0;
     let zoomed = restored_maximized || os_zoomed;
     let filled = FILLED.lock().unwrap().remove(&hwnd);
@@ -805,27 +821,30 @@ fn enum_monitor_works() -> Vec<(isize, RECT)> {
 
 /// Move `hwnd` to monitor `index` (matching `screens()`) without taking focus.
 pub fn move_to_monitor(hwnd: Hwnd, index: usize) -> Result<(), String> {
-    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
-    let monitors = enum_monitor_works();
-    let (_, dst_work) = *monitors.get(index).ok_or_else(|| format!("no monitor {index}: run deskcrew screens"))?;
-    let current = unsafe { MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST) } as isize;
-    let src_work = monitors.iter().find(|(m, _)| *m == current).map(|(_, r)| *r).unwrap_or(dst_work);
-    apply_move_monitor(hwnd, src_work, dst_work)
+    if enum_monitor_works().get(index).is_none() {
+        return Err(format!("no monitor {index}: run deskcrew screens"));
+    }
+    apply_move_monitor(hwnd, |monitors, _| {
+        monitors.get(index).map(|(_, r)| *r).ok_or_else(|| format!("no monitor {index}: run deskcrew screens"))
+    })
 }
 
 /// Move `hwnd` to the next or previous monitor's work area without taking focus.
 /// Returns `Ok(false)` if there is only one monitor.
 pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
-    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
-    let mut monitors = enum_monitor_works();
-    monitors.sort_by_key(|(_, r)| (r.left, r.top));
-    if monitors.len() < 2 {
+    if enum_monitor_works().len() < 2 {
         return Ok(false);
     }
-    let current = unsafe { MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST) } as isize;
-    let idx = monitors.iter().position(|(m, _)| *m == current).unwrap_or(0);
-    let target = if next { (idx + 1) % monitors.len() } else { (idx + monitors.len() - 1) % monitors.len() };
-    apply_move_monitor(hwnd, monitors[idx].1, monitors[target].1)?;
+    apply_move_monitor(hwnd, |monitors, current| {
+        let mut sorted = monitors.to_vec();
+        sorted.sort_by_key(|(_, r)| (r.left, r.top));
+        if sorted.is_empty() {
+            return Err("no monitors found".into());
+        }
+        let idx = sorted.iter().position(|(m, _)| *m == current).unwrap_or(0);
+        let target = if next { (idx + 1) % sorted.len() } else { (idx + sorted.len() - 1) % sorted.len() };
+        Ok(sorted[target].1)
+    })?;
     Ok(true)
 }
 
@@ -2117,6 +2136,7 @@ mod tests {
         assert_eq!(move_monitor_rect((-320, 400, 1600, 900), src, dst), (0, 0, 1280, 720));
         let empty = RECT { left: 100, top: 200, right: 100, bottom: 150 };
         assert_eq!(move_monitor_rect((-1820, 100, 600, 400), src, empty), (100, 200, 1, 1));
+        assert_eq!(move_monitor_rect((i32::MIN, i32::MIN, i32::MAX, i32::MAX), src, dst), (0, 0, 1280, 720));
     }
 
     #[test]

@@ -1472,4 +1472,10 @@ mod tests {
         assert_eq!(WinShortcut::from_chord(&real::chord("win+alt+e").unwrap()), None);
         assert_eq!(WinShortcut::from_chord(&real::chord("ctrl+s").unwrap()), None);
     }
+
+    #[test]
+    fn centre_saturates_extreme_bounds_without_overflow() {
+        assert_eq!(centre((10, 20, 100, 40)), (60, 40));
+        assert_eq!(centre((i32::MAX, i32::MIN, 100, -100)), (i32::MAX, i32::MIN));
+    }
 }

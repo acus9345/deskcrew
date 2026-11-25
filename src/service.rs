@@ -2276,6 +2276,9 @@ impl Service {
         let wanted = text.to_lowercase();
         let until = Instant::now() + Duration::from_millis(flags.ms.unwrap_or(WAIT_DEFAULT_MS).min(WAIT_MOST_MS));
         loop {
+            if self.stop.load(Ordering::Relaxed) {
+                return Err(STOPPED.into());
+            }
             self.read(tracked, view, false)?;
             let present = view.lines.values().any(|line| line.to_lowercase().contains(&wanted));
             if present != flags.gone {
@@ -2755,12 +2758,22 @@ impl Service {
             }
             let node = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?;
             let rect = node.element.rect()?;
-            let inside = |value: i32| (value as f32 / units) as u32;
-            frame = frame.crop(inside((rect.0 - left).max(0)), inside((rect.1 - top).max(0)), inside(rect.2).max(1), inside(rect.3).max(1));
+            if rect.2 <= 0 || rect.3 <= 0 {
+                return Err(format!("e{id} has no visible size"));
+            }
+            let rx0 = rect.0.max(left);
+            let ry0 = rect.1.max(top);
+            let vw = rect.0.saturating_add(rect.2).saturating_sub(rx0);
+            let vh = rect.1.saturating_add(rect.3).saturating_sub(ry0);
+            if vw <= 0 || vh <= 0 {
+                return Err(format!("e{id} is outside the window picture"));
+            }
+            let inside = |value: i32| ((value as f32 / units).round().max(0.0)) as u32;
+            frame = frame.crop(inside(rx0 - left), inside(ry0 - top), inside(vw).max(1), inside(vh).max(1));
             if frame.w == 0 || frame.h == 0 {
                 return Err(format!("e{id} is outside the window picture"));
             }
-            origin = (rect.0.max(left), rect.1.max(top));
+            origin = (rx0, ry0);
         }
 
         let hash = frame.hash();
@@ -2834,6 +2847,8 @@ impl Service {
             return Err("refused: that window is the Windows desktop or taskbar".into());
         }
         let word = words.first().ok_or("place x,y,w,h|min|max|restore|left|right|monitor N")?;
+        let joined = words.join(" ");
+        let joined = joined.trim();
         // A window in the back stays there: Windows' own minimize, maximize and restore activate
         // the window, which would take the person's keyboard. Their own window is theirs to change.
         let front = win::foreground();
@@ -2852,12 +2867,12 @@ impl Service {
             "restore" | "show" => win::restore_behind(tracked.hwnd)?,
             "left" => win::snap_half(tracked.hwnd, false)?,
             "right" => win::snap_half(tracked.hwnd, true)?,
-            "monitor" => {
-                let index: usize = words.get(1).and_then(|n| n.parse().ok()).ok_or("place monitor N (see deskcrew screens)")?;
+            _ if joined == "monitor" || joined.starts_with("monitor ") => {
+                let index: usize = joined["monitor".len()..].trim().parse().ok().ok_or("place monitor N (see deskcrew screens)")?;
                 win::move_to_monitor(tracked.hwnd, index)?;
             }
-            box_text => {
-                let Some((x, y, w, h)) = lines::parse_rect(box_text) else {
+            _ => {
+                let Some((x, y, w, h)) = lines::parse_rect(joined) else {
                     return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into());
                 };
                 win::place_rect(tracked.hwnd, x, y, w, h)?;

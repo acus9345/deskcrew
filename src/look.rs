@@ -131,9 +131,10 @@ pub use crate::mac::ocr::read_text;
 #[cfg(target_os = "linux")]
 fn to_ppm(frame: &Frame) -> Vec<u8> {
     let header = format!("P6\n{} {}\n255\n", frame.w, frame.h);
-    let mut out = Vec::with_capacity(header.len() + (frame.w * frame.h * 3) as usize);
+    let pixel_count = (frame.w as usize).saturating_mul(frame.h as usize);
+    let mut out = Vec::with_capacity(header.len().saturating_add(pixel_count.saturating_mul(3)));
     out.extend_from_slice(header.as_bytes());
-    for pixel in frame.pixels.as_chunks::<4>().0 {
+    for pixel in frame.pixels.as_chunks::<4>().0.iter().take(pixel_count) {
         out.extend_from_slice(&[pixel[2], pixel[1], pixel[0]]);
     }
     out
@@ -179,8 +180,8 @@ fn parse_tesseract_tsv(tsv: &str, by: f32) -> Vec<Text> {
         entry.0.push(word.to_string());
         entry.1 = entry.1.min(left);
         entry.2 = entry.2.min(top);
-        entry.3 = entry.3.max(left + w);
-        entry.4 = entry.4.max(top + h);
+        entry.3 = entry.3.max(left.saturating_add(w));
+        entry.4 = entry.4.max(top.saturating_add(h));
     }
     let back = |value: i32| (value as f32 / by).round() as i32;
     lines
@@ -189,7 +190,7 @@ fn parse_tesseract_tsv(tsv: &str, by: f32) -> Vec<Text> {
         .take(MAX_TEXT_LINES)
         .map(|(words, left, top, right, bottom)| Text {
             text: words.join(" "),
-            rect: (back(left), back(top), back(right - left).max(1), back(bottom - top).max(1)),
+            rect: (back(left), back(top), back(right.saturating_sub(left)).max(1), back(bottom.saturating_sub(top)).max(1)),
         })
         .collect()
 }
@@ -229,10 +230,11 @@ pub fn read_text(frame: &Frame) -> Result<Vec<Text>, String> {
             let _ = stdin.write_all(&ppm);
         })
     });
-    let output = child.wait_with_output().map_err(|e| format!("tesseract failed: {e}"))?;
+    let wait_res = child.wait_with_output();
     if let Some(handle) = writer {
         let _ = handle.join();
     }
+    let output = wait_res.map_err(|e| format!("tesseract failed: {e}"))?;
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -297,7 +299,7 @@ pub fn read_text(frame: &Frame) -> Result<Vec<Text>, String> {
             bottom = bottom.max(r.Y + r.Height);
         }
         if !text.trim().is_empty() && right > left {
-            out.push(Text { text, rect: (back(left), back(top), back(right - left), back(bottom - top)) });
+            out.push(Text { text, rect: (back(left), back(top), back(right - left).max(1), back(bottom - top).max(1)) });
         }
         if out.len() == MAX_TEXT_LINES {
             break;
@@ -357,6 +359,15 @@ mod tests {
         assert_eq!((doubled.w, doubled.h, doubled.pixels.len()), (4, 4, 64));
         let empty = Frame { w: 0, h: 0, pixels: Vec::new() };
         assert_eq!((empty.enlarge(2).w, empty.enlarge(2).h), (0, 0));
+    }
+
+    #[cfg(any(windows, target_os = "linux"))]
+    #[test]
+    fn read_text_handles_empty_or_truncated_frames_without_failing() {
+        let empty = Frame { w: 0, h: 0, pixels: Vec::new() };
+        assert!(read_text(&empty).unwrap().is_empty());
+        let truncated = Frame { w: 10, h: 10, pixels: vec![0; 4] };
+        assert!(read_text(&truncated).unwrap().is_empty());
     }
 
     #[cfg(target_os = "linux")]

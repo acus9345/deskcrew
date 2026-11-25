@@ -194,12 +194,19 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+fn is_dims(s: &str) -> bool {
+    let Some((w, rest)) = s.split_once('x') else { return false };
+    let h = rest.split_whitespace().next().unwrap_or("");
+    !w.is_empty() && w.bytes().all(|b| b.is_ascii_digit()) && !h.is_empty() && h.bytes().all(|b| b.is_ascii_digit())
+}
+
 /// Extract the PNG path at the start of a `shot` reply (even if a parent folder contains `.png`).
 fn picture_path(reply: &str) -> Option<&str> {
     let mut offset = 0;
     while let Some(pos) = reply[offset..].find(".png") {
         let end = offset + pos + 4;
-        if reply.as_bytes().get(end).is_none_or(u8::is_ascii_whitespace) {
+        let after = &reply[end..];
+        if after.is_empty() || (after.starts_with(' ') && is_dims(after.trim_start())) {
             return Some(&reply[..end]);
         }
         offset = end;
@@ -328,9 +335,14 @@ mod tests {
             Some(r"C:\Users\my.png.files\deskcrew\shots\Claude-w1.png")
         );
         assert_eq!(
+            picture_path(r"C:\Users\my.png files\deskcrew\shots\Claude-w1.png 800x600 scale 1.00"),
+            Some(r"C:\Users\my.png files\deskcrew\shots\Claude-w1.png")
+        );
+        assert_eq!(
             picture_path("/tmp/folder with spaces/a-w0.png"),
             Some("/tmp/folder with spaces/a-w0.png")
         );
         assert_eq!(picture_path("unchanged"), None);
+        assert_eq!(words("shot", &json!({ "region": "10,20,300,400" })).unwrap(), ["shot", "--region", "10,20,300,400"]);
     }
 }

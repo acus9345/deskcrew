@@ -175,7 +175,9 @@ pub fn work_area() -> ax::Bounds {
     use objc2::runtime::AnyObject;
     use objc2::{class, msg_send};
     unsafe {
-        let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+        let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+        let primary: *mut AnyObject = if !screens.is_null() { msg_send![screens, firstObject] } else { std::ptr::null_mut() };
+        let screen: *mut AnyObject = if !primary.is_null() { primary } else { msg_send![class!(NSScreen), mainScreen] };
         if screen.is_null() {
             let all = CGDisplayBounds(CGMainDisplayID());
             return (0, 0, all.size.width as i32, all.size.height as i32);

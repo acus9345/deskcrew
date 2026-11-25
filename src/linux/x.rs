@@ -365,15 +365,15 @@ pub fn place(id: u32, how: &str) -> Result<(), String> {
             let (sx, sy, sw, sh) = monitor_of(x, id);
             unmax();
             let half = sw / 2;
-            let bx = if how == "left" { sx } else { sx + half };
-            configure(x, id, (bx, sy, half, sh))
+            let (bx, bw) = if how == "left" { (sx, half) } else { (sx + half, sw - half) };
+            configure(x, id, (bx, sy, bw, sh))
         }
-        other if other.starts_with("monitor ") => {
-            let index: usize = other["monitor ".len()..].trim().parse().map_err(|_| "place monitor N needs a monitor number from deskcrew screens".to_string())?;
+        other if other == "monitor" || other.starts_with("monitor ") => {
+            let index: usize = other["monitor".len()..].trim().parse().map_err(|_| "place monitor N needs a monitor number from deskcrew screens".to_string())?;
             let list = screens();
             let (sx, sy, sw, sh) = list.get(index).ok_or_else(|| format!("no monitor {index}: run deskcrew screens"))?.0;
             unmax();
-            let (bw, bh) = x.rect(id).map_or((sw, sh), |r| (r.2.min(sw).max(200), r.3.min(sh).max(200)));
+            let (bw, bh) = x.rect(id).map_or((sw, sh), |r| (r.2.min(sw).max(200.min(sw.max(1))), r.3.min(sh).max(200.min(sh.max(1)))));
             configure(x, id, (sx + (sw - bw) / 2, sy + (sh - bh) / 2, bw, bh))
         }
         box_text => {
@@ -390,8 +390,8 @@ pub fn place(id: u32, how: &str) -> Result<(), String> {
 fn monitor_of(x: &X, id: u32) -> Bounds {
     let list = screens();
     if let Some((wx, wy, ww, wh)) = x.rect(id) {
-        let (cx, cy) = (wx + ww / 2, wy + wh / 2);
-        if let Some((bounds, _)) = list.iter().find(|((sx, sy, sw, sh), _)| cx >= *sx && cy >= *sy && cx < *sx + *sw && cy < *sy + *sh) {
+        let (cx, cy) = (wx.saturating_add(ww / 2), wy.saturating_add(wh / 2));
+        if let Some((bounds, _)) = list.iter().find(|((sx, sy, sw, sh), _)| cx >= *sx && cy >= *sy && cx < sx.saturating_add(*sw) && cy < sy.saturating_add(*sh)) {
             return *bounds;
         }
     }
@@ -1251,7 +1251,7 @@ fn tap(x: &X, map: &Keymap, sym: u32, held: &[u8]) -> Result<(), String> {
                 let code = fresh.spare().ok_or("no free key to type that character with")?;
                 active_per = fresh.per.max(1);
                 let row = vec![sym; active_per];
-                x.conn.change_keyboard_mapping(1, code, fresh.per as u8, &row).map_err(|e| e.to_string())?;
+                x.conn.change_keyboard_mapping(1, code, active_per as u8, &row).map_err(|e| e.to_string())?;
                 (code, false, true)
             }
         }
@@ -1444,7 +1444,7 @@ fn send_tap(x: &X, target: XWindow, coords: (i16, i16, i16, i16), map: &Keymap, 
                 let code = fresh.spare().ok_or("no free key to type that character with")?;
                 active_per = fresh.per.max(1);
                 let row = vec![sym; active_per];
-                x.conn.change_keyboard_mapping(1, code, fresh.per as u8, &row).map_err(|e| e.to_string())?;
+                x.conn.change_keyboard_mapping(1, code, active_per as u8, &row).map_err(|e| e.to_string())?;
                 (code, false, true)
             }
         }

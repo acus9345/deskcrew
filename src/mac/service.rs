@@ -1713,12 +1713,22 @@ impl Service {
             }
             let node = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?;
             let rect = ax::rect(&node.element).unwrap_or(node.rect);
-            let inside = |value: i32| (value as f32 / units) as u32;
-            frame = frame.crop(inside((rect.0 - left).max(0)), inside((rect.1 - top).max(0)), inside(rect.2).max(1), inside(rect.3).max(1));
+            if rect.2 <= 0 || rect.3 <= 0 {
+                return Err(format!("e{id} has no visible size"));
+            }
+            let rx0 = rect.0.max(left);
+            let ry0 = rect.1.max(top);
+            let vw = rect.0.saturating_add(rect.2).saturating_sub(rx0);
+            let vh = rect.1.saturating_add(rect.3).saturating_sub(ry0);
+            if vw <= 0 || vh <= 0 {
+                return Err(format!("e{id} is outside the window picture"));
+            }
+            let inside = |value: i32| ((value as f32 / units).round().max(0.0)) as u32;
+            frame = frame.crop(inside(rx0 - left), inside(ry0 - top), inside(vw).max(1), inside(vh).max(1));
             if frame.w == 0 || frame.h == 0 {
                 return Err(format!("e{id} is outside the window picture"));
             }
-            origin = (rect.0.max(left), rect.1.max(top));
+            origin = (rx0, ry0);
         }
         let hash = frame.hash();
         // The view before the agents: every other command takes the two locks in that order.
@@ -1809,6 +1819,8 @@ impl Service {
         let window = self.window_of(&tracked)?;
         let element = apps::element(&window).ok_or("that window does not answer accessibility requests")?;
         let word = words.first().ok_or("place x,y,w,h|min|max|restore|left|right|monitor N")?;
+        let joined = words.join(" ");
+        let joined = joined.trim();
         match word.as_str() {
             "min" => ax::set_bool(&element, "AXMinimized", true)?,
             "restore" | "show" => {
@@ -1828,20 +1840,21 @@ impl Service {
                 ax::set_position(&element, nx, y)?;
                 ax::set_size(&element, nw, h)?;
             }
-            "monitor" => {
-                let index: usize = words.get(1).and_then(|n| n.parse().ok()).ok_or("place monitor N (see deskcrew screens)")?;
+            _ if joined == "monitor" || joined.starts_with("monitor ") => {
+                let index: usize = joined["monitor".len()..].trim().parse().ok().ok_or("place monitor N (see deskcrew screens)")?;
                 let screens = apps::screens();
-                let (dst, _) = screens.get(index).ok_or(format!("no monitor {index}: run deskcrew screens"))?;
+                let (raw_dst, _) = screens.get(index).ok_or(format!("no monitor {index}: run deskcrew screens"))?;
+                let dst = screen_for(*raw_dst);
                 let (_, _, cur_w, cur_h) = window.rect;
-                let w = cur_w.min(dst.2).max(100);
-                let h = cur_h.min(dst.3).max(100);
+                let w = cur_w.min(dst.2).max(100.min(dst.2.max(1)));
+                let h = cur_h.min(dst.3).max(100.min(dst.3.max(1)));
                 let x = dst.0 + (dst.2 - w) / 2;
                 let y = dst.1 + (dst.3 - h) / 2;
                 ax::set_position(&element, x, y)?;
                 ax::set_size(&element, w, h)?;
             }
-            box_text => {
-                let Some((x, y, w, h)) = lines::parse_rect(box_text) else {
+            _ => {
+                let Some((x, y, w, h)) = lines::parse_rect(joined) else {
                     return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into());
                 };
                 ax::set_position(&element, x, y)?;

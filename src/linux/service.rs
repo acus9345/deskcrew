@@ -2231,7 +2231,7 @@ impl Service {
                 (f, (left, top), u)
             }
             None => {
-                let hint = (ww > 0 && wh > 0).then_some((left + ww / 2, top + wh / 2));
+                let hint = (ww > 0 && wh > 0).then_some((left.saturating_add(ww / 2), top.saturating_add(wh / 2)));
                 let (full, screen_origin, units) = portal::screenshot(hint)?;
                 if ww > 0 && wh > 0 {
                     let px_x = (((left - screen_origin.0) as f32 / units).round() as i32).max(0) as u32;
@@ -2252,15 +2252,25 @@ impl Service {
             }
             let node = view.nodes.get(&id).ok_or(format!("e{id} is gone: see"))?;
             let rect = atspi::rect(&node.element).unwrap_or(node.rect);
-            let cx = (((rect.0 - origin.0) as f32 / units).round() as i32).max(0) as u32;
-            let cy = (((rect.1 - origin.1) as f32 / units).round() as i32).max(0) as u32;
-            let cw = ((rect.2 as f32 / units).round() as u32).max(1);
-            let ch = ((rect.3 as f32 / units).round() as u32).max(1);
+            if rect.2 <= 0 || rect.3 <= 0 {
+                return Err(format!("e{id} has no visible size"));
+            }
+            let rx0 = rect.0.max(origin.0);
+            let ry0 = rect.1.max(origin.1);
+            let vw = rect.0.saturating_add(rect.2).saturating_sub(rx0);
+            let vh = rect.1.saturating_add(rect.3).saturating_sub(ry0);
+            if vw <= 0 || vh <= 0 {
+                return Err(format!("e{id} is outside the window picture"));
+            }
+            let cx = (((rx0 - origin.0) as f32 / units).round() as i32).max(0) as u32;
+            let cy = (((ry0 - origin.1) as f32 / units).round() as i32).max(0) as u32;
+            let cw = ((vw as f32 / units).round() as u32).max(1);
+            let ch = ((vh as f32 / units).round() as u32).max(1);
             frame = frame.crop(cx, cy, cw, ch);
             if frame.w == 0 || frame.h == 0 {
                 return Err(format!("e{id} is outside the window picture"));
             }
-            origin = (rect.0.max(origin.0), rect.1.max(origin.1));
+            origin = (rx0, ry0);
         }
         let hash = frame.hash();
         // The view before the agents: every other command takes the two locks in that order.

@@ -290,6 +290,14 @@ mod tests {
         assert_eq!(agent_from(&mut trailing, Some("   "), || "Fallback".into()), "Fallback");
         assert_eq!(trailing, vec!["status"]);
 
+        let mut before_sep = vec!["click".into(), "e1".into(), "--agent".into(), "--".into(), "literal".into()];
+        assert_eq!(agent_from(&mut before_sep, Some("Bob"), || "Fallback".into()), "Bob");
+        assert_eq!(before_sep, vec!["click", "e1", "--", "literal"]);
+
+        let mut after_sep = vec!["type".into(), "e1".into(), "--".into(), "--agent".into(), "foo".into()];
+        assert_eq!(agent_from(&mut after_sep, None, || "Fallback".into()), "Fallback");
+        assert_eq!(after_sep, vec!["type", "e1", "--", "--agent", "foo"]);
+
         let mut blank_flag = vec!["--agent".into(), "  ".into(), "see".into()];
         assert_eq!(agent_from(&mut blank_flag, Some("Bob"), || "Fallback".into()), "Bob");
         assert_eq!(blank_flag, vec!["see"]);
@@ -298,6 +306,7 @@ mod tests {
     #[test]
     fn encode_words_rejects_embedded_nul_bytes() {
         assert_eq!(encode_words(&["Agent".into(), "status".into()]).unwrap(), "Agent\0status");
+        assert!(encode_words(&["Bad\0Agent".into(), "status".into()]).is_err());
         assert!(encode_words(&["Agent".into(), "bad\0arg".into()]).is_err());
     }
 }
