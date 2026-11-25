@@ -29,7 +29,7 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 /// Who is asking, so each agent keeps its own cursor. A flag beats the environment.
 pub fn agent(args: &mut Vec<String>) -> String {
     let env_name = env::var("DESKCREW_AGENT").ok();
-    agent_from(args, env_name.as_deref(), || launched_by().unwrap_or("your agent").into())
+    agent_from(args, env_name.as_deref(), || set_by_agent().or_else(launched_by).unwrap_or("your agent").into())
 }
 
 fn agent_from(args: &mut Vec<String>, env_agent: Option<&str>, fallback: impl FnOnce() -> String) -> String {
@@ -45,27 +45,30 @@ fn agent_from(args: &mut Vec<String>, env_agent: Option<&str>, fallback: impl Fn
             args.remove(at);
         }
     }
+    env_agent.map(str::trim).filter(|n| !n.is_empty()).map_or_else(fallback, str::to_string)
+}
+
+/// The agent named by a variable it sets in the environment.
+fn set_by_agent() -> Option<&'static str> {
     let has = |name: &str| env::var_os(name).is_some();
-    if let Some(name) = env_agent.map(str::trim).filter(|n| !n.is_empty()) {
-        name.to_string()
-    } else if has("CLAUDECODE") || has("CLAUDE_CODE_ENTRYPOINT") {
-        "Claude Code".into()
+    if has("CLAUDECODE") || has("CLAUDE_CODE_ENTRYPOINT") {
+        Some("Claude Code")
     } else if has("CURSOR_TRACE_ID") || has("CURSOR_AGENT") {
-        "Cursor".into()
+        Some("Cursor")
     } else if has("CODEX_HOME") || has("CODEX_SANDBOX") {
-        "Codex".into()
+        Some("Codex")
     } else if has("GEMINI_CLI") {
-        "Gemini".into()
+        Some("Gemini")
     } else if has("COPILOT_CLI") {
-        "Copilot".into()
+        Some("Copilot")
     } else if has("OPENCODE") {
-        "OpenCode".into()
+        Some("OpenCode")
     } else if has("CLINE_ACTIVE") {
-        "Cline".into()
+        Some("Cline")
     } else if has("AMP_CURRENT_THREAD_ID") {
-        "Amp".into()
+        Some("Amp")
     } else {
-        fallback()
+        None
     }
 }
 
