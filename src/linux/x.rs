@@ -377,8 +377,9 @@ pub fn place(id: u32, how: &str) -> Result<(), String> {
             configure(x, id, (sx + (sw - bw) / 2, sy + (sh - bh) / 2, bw, bh))
         }
         box_text => {
-            let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-            let [bx, by, bw, bh] = parts[..] else { return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into()) };
+            let Some((bx, by, bw, bh)) = crate::lines::parse_rect(box_text) else {
+                return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into());
+            };
             unmax();
             configure(x, id, (bx, by, bw, bh))
         }

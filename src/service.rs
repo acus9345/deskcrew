@@ -105,7 +105,7 @@ drag a b     draw [e3] "x,y x,y; x,y x,y" [--smooth]     both take [--button rig
 do "set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Yes" [--dry] [--risk low|medium|high]
                                       many steps, one reply; names work as refs, and it goes on into dialogs it opens
 Any action: --expect "text" fails unless the text shows afterwards.
-launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore
+launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore|left|right|monitor N
 apps     screens     notifications [close]     clip     clip set "text"     clip clear     status     resume     quit     setup (installs for your coding agents)     mcp (the same as MCP tools, over stdio)
 Every action replies with what changed, new dialogs and their text too: no need to see again or sleep. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
@@ -518,6 +518,10 @@ struct Step {
 /// `wait` would read as milliseconds.
 fn expected(flags: &Flags) -> Option<Step> {
     flags.expect.as_ref().map(|text| Step { flags: Flags::default(), words: vec!["expect".to_string(), text.clone()] })
+}
+
+fn sleep_ms(text: &str, flags: &Flags) -> Option<u64> {
+    (!flags.gone).then(|| text.parse::<u64>().ok()).flatten()
 }
 
 enum Target {
@@ -2253,8 +2257,15 @@ impl Service {
     }
 
     fn wait(&self, flags: &Flags, tracked: &Tracked, view: &mut View, text: &str) -> Reply {
-        if let Ok(ms) = text.parse::<u64>() {
-            thread::sleep(Duration::from_millis(ms.min(WAIT_MOST_MS)));
+        if let Some(ms) = sleep_ms(text, flags) {
+            let limit = Duration::from_millis(ms.min(WAIT_MOST_MS));
+            let started = Instant::now();
+            while started.elapsed() < limit {
+                if self.stop.load(Ordering::Relaxed) {
+                    return Err(STOPPED.into());
+                }
+                thread::sleep(WAIT_STEP.min(limit.saturating_sub(started.elapsed())));
+            }
             return Ok("waited".into());
         }
         self.wait_text(flags, tracked, view, text)
@@ -2690,11 +2701,9 @@ impl Service {
     fn shot(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let edge = flags.edge.unwrap_or(shot::DEFAULT_EDGE);
         if let Some(region) = &flags.region {
-            let parts: Vec<i32> = region.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-            let [x, y, w, h] = parts[..] else { return Err("--region x,y,w,h".into()) };
-            if w < 1 || h < 1 {
-                return Err("--region needs a width and height".into());
-            }
+            let Some((x, y, w, h)) = lines::parse_rect(region) else {
+                return Err("--region x,y,w,h (width and height >= 1)".into());
+            };
             let (small, scale) = self.capture_screen(x, y, w, h)?.shrink(edge);
             let path = shot::path_for(who, 0);
             small.save(&path)?;
@@ -2748,6 +2757,9 @@ impl Service {
             let rect = node.element.rect()?;
             let inside = |value: i32| (value as f32 / units) as u32;
             frame = frame.crop(inside((rect.0 - left).max(0)), inside((rect.1 - top).max(0)), inside(rect.2).max(1), inside(rect.3).max(1));
+            if frame.w == 0 || frame.h == 0 {
+                return Err(format!("e{id} is outside the window picture"));
+            }
             origin = (rect.0.max(left), rect.1.max(top));
         }
 
@@ -2777,10 +2789,11 @@ impl Service {
             None => frame.crop(0, 0, frame.w, frame.h),
         };
         let (mut small, scale) = picture.shrink(edge);
-        if flags.marks {
-            let to_image = |value: i32, from: i32| ((value - from) as f32 / (scale * units)) as i32;
+        let per_pixel = scale * units;
+        if flags.marks && per_pixel.is_finite() && per_pixel > 0.0 {
+            let to_image = |value: i32, from: i32| ((value - from) as f32 / per_pixel) as i32;
             for (id, (x, y, w, h)) in marked {
-                small.mark(to_image(x, origin.0), to_image(y, origin.1), ((w as f32) / (scale * units)) as i32, ((h as f32) / (scale * units)) as i32, id);
+                small.mark(to_image(x, origin.0), to_image(y, origin.1), ((w as f32) / per_pixel) as i32, ((h as f32) / per_pixel) as i32, id);
             }
         }
         if flags.rulers {
@@ -2820,7 +2833,7 @@ impl Service {
         if act::is_shell_window(tracked.hwnd) {
             return Err("refused: that window is the Windows desktop or taskbar".into());
         }
-        let word = words.first().ok_or("place x,y,w,h|min|max|restore")?;
+        let word = words.first().ok_or("place x,y,w,h|min|max|restore|left|right|monitor N")?;
         // A window in the back stays there: Windows' own minimize, maximize and restore activate
         // the window, which would take the person's keyboard. Their own window is theirs to change.
         let front = win::foreground();
@@ -2837,9 +2850,16 @@ impl Service {
             }
             "restore" if theirs => win::place_restore_front(tracked.hwnd)?,
             "restore" | "show" => win::restore_behind(tracked.hwnd)?,
+            "left" => win::snap_half(tracked.hwnd, false)?,
+            "right" => win::snap_half(tracked.hwnd, true)?,
+            "monitor" => {
+                let index: usize = words.get(1).and_then(|n| n.parse().ok()).ok_or("place monitor N (see deskcrew screens)")?;
+                win::move_to_monitor(tracked.hwnd, index)?;
+            }
             box_text => {
-                let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-                let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore".into()) };
+                let Some((x, y, w, h)) = lines::parse_rect(box_text) else {
+                    return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into());
+                };
                 win::place_rect(tracked.hwnd, x, y, w, h)?;
             }
         }
@@ -3405,5 +3425,14 @@ mod tests {
         assert!(quiet_blocked("type", &[], &Flags { paste: true, ..Flags::default() }, None).is_none());
         let step_real = vec![Step { flags: Flags { real: true, ..Flags::default() }, words: vec!["click".into(), "e1".into()] }];
         assert!(quiet_blocked("do", &[], &plain, Some(&step_real)).is_some());
+    }
+
+    #[test]
+    fn numeric_wait_respects_gone_flag() {
+        let plain = Flags::default();
+        let gone = Flags { gone: true, ..Flags::default() };
+        assert_eq!(sleep_ms("1500", &plain), Some(1500));
+        assert_eq!(sleep_ms("1500", &gone), None);
+        assert_eq!(sleep_ms("Ready", &plain), None);
     }
 }

@@ -25,19 +25,23 @@ pub fn empty_area(window: Box4, rects: &[(Box4, bool)]) -> Option<Box4> {
     if ww < LEAST_SIDE || wh < LEAST_SIDE {
         return None;
     }
-    let (cw, ch) = (ww as f32 / GRID as f32, wh as f32 / GRID as f32);
+    let (cw, ch) = (ww as f64 / GRID as f64, wh as f64 / GRID as f64);
     let mut covered = vec![[false; GRID as usize]; GRID as usize];
-    let whole = (ww * wh) as f32;
+    let whole = ww as f64 * wh as f64;
     for &((x, y, w, h), container) in rects {
-        if w <= 0 || h <= 0 || (container && (w * h) as f32 > whole * CONTAINER_SHARE) {
+        if w <= 0 || h <= 0 || (container && (w as f64 * h as f64) > whole * CONTAINER_SHARE as f64) {
             continue;
         }
-        let left = (((x - wx) as f32 / cw).floor() as i32).clamp(0, GRID);
-        let right = (((x + w - wx) as f32 / cw).ceil() as i32).clamp(0, GRID);
-        let top = (((y - wy) as f32 / ch).floor() as i32).clamp(0, GRID);
-        let bottom = (((y + h - wy) as f32 / ch).ceil() as i32).clamp(0, GRID);
-        for row in covered.iter_mut().take(bottom as usize).skip(top as usize) {
-            for cell in row.iter_mut().take(right as usize).skip(left as usize) {
+        let x0 = x as i64 - wx as i64;
+        let x1 = x0 + w as i64;
+        let y0 = y as i64 - wy as i64;
+        let y1 = y0 + h as i64;
+        let left = ((x0 as f64 / cw).floor() as i64).clamp(0, GRID as i64) as usize;
+        let right = ((x1 as f64 / cw).ceil() as i64).clamp(0, GRID as i64) as usize;
+        let top = ((y0 as f64 / ch).floor() as i64).clamp(0, GRID as i64) as usize;
+        let bottom = ((y1 as f64 / ch).ceil() as i64).clamp(0, GRID as i64) as usize;
+        for row in covered.iter_mut().take(bottom).skip(top) {
+            for cell in row.iter_mut().take(right).skip(left) {
                 *cell = true;
             }
         }
@@ -64,11 +68,11 @@ pub fn empty_area(window: Box4, rects: &[(Box4, bool)]) -> Option<Box4> {
         }
     }
     let (_, (column, row, columns, rows)) = best;
-    let x = wx + (column as f32 * cw).round() as i32;
-    let y = wy + (row as f32 * ch).round() as i32;
-    let w = (columns as f32 * cw).round() as i32;
-    let h = (rows as f32 * ch).round() as i32;
-    let big = (w * h) as f32 >= whole * LEAST_SHARE && w >= LEAST_SIDE && h >= LEAST_SIDE;
+    let x = (wx as i64 + (column as f64 * cw).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let y = (wy as i64 + (row as f64 * ch).round() as i64).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+    let w = (columns as f64 * cw).round().clamp(0.0, i32::MAX as f64) as i32;
+    let h = (rows as f64 * ch).round().clamp(0.0, i32::MAX as f64) as i32;
+    let big = (w as f64 * h as f64) >= whole * LEAST_SHARE as f64 && w >= LEAST_SIDE && h >= LEAST_SIDE;
     big.then_some((x, y, w, h))
 }
 
@@ -90,11 +94,23 @@ impl Frame {
 
     #[cfg_attr(not(any(windows, target_os = "linux")), allow(dead_code))]
     pub fn enlarge(&self, by: u32) -> Frame {
-        let (w, h) = (self.w * by, self.h * by);
-        let mut pixels = Vec::with_capacity((w * h * 4) as usize);
+        let expected = (self.w as usize).checked_mul(self.h as usize).and_then(|n| n.checked_mul(4));
+        if by <= 1 || self.w == 0 || self.h == 0 || expected.is_none_or(|len| self.pixels.len() < len) {
+            return Frame { w: self.w, h: self.h, pixels: self.pixels.clone() };
+        }
+        let Some(w) = self.w.checked_mul(by) else {
+            return Frame { w: self.w, h: self.h, pixels: self.pixels.clone() };
+        };
+        let Some(h) = self.h.checked_mul(by) else {
+            return Frame { w: self.w, h: self.h, pixels: self.pixels.clone() };
+        };
+        let Some(cap) = (w as usize).checked_mul(h as usize).and_then(|n| n.checked_mul(4)) else {
+            return Frame { w: self.w, h: self.h, pixels: self.pixels.clone() };
+        };
+        let mut pixels = Vec::with_capacity(cap);
         for y in 0..h {
             for x in 0..w {
-                let at = (((y / by) * self.w + x / by) * 4) as usize;
+                let at = ((y / by) as usize * self.w as usize + (x / by) as usize) * 4;
                 pixels.extend_from_slice(&self.pixels[at..at + 4]);
             }
         }
@@ -184,7 +200,8 @@ fn parse_tesseract_tsv(tsv: &str, by: f32) -> Vec<Text> {
 pub fn read_text(frame: &Frame) -> Result<Vec<Text>, String> {
     use std::io::Write;
     use std::process::{Command, Stdio};
-    if frame.w == 0 || frame.h == 0 {
+    let expected = (frame.w as usize).checked_mul(frame.h as usize).and_then(|n| n.checked_mul(4));
+    if frame.w == 0 || frame.h == 0 || expected.is_none_or(|len| frame.pixels.len() < len) {
         return Ok(Vec::new());
     }
     let by = if frame.w.max(frame.h) < OCR_SMALL { 2 } else { 1 };
@@ -207,10 +224,15 @@ pub fn read_text(frame: &Frame) -> Result<Vec<Text>, String> {
         Err(e) => return Err(format!("could not run tesseract: {e}")),
     };
     let ppm = to_ppm(picture);
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&ppm);
-    }
+    let writer = child.stdin.take().map(|mut stdin| {
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(&ppm);
+        })
+    });
     let output = child.wait_with_output().map_err(|e| format!("tesseract failed: {e}"))?;
+    if let Some(handle) = writer {
+        let _ = handle.join();
+    }
     if !output.status.success() {
         return Ok(Vec::new());
     }
@@ -226,10 +248,17 @@ pub fn read_text(frame: &Frame) -> Result<Vec<Text>, String> {
         Media::Ocr::OcrEngine,
         Security::Cryptography::CryptographicBuffer,
     };
+    let expected = (frame.w as usize).checked_mul(frame.h as usize).and_then(|n| n.checked_mul(4));
+    if frame.w == 0 || frame.h == 0 || expected.is_none_or(|len| frame.pixels.len() < len) {
+        return Ok(Vec::new());
+    }
     let fail = |e: windows::core::Error| format!("Windows could not read text: {}", e.message());
     let engine = OcrEngine::TryCreateFromUserProfileLanguages().map_err(fail)?;
     let most = OcrEngine::MaxImageDimension().map_err(fail)?;
-    let by = if frame.w.max(frame.h) < OCR_SMALL && frame.w.max(frame.h) * 2 <= most { 2 } else { 1 };
+    if most == 0 {
+        return Ok(Vec::new());
+    }
+    let by = if frame.w.max(frame.h) < OCR_SMALL && frame.w.max(frame.h).saturating_mul(2) <= most { 2 } else { 1 };
     let enlarged;
     let mut picture = if by > 1 {
         enlarged = frame.enlarge(by);
@@ -244,6 +273,9 @@ pub fn read_text(frame: &Frame) -> Result<Vec<Text>, String> {
         shrunk = small;
         picture = &shrunk;
         shrink_by = scale;
+    }
+    if picture.w == 0 || picture.h == 0 {
+        return Ok(Vec::new());
     }
     let mut pixels = picture.pixels.clone();
     for pixel in pixels.as_chunks_mut::<4>().0 {
@@ -306,6 +338,25 @@ mod tests {
             drawn.pixels[at] = 0;
         }
         assert!(drawn.busy());
+    }
+
+    #[test]
+    fn empty_area_and_enlarge_handle_extreme_bounds_safely() {
+        // Huge or overflowing control bounds must not overflow i32 arithmetic.
+        assert_eq!(empty_area((0, 0, 0, 0), &[]), None);
+        assert_eq!(
+            empty_area((-1000, -1000, 5000, 5000), &[((i32::MIN, i32::MIN, 1_000_000, 1_000_000), false)]),
+            Some((-1000, -1000, 5000, 5000))
+        );
+        assert!(empty_area((-1000, -1000, 5000, 5000), &[((i32::MIN, i32::MIN, i32::MAX, i32::MAX), false)]).is_some());
+        let tiny = Frame { w: 2, h: 2, pixels: vec![7; 16] };
+        assert_eq!(tiny.enlarge(0).w, 2);
+        assert_eq!(tiny.enlarge(1).w, 2);
+        assert_eq!(tiny.enlarge(u32::MAX).w, 2);
+        let doubled = tiny.enlarge(2);
+        assert_eq!((doubled.w, doubled.h, doubled.pixels.len()), (4, 4, 64));
+        let empty = Frame { w: 0, h: 0, pixels: Vec::new() };
+        assert_eq!((empty.enlarge(2).w, empty.enlarge(2).h), (0, 0));
     }
 
     #[cfg(target_os = "linux")]

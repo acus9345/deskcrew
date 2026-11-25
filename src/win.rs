@@ -743,27 +743,8 @@ pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
     Ok(())
 }
 
-/// Move `hwnd` to the next or previous monitor's work area without taking focus.
-/// Returns `Ok(false)` if there is only one monitor.
-pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
-    use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
+fn apply_move_monitor(hwnd: Hwnd, src_work: RECT, dst_work: RECT) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MAXIMIZE, SW_SHOWNOACTIVATE};
-    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> i32 {
-        unsafe {
-            let mut info: MONITORINFO = zeroed();
-            info.cbSize = size_of::<MONITORINFO>() as u32;
-            if GetMonitorInfoW(monitor, &mut info) != 0 {
-                (*(found as *mut Vec<(isize, RECT)>)).push((monitor as isize, info.rcWork));
-            }
-        }
-        1
-    }
-    let mut monitors: Vec<(isize, RECT)> = Vec::new();
-    unsafe { EnumDisplayMonitors(null_mut(), std::ptr::null(), Some(each), &mut monitors as *mut _ as LPARAM) };
-    monitors.sort_by_key(|(_, r)| (r.left, r.top));
-    if monitors.len() < 2 {
-        return Ok(false);
-    }
     let front = foreground();
     let theirs = front == hwnd;
     let lock = window_lock(hwnd);
@@ -777,10 +758,6 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
     if unsafe { IsIconic(raw(hwnd)) } != 0 {
         show(hwnd, SW_SHOWNOACTIVATE)?;
     }
-    let current = unsafe { MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST) } as isize;
-    let idx = monitors.iter().position(|(m, _)| *m == current).unwrap_or(0);
-    let target = if next { (idx + 1) % monitors.len() } else { (idx + monitors.len() - 1) % monitors.len() };
-    let (src_work, dst_work) = (monitors[idx].1, monitors[target].1);
     let os_zoomed = unsafe { IsZoomed(raw(hwnd)) } != 0;
     let zoomed = restored_maximized || os_zoomed;
     let filled = FILLED.lock().unwrap().remove(&hwnd);
@@ -807,6 +784,48 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
     drop(_fg_lock);
     drop(guard);
     settle_behind(hwnd, front);
+    Ok(())
+}
+
+fn enum_monitor_works() -> Vec<(isize, RECT)> {
+    unsafe extern "system" fn each(monitor: HMONITOR, _: HDC, _: *mut RECT, found: LPARAM) -> i32 {
+        unsafe {
+            let mut info: MONITORINFO = zeroed();
+            info.cbSize = size_of::<MONITORINFO>() as u32;
+            if GetMonitorInfoW(monitor, &mut info) != 0 {
+                (*(found as *mut Vec<(isize, RECT)>)).push((monitor as isize, info.rcWork));
+            }
+        }
+        1
+    }
+    let mut monitors: Vec<(isize, RECT)> = Vec::new();
+    unsafe { EnumDisplayMonitors(null_mut(), std::ptr::null(), Some(each), &mut monitors as *mut _ as LPARAM) };
+    monitors
+}
+
+/// Move `hwnd` to monitor `index` (matching `screens()`) without taking focus.
+pub fn move_to_monitor(hwnd: Hwnd, index: usize) -> Result<(), String> {
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    let monitors = enum_monitor_works();
+    let (_, dst_work) = *monitors.get(index).ok_or_else(|| format!("no monitor {index}: run deskcrew screens"))?;
+    let current = unsafe { MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST) } as isize;
+    let src_work = monitors.iter().find(|(m, _)| *m == current).map(|(_, r)| *r).unwrap_or(dst_work);
+    apply_move_monitor(hwnd, src_work, dst_work)
+}
+
+/// Move `hwnd` to the next or previous monitor's work area without taking focus.
+/// Returns `Ok(false)` if there is only one monitor.
+pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
+    use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
+    let mut monitors = enum_monitor_works();
+    monitors.sort_by_key(|(_, r)| (r.left, r.top));
+    if monitors.len() < 2 {
+        return Ok(false);
+    }
+    let current = unsafe { MonitorFromWindow(raw(hwnd), MONITOR_DEFAULTTONEAREST) } as isize;
+    let idx = monitors.iter().position(|(m, _)| *m == current).unwrap_or(0);
+    let target = if next { (idx + 1) % monitors.len() } else { (idx + monitors.len() - 1) % monitors.len() };
+    apply_move_monitor(hwnd, monitors[idx].1, monitors[target].1)?;
     Ok(true)
 }
 

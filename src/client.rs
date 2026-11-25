@@ -28,17 +28,26 @@ const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
 
 /// Who is asking, so each agent keeps its own cursor. A flag beats the environment.
 pub fn agent(args: &mut Vec<String>) -> String {
+    let env_name = env::var("DESKCREW_AGENT").ok();
+    agent_from(args, env_name.as_deref(), || launched_by().unwrap_or("your agent").into())
+}
+
+fn agent_from(args: &mut Vec<String>, env_agent: Option<&str>, fallback: impl FnOnce() -> String) -> String {
     let limit = args.iter().position(|a| a == "--").unwrap_or(args.len());
-    if let Some(at) = args[..limit].iter().position(|a| a == "--agent")
-        && at + 1 < limit
-    {
-        let name = args.remove(at + 1);
-        args.remove(at);
-        return name;
+    if let Some(at) = args[..limit].iter().position(|a| a == "--agent") {
+        if at + 1 < limit {
+            let name = args.remove(at + 1);
+            args.remove(at);
+            if !name.trim().is_empty() {
+                return name.trim().to_string();
+            }
+        } else {
+            args.remove(at);
+        }
     }
     let has = |name: &str| env::var_os(name).is_some();
-    if let Ok(name) = env::var("DESKCREW_AGENT") {
-        name
+    if let Some(name) = env_agent.map(str::trim).filter(|n| !n.is_empty()) {
+        name.to_string()
     } else if has("CLAUDECODE") || has("CLAUDE_CODE_ENTRYPOINT") {
         "Claude Code".into()
     } else if has("CURSOR_TRACE_ID") || has("CURSOR_AGENT") {
@@ -56,7 +65,7 @@ pub fn agent(args: &mut Vec<String>) -> String {
     } else if has("AMP_CURRENT_THREAD_ID") {
         "Amp".into()
     } else {
-        launched_by().unwrap_or("your agent").into()
+        fallback()
     }
 }
 
@@ -205,12 +214,20 @@ fn connect() -> Result<Pipe, String> {
     }
 }
 
+fn encode_words(words: &[String]) -> Result<String, String> {
+    if words.iter().any(|w| w.contains('\0')) {
+        return Err("arguments cannot contain NUL bytes".into());
+    }
+    Ok(words.join("\0"))
+}
+
 /// One request to the service as this agent, without logging it: whether it worked, and the reply.
 pub fn ask(who: &str, args: &[String]) -> Result<(bool, String), String> {
     let mut words = vec![who.to_string()];
     words.extend(args.iter().cloned());
+    let message = encode_words(&words)?;
     let reply = connect().and_then(|pipe| {
-        pipe.send(words.join("\0").as_bytes()).map_err(|e| e.to_string())?;
+        pipe.send(message.as_bytes()).map_err(|e| e.to_string())?;
         pipe.receive().map_err(|e| format!("the deskcrew service stopped answering: {e}"))
     })?;
     let (code, text) = reply.split_first().ok_or("the deskcrew service sent nothing back")?;
@@ -224,10 +241,11 @@ pub fn run(mut args: Vec<String>) -> i32 {
     let started = Instant::now();
     let mut words = vec![who];
     words.extend(args);
-    let message = words.join("\0");
-    let answer = connect().and_then(|pipe| {
-        pipe.send(message.as_bytes()).map_err(|e| e.to_string())?;
-        pipe.receive().map_err(|e| format!("the deskcrew service stopped answering: {e}"))
+    let answer = encode_words(&words).and_then(|message| {
+        connect().and_then(|pipe| {
+            pipe.send(message.as_bytes()).map_err(|e| e.to_string())?;
+            pipe.receive().map_err(|e| format!("the deskcrew service stopped answering: {e}"))
+        })
     });
     let log_reply = |ok: bool, text: &str| {
         crate::log::record(&words[0], &words[1..], ok, text);
@@ -255,5 +273,31 @@ pub fn run(mut args: Vec<String>) -> i32 {
             eprintln!("{error}");
             1
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_flag_and_env_fallbacks_handle_blank_values() {
+        let mut args = vec!["status".into(), "--agent".into(), " Alice ".into()];
+        assert_eq!(agent_from(&mut args, Some("Bob"), || "Fallback".into()), "Alice");
+        assert_eq!(args, vec!["status"]);
+
+        let mut trailing = vec!["status".into(), "--agent".into()];
+        assert_eq!(agent_from(&mut trailing, Some("   "), || "Fallback".into()), "Fallback");
+        assert_eq!(trailing, vec!["status"]);
+
+        let mut blank_flag = vec!["--agent".into(), "  ".into(), "see".into()];
+        assert_eq!(agent_from(&mut blank_flag, Some("Bob"), || "Fallback".into()), "Bob");
+        assert_eq!(blank_flag, vec!["see"]);
+    }
+
+    #[test]
+    fn encode_words_rejects_embedded_nul_bytes() {
+        assert_eq!(encode_words(&["Agent".into(), "status".into()]).unwrap(), "Agent\0status");
+        assert!(encode_words(&["Agent".into(), "bad\0arg".into()]).is_err());
     }
 }

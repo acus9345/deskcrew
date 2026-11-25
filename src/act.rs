@@ -57,7 +57,7 @@ fn route(name: &'static str, done: Done) -> String {
 }
 
 pub fn centre(rect: (i32, i32, i32, i32)) -> (i32, i32) {
-    (rect.0 + rect.2 / 2, rect.1 + rect.3 / 2)
+    (rect.0.saturating_add(rect.2 / 2), rect.1.saturating_add(rect.3 / 2))
 }
 
 /// The control's own default action, picking the most direct one it offers.

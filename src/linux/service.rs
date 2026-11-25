@@ -383,7 +383,7 @@ fn is_point(word: &str) -> Option<(i32, i32)> {
 }
 
 fn centre(rect: Bounds) -> (i32, i32) {
-    (rect.0 + rect.2 / 2, rect.1 + rect.3 / 2)
+    (rect.0.saturating_add(rect.2 / 2), rect.1.saturating_add(rect.3 / 2))
 }
 
 enum Target {
@@ -2159,13 +2159,11 @@ impl Service {
         let edge = flags.edge.unwrap_or(shot::DEFAULT_EDGE);
         let pure_wayland = !x::has_display() && x::has_wayland();
         if let Some(region) = &flags.region {
-            let parts: Vec<i32> = region.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-            let [rx, ry, w, h] = parts[..] else { return Err("--region x,y,w,h".into()) };
-            if w < 1 || h < 1 {
-                return Err("--region needs a width and height".into());
-            }
+            let Some((rx, ry, w, h)) = lines::parse_rect(region) else {
+                return Err("--region x,y,w,h (width and height >= 1)".into());
+            };
             if pure_wayland {
-                let (full, origin, units) = portal::screenshot(Some((rx + w / 2, ry + h / 2)))?;
+                let (full, origin, units) = portal::screenshot(Some((rx.saturating_add(w / 2), ry.saturating_add(h / 2))))?;
                 let px_x = (((rx - origin.0) as f32 / units).round() as i32).max(0) as u32;
                 let px_y = (((ry - origin.1) as f32 / units).round() as i32).max(0) as u32;
                 let px_w = ((w as f32 / units).round() as u32).max(1);
@@ -2259,6 +2257,9 @@ impl Service {
             let cw = ((rect.2 as f32 / units).round() as u32).max(1);
             let ch = ((rect.3 as f32 / units).round() as u32).max(1);
             frame = frame.crop(cx, cy, cw, ch);
+            if frame.w == 0 || frame.h == 0 {
+                return Err(format!("e{id} is outside the window picture"));
+            }
             origin = (rect.0.max(origin.0), rect.1.max(origin.1));
         }
         let hash = frame.hash();
@@ -2285,7 +2286,7 @@ impl Service {
         };
         let (mut small, shrink) = picture.shrink(edge);
         let scale = shrink * units;
-        if flags.marks {
+        if flags.marks && scale.is_finite() && scale > 0.0 {
             let to_image = |value: i32, from: i32| ((value - from) as f32 / scale) as i32;
             for (id, (nx, ny, w, h)) in marked {
                 small.mark(to_image(nx, origin.0), to_image(ny, origin.1), (w as f32 / scale) as i32, (h as f32 / scale) as i32, id);

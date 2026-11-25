@@ -11,6 +11,19 @@ const MAX_VALUE: usize = 60;
 const MAX_CELL: usize = 32;
 const MAX_CELLS: usize = 6;
 
+/// Parse a strict `x,y,w,h` rectangle where every component is an `i32` and `w, h >= 1`.
+pub fn parse_rect(text: &str) -> Option<(i32, i32, i32, i32)> {
+    let mut parts = text.split(',').map(|p| p.trim().parse::<i32>().ok());
+    let x = parts.next()??;
+    let y = parts.next()??;
+    let w = parts.next()??;
+    let h = parts.next()??;
+    if parts.next().is_some() || w < 1 || h < 1 {
+        return None;
+    }
+    Some((x, y, w, h))
+}
+
 /// One line of text, cut to length, so a long value cannot flood a reply.
 pub fn clip(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -335,5 +348,17 @@ mod tests {
                 vec!["click", "e5"],
             ]
         );
+    }
+
+    #[test]
+    fn parse_rect_rejects_malformed_or_non_positive_boxes() {
+        assert_eq!(parse_rect("10, 20, 300, 400"), Some((10, 20, 300, 400)));
+        assert_eq!(parse_rect("-1920, -100, 800, 600"), Some((-1920, -100, 800, 600)));
+        assert_eq!(parse_rect("10,abc,20,30,40"), None);
+        assert_eq!(parse_rect("10,20,30"), None);
+        assert_eq!(parse_rect("10,20,30,40,50"), None);
+        assert_eq!(parse_rect("10,20,0,40"), None);
+        assert_eq!(parse_rect("10,20,40,-5"), None);
+        assert_eq!(parse_rect(""), None);
     }
 }

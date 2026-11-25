@@ -338,7 +338,22 @@ fn is_point(word: &str) -> Option<(i32, i32)> {
 }
 
 fn centre(rect: Bounds) -> (i32, i32) {
-    (rect.0 + rect.2 / 2, rect.1 + rect.3 / 2)
+    (rect.0.saturating_add(rect.2 / 2), rect.1.saturating_add(rect.3 / 2))
+}
+
+fn screen_for(rect: Bounds) -> Bounds {
+    let (cx, cy) = centre(rect);
+    let screens = apps::screens();
+    if let Some((bounds, main)) = screens
+        .iter()
+        .find(|((sx, sy, sw, sh), _)| cx >= *sx && cy >= *sy && cx < sx.saturating_add(*sw) && cy < sy.saturating_add(*sh))
+    {
+        if *main {
+            return apps::work_area();
+        }
+        return *bounds;
+    }
+    apps::work_area()
 }
 
 enum Target {
@@ -1651,11 +1666,9 @@ impl Service {
     fn shot(&self, who: &str, flags: &Flags, words: &[String]) -> Reply {
         let edge = flags.edge.unwrap_or(shot::DEFAULT_EDGE);
         if let Some(region) = &flags.region {
-            let parts: Vec<i32> = region.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-            let [x, y, w, h] = parts[..] else { return Err("--region x,y,w,h".into()) };
-            if w < 1 || h < 1 {
-                return Err("--region needs a width and height".into());
-            }
+            let Some((x, y, w, h)) = lines::parse_rect(region) else {
+                return Err("--region x,y,w,h (width and height >= 1)".into());
+            };
             self.overlay.aside(true);
             let taken = capture::screen(x, y, w, h);
             self.overlay.aside(false);
@@ -1702,6 +1715,9 @@ impl Service {
             let rect = ax::rect(&node.element).unwrap_or(node.rect);
             let inside = |value: i32| (value as f32 / units) as u32;
             frame = frame.crop(inside((rect.0 - left).max(0)), inside((rect.1 - top).max(0)), inside(rect.2).max(1), inside(rect.3).max(1));
+            if frame.w == 0 || frame.h == 0 {
+                return Err(format!("e{id} is outside the window picture"));
+            }
             origin = (rect.0.max(left), rect.1.max(top));
         }
         let hash = frame.hash();
@@ -1728,7 +1744,7 @@ impl Service {
         };
         let (mut small, scale) = picture.shrink(edge);
         let per_pixel = scale * units;
-        if flags.marks {
+        if flags.marks && per_pixel.is_finite() && per_pixel > 0.0 {
             let to_image = |value: i32, from: i32| ((value - from) as f32 / per_pixel) as i32;
             for (id, (x, y, w, h)) in marked {
                 small.mark(to_image(x, origin.0), to_image(y, origin.1), (w as f32 / per_pixel) as i32, (h as f32 / per_pixel) as i32, id);
@@ -1800,12 +1816,12 @@ impl Service {
                 ax::set_bool(&element, "AXMinimized", false)?;
             }
             "max" => {
-                let (x, y, w, h) = apps::work_area();
+                let (x, y, w, h) = screen_for(window.rect);
                 ax::set_position(&element, x, y)?;
                 ax::set_size(&element, w, h)?;
             }
             "left" | "right" => {
-                let (x, y, w, h) = apps::work_area();
+                let (x, y, w, h) = screen_for(window.rect);
                 let half = w / 2;
                 let nx = if word == "right" { x + half } else { x };
                 let nw = if word == "right" { w - half } else { half };
@@ -1825,8 +1841,9 @@ impl Service {
                 ax::set_size(&element, w, h)?;
             }
             box_text => {
-                let parts: Vec<i32> = box_text.split(',').filter_map(|n| n.trim().parse().ok()).collect();
-                let [x, y, w, h] = parts[..] else { return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into()) };
+                let Some((x, y, w, h)) = lines::parse_rect(box_text) else {
+                    return Err("place x,y,w,h|min|max|restore|left|right|monitor N".into());
+                };
                 ax::set_position(&element, x, y)?;
                 ax::set_size(&element, w, h)?;
             }

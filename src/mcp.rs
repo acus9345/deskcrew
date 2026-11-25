@@ -194,14 +194,26 @@ fn base64(bytes: &[u8]) -> String {
     out
 }
 
+/// Extract the PNG path at the start of a `shot` reply (even if a parent folder contains `.png`).
+fn picture_path(reply: &str) -> Option<&str> {
+    let mut offset = 0;
+    while let Some(pos) = reply[offset..].find(".png") {
+        let end = offset + pos + 4;
+        if reply.as_bytes().get(end).is_none_or(u8::is_ascii_whitespace) {
+            return Some(&reply[..end]);
+        }
+        offset = end;
+    }
+    None
+}
+
 /// A shot's reply starts with the PNG's path: send the picture itself along with the line.
 fn with_picture(reply: &str) -> Vec<Value> {
     let mut content = vec![text(reply)];
-    if let Some(end) = reply.find(".png") {
-        let path = &reply[..end + 4];
-        if let Ok(bytes) = std::fs::read(path) {
-            content.push(json!({ "type": "image", "data": base64(&bytes), "mimeType": "image/png" }));
-        }
+    if let Some(path) = picture_path(reply)
+        && let Ok(bytes) = std::fs::read(path)
+    {
+        content.push(json!({ "type": "image", "data": base64(&bytes), "mimeType": "image/png" }));
     }
     content
 }
@@ -222,7 +234,8 @@ fn call(agent: &str, params: &Value) -> Value {
 pub fn serve() {
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
-    let mut agent = std::env::var("DESKCREW_AGENT").unwrap_or_else(|_| "your agent".into());
+    let env_agent = std::env::var("DESKCREW_AGENT").ok().map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+    let mut agent = env_agent.clone().unwrap_or_else(|| "your agent".into());
     for line in stdin.lock().lines() {
         let Ok(line) = line else { break };
         if line.trim().is_empty() {
@@ -243,7 +256,7 @@ pub fn serve() {
         let params = message.get("params").cloned().unwrap_or(Value::Null);
         let result = match method {
             "initialize" => {
-                if std::env::var_os("DESKCREW_AGENT").is_none()
+                if env_agent.is_none()
                     && let Some(name) = params.pointer("/clientInfo/name").and_then(Value::as_str)
                 {
                     agent = agent_name(name);
@@ -306,5 +319,18 @@ mod tests {
         assert_eq!(agent_name("claude-code"), "Claude Code");
         assert_eq!(agent_name("codex-mcp-client"), "Codex");
         assert_eq!(agent_name("Something"), "Something");
+    }
+
+    #[test]
+    fn picture_path_skips_png_in_parent_folder_names() {
+        assert_eq!(
+            picture_path(r"C:\Users\my.png.files\deskcrew\shots\Claude-w1.png 800x600 scale 1.00"),
+            Some(r"C:\Users\my.png.files\deskcrew\shots\Claude-w1.png")
+        );
+        assert_eq!(
+            picture_path("/tmp/folder with spaces/a-w0.png"),
+            Some("/tmp/folder with spaces/a-w0.png")
+        );
+        assert_eq!(picture_path("unchanged"), None);
     }
 }
