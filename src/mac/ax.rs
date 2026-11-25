@@ -827,6 +827,14 @@ pub fn table(element: &Owned, skip: usize, max_rows: usize, max_cols: usize) -> 
     Ok(Table { headers, rows, total_rows, total_columns })
 }
 
+fn clamp_scroll_bar_next(current: f64, down: bool, times: i32) -> Option<f64> {
+    if !current.is_finite() {
+        return None;
+    }
+    let step = 0.1 * times.clamp(1, crate::motion::MAX_SCROLL_NOTCHES) as f64;
+    Some(if down { (current + step).clamp(0.0, 1.0) } else { (current - step).clamp(0.0, 1.0) })
+}
+
 /// Find an AXScrollArea at or near `element` and move its AXScrollBar value in the background.
 pub fn scroll_bar(element: &Owned, sideways: bool, down: bool, times: i32) -> Result<bool, String> {
     let attr = if sideways { "AXHorizontalScrollBar" } else { "AXVerticalScrollBar" };
@@ -846,11 +854,9 @@ pub fn scroll_bar(element: &Owned, sideways: bool, down: bool, times: i32) -> Re
         return Ok(false);
     }
     let current = attribute(&bar, "AXValue").and_then(|v| number_of(v.0)).unwrap_or(0.0);
-    if !current.is_finite() {
+    let Some(next) = clamp_scroll_bar_next(current, down, times) else {
         return Ok(false);
-    }
-    let step = 0.1 * times.clamp(1, crate::motion::MAX_SCROLL_NOTCHES) as f64;
-    let next = if down { (current + step).clamp(0.0, 1.0) } else { (current - step).clamp(0.0, 1.0) };
+    };
     set_number(&bar, "AXValue", next)?;
     Ok(true)
 }
@@ -931,6 +937,14 @@ mod tests {
         assert!(!encloses((i32::MAX - 10, 0, 10, 10), (0, 0, 10, 10)));
         assert!(!outside((i32::MAX - 10, 0, 20, 20), (0, 0, i32::MAX, 100)));
         assert!(outside((i32::MAX, 0, 20, 20), (0, 0, i32::MAX - 10, 100)));
+    }
+
+    #[test]
+    fn clamp_scroll_bar_next_guards_non_finite_and_caps_times() {
+        assert_eq!(clamp_scroll_bar_next(f64::NAN, true, 1), None);
+        assert_eq!(clamp_scroll_bar_next(0.5, true, 999), Some(1.0));
+        assert_eq!(clamp_scroll_bar_next(0.5, false, 999), Some(0.0));
+        assert!((clamp_scroll_bar_next(0.25, true, 2).unwrap() - 0.45).abs() < 1e-9);
     }
 
     #[test]

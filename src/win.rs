@@ -192,6 +192,10 @@ pub fn to_client(hwnd: Hwnd, x: i32, y: i32) -> (i32, i32) {
 
 pub fn inside(hwnd: Hwnd, x: i32, y: i32) -> bool {
     let (left, top, w, h) = outer_rect(hwnd);
+    if w <= 0 || h <= 0 {
+        return false;
+    }
+    let (x, y, left, top, w, h) = (x as i64, y as i64, left as i64, top as i64, w as i64, h as i64);
     x >= left && y >= top && x < left + w && y < top + h
 }
 

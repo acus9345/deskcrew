@@ -807,6 +807,21 @@ fn bar_inside(obj: &Obj, vertical: bool) -> Option<Obj> {
     None
 }
 
+fn clamp_scroll_target(now: f64, low: f64, high: f64, inc: f64, notches: i32) -> Option<f64> {
+    if !now.is_finite() || !low.is_finite() || !high.is_finite() || low > high {
+        return None;
+    }
+    if notches == 0 {
+        return Some(now.clamp(low, high));
+    }
+    let inc = if inc.is_finite() && inc >= 0.0 { inc } else { 0.0 };
+    let span = high - low;
+    let step = if span.is_finite() { (span / 10.0).max(inc) } else { f64::INFINITY };
+    let delta = step * notches as f64;
+    let target = now + delta;
+    Some(if target.is_finite() { target.clamp(low, high) } else if notches > 0 { high } else { low })
+}
+
 /// Scroll by moving a scroll bar's value, which needs no pointer and no focus: the bar of this
 /// control or of the nearest pane around it, or the first one inside it, as for a whole window.
 /// Positive notches scroll down or right, each a tenth of the way or one step, whichever is more.
@@ -825,13 +840,8 @@ pub fn scroll(obj: &Obj, vertical: bool, notches: i32) -> Result<(), String> {
     let (Some(now), Some(low), Some(high)) = (value_of(&bar, "CurrentValue"), value_of(&bar, "MinimumValue"), value_of(&bar, "MaximumValue")) else {
         return Err("that scroll bar does not say where it is".into());
     };
-    if !now.is_finite() || !low.is_finite() || !high.is_finite() || low > high {
-        return Err("that scroll bar reported invalid bounds".into());
-    }
-    let inc = value_of(&bar, "MinimumIncrement").filter(|v| v.is_finite() && *v >= 0.0).unwrap_or(0.0);
-    let step = ((high - low) / 10.0).max(inc);
-    let target = now + step * notches as f64;
-    let wanted = if target.is_finite() { target.clamp(low, high) } else if notches > 0 { high } else { low };
+    let inc = value_of(&bar, "MinimumIncrement").unwrap_or(0.0);
+    let wanted = clamp_scroll_target(now, low, high, inc, notches).ok_or("that scroll bar reported invalid bounds")?;
     set_value(&bar, wanted)?;
     if (value_of(&bar, "CurrentValue").unwrap_or(now) - now).abs() < f64::EPSILON && wanted != now {
         return Err("that scroll bar did not move".into());
@@ -1083,5 +1093,15 @@ mod tests {
         assert!(encloses((i32::MIN, i32::MIN, 100, 100), (i32::MIN + 2, i32::MIN + 2, 10, 10)));
         assert!(encloses((i32::MAX - 50, i32::MAX - 50, 50, 50), (i32::MAX - 40, i32::MAX - 40, 30, 30)));
         assert!(!encloses((i32::MAX - 10, 0, 10, 10), (0, 0, 10, 10)));
+    }
+
+    #[test]
+    fn clamp_scroll_target_handles_extreme_and_non_finite_bounds() {
+        assert_eq!(clamp_scroll_target(f64::NAN, 0.0, 100.0, 1.0, 1), None);
+        assert_eq!(clamp_scroll_target(50.0, 100.0, 0.0, 1.0, 1), None);
+        assert_eq!(clamp_scroll_target(0.0, -f64::MAX, f64::MAX, f64::NAN, 0), Some(0.0));
+        assert_eq!(clamp_scroll_target(0.0, -f64::MAX, f64::MAX, 1.0, 2), Some(f64::MAX));
+        assert_eq!(clamp_scroll_target(0.0, -f64::MAX, f64::MAX, 1.0, -2), Some(-f64::MAX));
+        assert_eq!(clamp_scroll_target(50.0, 0.0, 100.0, 1.0, 1), Some(60.0));
     }
 }

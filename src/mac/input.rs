@@ -175,9 +175,10 @@ pub fn scroll(pid: i32, window: u32, x: f64, y: f64, lines: i32, sideways: bool)
 /// Text as key events carrying the characters themselves, so any language types.
 /// Returns how many characters went out before `stop` said to stop.
 pub fn type_text(to: To, text: &str, stop: &dyn Fn() -> bool) -> Result<usize, String> {
-    let units: Vec<u16> = text.encode_utf16().collect();
+    let normalized = crate::motion::normalize_newlines(text);
+    let units: Vec<u16> = normalized.encode_utf16().collect();
     let mut sent = 0;
-    for piece in pieces(text) {
+    for piece in pieces(&normalized) {
         if stop() {
             break;
         }

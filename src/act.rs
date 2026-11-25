@@ -275,26 +275,31 @@ fn with_state_held<T>(hwnd: Hwnd, keys: &[u16], work: impl FnOnce() -> T) -> T {
     }
 }
 
+fn set_key_state_bits(state: &mut [u8; 256], vk: u16) {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT};
+    if (vk as usize) < 256 {
+        state[vk as usize] |= 0x80;
+    }
+    let side = match vk {
+        VK_CONTROL => VK_LCONTROL,
+        VK_SHIFT => VK_LSHIFT,
+        VK_MENU => VK_LMENU,
+        other => other,
+    };
+    if (side as usize) < 256 {
+        state[side as usize] |= 0x80;
+    }
+}
+
 /// Run `work` with these keys down in the keyboard state of the thread this one is joined to,
 /// and put that state back after.
 fn held_down<T>(keys: &[u16], work: impl FnOnce() -> T) -> T {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState};
     let mut saved = [0u8; 256];
     unsafe { GetKeyboardState(saved.as_mut_ptr()) };
     let mut state = saved;
     for vk in keys {
-        if (*vk as usize) < 256 {
-            state[*vk as usize] |= 0x80;
-        }
-        let side = match *vk {
-            VK_CONTROL => VK_LCONTROL,
-            VK_SHIFT => VK_LSHIFT,
-            VK_MENU => VK_LMENU,
-            other => other,
-        };
-        if (side as usize) < 256 {
-            state[side as usize] |= 0x80;
-        }
+        set_key_state_bits(&mut state, *vk);
     }
     unsafe { SetKeyboardState(state.as_ptr()) };
     let result = work();
@@ -871,6 +876,10 @@ pub fn post_key(root: Hwnd, chord: &Chord, spec: &str) -> Result<String, String>
 /// would from a real pick: a menu opened while its app is in the back does not take posted keys.
 /// The arrow keys and Enter are left for an entry with no command of its own. None if the menu
 /// has no entry by that name.
+fn popup_shortcut_command(submenu: Hwnd, command: usize) -> Option<usize> {
+    (submenu == 0 && command != 0).then_some(command & 0xFFFF)
+}
+
 pub fn choose_in_popup(popup: Hwnd, label: &str) -> Option<Result<String, String>> {
     let entries = win::menu_entries(win::menu_of_popup(popup));
     let wanted = label.to_lowercase();
@@ -879,8 +888,7 @@ pub fn choose_in_popup(popup: Hwnd, label: &str) -> Option<Result<String, String
         return Some(Err(format!("'{}' is disabled", entries[at].label)));
     }
     let entry = &entries[at];
-    if entry.submenu == 0
-        && entry.command != 0
+    if let Some(cmd) = popup_shortcut_command(entry.submenu, entry.command)
         && let Some(owner) = win::menu_owner(popup)
     {
         const WM_CANCELMODE: u32 = 0x001F;
@@ -894,7 +902,7 @@ pub fn choose_in_popup(popup: Hwnd, label: &str) -> Option<Result<String, String
         if win::in_menu(owner) {
             return Some(Err("the menu would not close: try key escape, then another way".into()));
         }
-        return Some(post(owner, WM_COMMAND, entry.command & 0xFFFF, 0).map(|_| "menu command".to_string()));
+        return Some(post(owner, WM_COMMAND, cmd, 0).map(|_| "menu command".to_string()));
     }
     const VK_DOWN: usize = 0x28;
     const VK_RETURN: usize = 0x0D;
@@ -943,16 +951,20 @@ pub fn post_hold(root: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &At
     }
 }
 
-fn release_pressed(target: Hwnd, up: u32, pressed: Vec<(u16, bool)>, bits: impl Fn(u16, bool) -> isize) -> Result<(), String> {
+fn release_sequence(pressed: Vec<(u16, bool)>, mut release_fn: impl FnMut(u16, bool) -> Result<(), String>) -> Result<(), String> {
     let mut first_err = None;
     for (vk, extended) in pressed.into_iter().rev() {
-        if let Err(err) = release(target, up, vk as usize, bits(vk, extended))
+        if let Err(err) = release_fn(vk, extended)
             && first_err.is_none()
         {
             first_err = Some(err);
         }
     }
     first_err.map_or(Ok(()), Err)
+}
+
+fn release_pressed(target: Hwnd, up: u32, pressed: Vec<(u16, bool)>, bits: impl Fn(u16, bool) -> isize) -> Result<(), String> {
+    release_sequence(pressed, |vk, extended| release(target, up, vk as usize, bits(vk, extended)))
 }
 
 fn hold_keys(target: Hwnd, chord: &Chord, hold: std::time::Duration, stop: &AtomicBool) -> Result<String, String> {
@@ -1012,15 +1024,9 @@ const CHORD_SETTLE: std::time::Duration = std::time::Duration::from_millis(40);
 /// WPF needs. That makes it the active window of its app only: the lock keeps Windows from
 /// bringing it forward, and the person's window keeps their keys.
 fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<String, String> {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_LCONTROL, VK_LMENU, VK_LSHIFT, VK_MENU, VK_SHIFT};
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetKeyboardState, SetKeyboardState, VK_CONTROL, VK_MENU};
     use windows_sys::Win32::UI::WindowsAndMessaging::{WM_SYSKEYDOWN, WM_SYSKEYUP};
     let Some(((key, extended), held)) = chord.keys.split_last() else { return Err("no key given".into()) };
-    let left = |vk: u16| match vk {
-        VK_CONTROL => Some(VK_LCONTROL),
-        VK_SHIFT => Some(VK_LSHIFT),
-        VK_MENU => Some(VK_LMENU),
-        _ => None,
-    };
     if chord.has_win() {
         return Err(format!("{spec} needs the real keyboard: add --real"));
     }
@@ -1047,14 +1053,7 @@ fn post_chord(target: Hwnd, chord: &Chord, spec: &str, focus: bool) -> Result<St
         GetKeyboardState(saved.as_mut_ptr());
         let mut state = saved;
         for (vk, _) in held {
-            if (*vk as usize) < 256 {
-                state[*vk as usize] |= 0x80;
-            }
-            if let Some(side) = left(*vk)
-                && (side as usize) < 256
-            {
-                state[side as usize] |= 0x80;
-            }
+            set_key_state_bits(&mut state, *vk);
         }
         SetKeyboardState(state.as_ptr());
         let sent = (|| {
@@ -1111,6 +1110,9 @@ fn attached<T>(target: Hwnd, spec: &str, focus: bool, work: impl FnOnce() -> Res
         if focus {
             SetFocus(target as HWND);
             if GetFocus() != target as HWND {
+                if !before.is_null() || win::is_wpf(target) {
+                    SetFocus(before);
+                }
                 AttachThreadInput(mine, theirs, 0);
                 return Err(NEEDS_REAL.into());
             }
@@ -1523,5 +1525,33 @@ mod tests {
     fn centre_saturates_extreme_bounds_without_overflow() {
         assert_eq!(centre((10, 20, 100, 40)), (60, 40));
         assert_eq!(centre((i32::MAX, i32::MIN, 100, -100)), (i32::MAX, i32::MIN));
+    }
+
+    #[test]
+    fn key_release_state_bits_and_popup_command_handle_edges() {
+        let mut released = Vec::new();
+        let err = release_sequence(vec![(17, false), (b'S' as u16, false), (16, true)], |vk, ext| {
+            released.push((vk, ext));
+            if vk == b'S' as u16 {
+                Err("first error".into())
+            } else if vk == 17 {
+                Err("second error".into())
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        assert_eq!(released, vec![(16, true), (b'S' as u16, false), (17, false)]);
+        assert_eq!(err, "first error");
+
+        let mut state = [0u8; 256];
+        set_key_state_bits(&mut state, windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL);
+        set_key_state_bits(&mut state, 300);
+        assert_eq!(state[windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL as usize], 0x80);
+        assert_eq!(state[windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_LCONTROL as usize], 0x80);
+
+        assert_eq!(popup_shortcut_command(0, 0), None);
+        assert_eq!(popup_shortcut_command(1, 42), None);
+        assert_eq!(popup_shortcut_command(0, 0x1_002A), Some(0x002A));
     }
 }

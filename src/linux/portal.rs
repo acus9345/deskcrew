@@ -423,9 +423,10 @@ pub fn key(chord: &Chord, hold: Duration) -> Result<(), String> {
 }
 
 pub fn type_text(text: &str, stop: &dyn Fn() -> bool) -> Result<usize, String> {
+    let normalized = crate::motion::normalize_newlines(text);
     with_session(|s| {
         let mut typed = 0;
-        for c in text.chars() {
+        for c in normalized.chars() {
             if stop() {
                 break;
             }

@@ -1362,8 +1362,9 @@ pub fn modifiers(names: &[u32], down: bool) -> Result<(), String> {
 pub fn type_text(text: &str, stop: &dyn Fn() -> bool) -> Result<usize, String> {
     let x = x()?;
     let map = keymap(x)?;
+    let normalized = crate::motion::normalize_newlines(text);
     let mut typed = 0;
-    for c in text.chars() {
+    for c in normalized.chars() {
         if stop() {
             break;
         }
@@ -1561,8 +1562,9 @@ pub fn send_text_at(window: u32, at: Option<(i32, i32)>, text: &str, stop: &dyn 
     let (target, rx, ry, lx, ly) = key_target(x, window, at);
     let coords = (rx, ry, lx, ly);
     with_synthetic_focus(x, window, target, || {
+        let normalized = crate::motion::normalize_newlines(text);
         let mut typed = 0;
-        for c in text.chars() {
+        for c in normalized.chars() {
             if stop() {
                 break;
             }

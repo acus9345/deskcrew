@@ -851,19 +851,38 @@ pub fn parse_scroll_count(arg: Option<&str>, default: i32) -> Result<i32, String
     }
 }
 
-/// Split a signed wheel notch count into chunks of at most `max_per_msg` (capped at `200`, so
-/// `chunk * 120` always fits in a signed 16-bit wheel delta).
+/// Split a signed wheel notch count into lazy chunks of at most `max_per_msg` (capped at `200`, so
+/// `chunk * 120` always fits in a signed 16-bit wheel delta) without allocating.
 #[cfg_attr(not(windows), allow(dead_code))]
-pub fn wheel_chunks(notches: i32, max_per_msg: i32) -> Vec<i32> {
+pub fn wheel_chunks(notches: i32, max_per_msg: i32) -> impl Iterator<Item = i32> {
     let step = (max_per_msg as i64).clamp(1, MAX_SCROLL_NOTCHES as i64);
     let mut left = notches as i64;
-    let mut chunks = Vec::new();
-    while left != 0 {
+    std::iter::from_fn(move || {
+        if left == 0 {
+            return None;
+        }
         let take = if left > 0 { left.min(step) } else { left.max(-step) };
-        chunks.push(take as i32);
         left -= take;
+        Some(take as i32)
+    })
+}
+
+/// Normalize CRLF (`\r\n`) and standalone `\r` line endings into `\n` so multi-line typing never
+/// double-triggers Return across platforms.
+pub fn normalize_newlines(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        if c == '\r' {
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+            out.push('\n');
+        } else {
+            out.push(c);
+        }
     }
-    chunks
+    out
 }
 
 #[cfg_attr(not(windows), allow(dead_code))]
@@ -878,14 +897,8 @@ pub enum TypingStep {
 #[cfg_attr(not(windows), allow(dead_code))]
 pub fn text_typing_steps(text: &str) -> Vec<TypingStep> {
     let mut steps = Vec::new();
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
+    for c in normalize_newlines(text).chars() {
         if c == '\n' {
-            steps.push(TypingStep::Enter);
-        } else if c == '\r' {
-            if chars.peek() == Some(&'\n') {
-                chars.next();
-            }
             steps.push(TypingStep::Enter);
         } else {
             let mut buf = [0u16; 2];
@@ -896,14 +909,14 @@ pub fn text_typing_steps(text: &str) -> Vec<TypingStep> {
     steps
 }
 
-/// True if `p` is finite and falls within `rect` without signed 32-bit overflow.
+/// True if `p` is finite and its rounded pixel coordinate falls within `rect` without signed 32-bit overflow.
 #[cfg_attr(windows, allow(dead_code))]
 pub fn point_in_rect(p: (f32, f32), rect: (i32, i32, i32, i32)) -> bool {
     if !p.0.is_finite() || !p.1.is_finite() || rect.2 <= 0 || rect.3 <= 0 {
         return false;
     }
-    let px = p.0 as i64;
-    let py = p.1 as i64;
+    let px = p.0.round() as i64;
+    let py = p.1.round() as i64;
     let x0 = rect.0 as i64;
     let y0 = rect.1 as i64;
     let x1 = x0 + rect.2 as i64;
@@ -1263,14 +1276,14 @@ mod tests {
         assert!(parse_scroll_count(Some("-2"), 1).is_err());
         assert!(parse_scroll_count(Some("abc"), 1).is_err());
 
-        assert!(wheel_chunks(0, 200).is_empty());
-        assert_eq!(wheel_chunks(450, 200), vec![200, 200, 50]);
-        assert_eq!(wheel_chunks(-450, 200), vec![-200, -200, -50]);
-        let min_chunks = wheel_chunks(i32::MIN, 200);
-        assert!(!min_chunks.is_empty());
-        assert!(min_chunks.iter().all(|&c| (-200..0).contains(&c)));
+        assert!(wheel_chunks(0, 200).next().is_none());
+        assert_eq!(wheel_chunks(450, 200).collect::<Vec<_>>(), vec![200, 200, 50]);
+        assert_eq!(wheel_chunks(-450, 200).collect::<Vec<_>>(), vec![-200, -200, -50]);
+        let min_head: Vec<i32> = wheel_chunks(i32::MIN, 200).take(5).collect();
+        assert_eq!(min_head, vec![-200; 5]);
 
-        let steps = text_typing_steps("a\r\nb\n\r\u{1F600}c");
+        assert_eq!(normalize_newlines("a\r\nb\rc\n\r"), "a\nb\nc\n\n");
+        let steps = text_typing_steps("a\r\nb\nc\rd\r");
         assert_eq!(
             steps,
             vec![
@@ -1278,13 +1291,20 @@ mod tests {
                 TypingStep::Enter,
                 TypingStep::Units([b'b' as u16, 0], 1),
                 TypingStep::Enter,
-                TypingStep::Enter,
-                TypingStep::Units([0xD83D, 0xDE00], 2),
                 TypingStep::Units([b'c' as u16, 0], 1),
+                TypingStep::Enter,
+                TypingStep::Units([b'd' as u16, 0], 1),
+                TypingStep::Enter,
             ]
+        );
+        assert_eq!(
+            text_typing_steps("\u{1F600}"),
+            vec![TypingStep::Units([0xD83D, 0xDE00], 2)]
         );
 
         assert!(point_in_rect((10.0, 20.0), (10, 20, 50, 40)));
+        assert!(!point_in_rect((-0.5, 10.0), (0, 0, 50, 40)));
+        assert!(!point_in_rect((59.6, 20.0), (10, 20, 50, 40)));
         assert!(!point_in_rect((60.0, 20.0), (10, 20, 50, 40)));
         assert!(!point_in_rect((f32::NAN, 20.0), (0, 0, 100, 100)));
         assert!(!point_in_rect((f32::INFINITY, 20.0), (0, 0, 100, 100)));

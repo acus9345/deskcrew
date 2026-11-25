@@ -97,6 +97,14 @@ unsafe fn cached_text(el: &IUIAutomationElement, id: UIA_PROPERTY_ID) -> String 
     unsafe { el.GetCachedPropertyValue(id) }.ok().and_then(|v: VARIANT| BSTR::try_from(&v).ok()).map(|s| s.to_string()).unwrap_or_default()
 }
 
+fn safe_array_count(low: i32, high: i32) -> usize {
+    (high as i64 - low as i64 + 1).clamp(0, MAX_SAFEARRAY_ITEMS as i64) as usize
+}
+
+fn walk_budget_exhausted(depth: usize, max_depth: usize, nodes: usize, max_nodes: usize, visited: usize, max_visited: usize) -> bool {
+    depth > max_depth || nodes >= max_nodes || visited >= max_visited
+}
+
 unsafe fn runtime_id(el: &IUIAutomationElement) -> Vec<i32> {
     unsafe {
         let Ok(array) = el.GetRuntimeId() else { return Vec::new() };
@@ -108,7 +116,7 @@ unsafe fn runtime_id(el: &IUIAutomationElement) -> Vec<i32> {
             let mut data = std::ptr::null_mut();
             if SafeArrayAccessData(array, &mut data).is_ok() {
                 if !data.is_null() {
-                    let count = (high as i64 - low as i64 + 1).clamp(0, MAX_SAFEARRAY_ITEMS as i64) as usize;
+                    let count = safe_array_count(low, high);
                     out.extend_from_slice(std::slice::from_raw_parts(data as *const i32, count));
                 }
                 let _ = SafeArrayUnaccessData(array);
@@ -131,7 +139,7 @@ fn rects_of(range: &IUIAutomationTextRange) -> Vec<(i32, i32, i32, i32)> {
             let mut data = std::ptr::null_mut();
             if SafeArrayAccessData(array, &mut data).is_ok() {
                 if !data.is_null() {
-                    let count = (high as i64 - low as i64 + 1).clamp(0, MAX_SAFEARRAY_ITEMS as i64) as usize;
+                    let count = safe_array_count(low, high);
                     numbers.extend_from_slice(std::slice::from_raw_parts(data as *const f64, count));
                 }
                 let _ = SafeArrayUnaccessData(array);
@@ -258,7 +266,10 @@ impl Uia {
         unsafe {
             let root = self.auto.ElementFromHandle(HWND(hwnd as _)).map_err(say)?;
             match root.BuildUpdatedCache(&self.cache) {
-                Ok(tree) => walk(&tree, "", 0, None, all, nodes, hidden, 0),
+                Ok(tree) => {
+                    let mut visited = 0usize;
+                    walk(&tree, "", 0, None, all, nodes, hidden, 0, &mut visited);
+                }
                 Err(error) => {
                     // Large or cross-process trees (e.g. Electron/Chromium) can occasionally fail
                     // a single subtree cache fetch; fall back to walking the control view live.
@@ -298,7 +309,7 @@ fn drop_labels(nodes: &mut Vec<Node>, quiet: &mut Vec<(i32, i32, i32, i32)>) {
 unsafe fn cells_of(el: &IUIAutomationElement) -> Option<(Vec<String>, IUIAutomationElement)> {
     unsafe {
         let children = el.GetCachedChildren().ok()?;
-        let count = children.Length().unwrap_or(0);
+        let count = children.Length().unwrap_or(0).min(4096);
         if count < 2 {
             return None;
         }
@@ -335,11 +346,13 @@ unsafe fn walk(
     nodes: &mut Vec<Node>,
     hidden: &mut usize,
     depth: usize,
+    visited: &mut usize,
 ) {
     unsafe {
-        if depth > MAX_DEPTH || nodes.len() >= MAX_LIVE_NODES {
+        if walk_budget_exhausted(depth, MAX_DEPTH, nodes.len(), MAX_LIVE_NODES, *visited, MAX_LIVE_VISITED) {
             return;
         }
+        *visited += 1;
         let kind = el.CachedControlType().map(|k| k.0).unwrap_or(0);
         if lines::skipped(kind) {
             return;
@@ -378,7 +391,7 @@ unsafe fn walk(
                 if !shown.is_empty() && shown != parent && !nodes[at].parts.cells.contains(&shown) {
                     nodes[at].parts.cells.push(shown);
                 }
-                walk_children(el, &name, kind, row, all, nodes, hidden, depth);
+                walk_children(el, &name, kind, row, all, nodes, hidden, depth, visited);
                 return;
             }
 
@@ -436,7 +449,7 @@ unsafe fn walk(
                 let control_id = text(el.CachedAutomationId());
                 let automation_id = Some(control_id.clone()).filter(|id| !id.bytes().all(|b| b.is_ascii_digit())).unwrap_or_default();
                 if lines::is_window_chrome(&automation_id) {
-                    walk_children(el, parent, kind, row, all, nodes, hidden, depth);
+                    walk_children(el, parent, kind, row, all, nodes, hidden, depth, visited);
                     return;
                 }
                 let mut states = Vec::new();
@@ -507,7 +520,7 @@ unsafe fn walk(
             }
         }
         let carried = if listed { name.as_str() } else { parent };
-        walk_children(el, carried, kind, own, all, nodes, hidden, depth);
+        walk_children(el, carried, kind, own, all, nodes, hidden, depth, visited);
     }
 }
 
@@ -552,7 +565,7 @@ unsafe fn walk_live(
     seen_ids: &mut std::collections::HashSet<Vec<i32>>,
 ) {
     unsafe {
-        if depth > MAX_DEPTH || nodes.len() >= MAX_LIVE_NODES || *visited >= MAX_LIVE_VISITED {
+        if walk_budget_exhausted(depth, MAX_DEPTH, nodes.len(), MAX_LIVE_NODES, *visited, MAX_LIVE_VISITED) {
             return;
         }
         *visited += 1;
@@ -736,15 +749,16 @@ unsafe fn walk_children(
     nodes: &mut Vec<Node>,
     hidden: &mut usize,
     depth: usize,
+    visited: &mut usize,
 ) {
     unsafe {
         let Ok(children) = el.GetCachedChildren() else { return };
         for at in 0..children.Length().unwrap_or(0) {
-            if nodes.len() >= MAX_LIVE_NODES {
+            if nodes.len() >= MAX_LIVE_NODES || *visited >= MAX_LIVE_VISITED {
                 break;
             }
             if let Ok(child) = children.GetElement(at) {
-                walk(&child, parent, parent_kind, row, all, nodes, hidden, depth + 1);
+                walk(&child, parent, parent_kind, row, all, nodes, hidden, depth + 1, visited);
             }
         }
     }
@@ -1198,5 +1212,17 @@ mod tests {
         assert_eq!(rect_of(RECT { left: -100, top: 0, right: i32::MAX, bottom: i32::MIN }), (-100, 0, i32::MAX, i32::MIN));
         assert_eq!(grid_row_range(usize::MAX - 1, 20, 50), 50..50);
         assert_eq!(grid_row_range(10, 20, 50), 10..30);
+    }
+
+    #[test]
+    fn safe_array_count_and_walk_budget_enforce_bounds() {
+        assert_eq!(safe_array_count(0, -1), 0);
+        assert_eq!(safe_array_count(0, 3), 4);
+        assert_eq!(safe_array_count(0, i32::MAX), MAX_SAFEARRAY_ITEMS);
+        assert_eq!(safe_array_count(i32::MIN, i32::MAX), MAX_SAFEARRAY_ITEMS);
+        assert!(!walk_budget_exhausted(0, MAX_DEPTH, 0, MAX_LIVE_NODES, 0, MAX_LIVE_VISITED));
+        assert!(walk_budget_exhausted(MAX_DEPTH + 1, MAX_DEPTH, 0, MAX_LIVE_NODES, 0, MAX_LIVE_VISITED));
+        assert!(walk_budget_exhausted(0, MAX_DEPTH, MAX_LIVE_NODES, MAX_LIVE_NODES, 0, MAX_LIVE_VISITED));
+        assert!(walk_budget_exhausted(0, MAX_DEPTH, 0, MAX_LIVE_NODES, MAX_LIVE_VISITED, MAX_LIVE_VISITED));
     }
 }

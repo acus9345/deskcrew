@@ -1765,7 +1765,7 @@ impl Service {
                 }
                 last = Some(win::caret_index(box_hwnd));
                 let Some((x, y, h)) = win::caret_in(box_hwnd) else { return };
-                let ahead = if letter == 10 { 0 } else { win::letter_width(box_hwnd, letter).unwrap_or(0) };
+                let ahead = if matches!(letter, 10 | 13) { 0 } else { win::letter_width(box_hwnd, letter).unwrap_or(0) };
                 self.overlay.caret(who, x + ahead, y, h);
             };
             match (target, hwnd) {
@@ -2081,6 +2081,9 @@ impl Service {
     /// that draws itself, and the real mouse only for an agent allowed to borrow it.
     fn walk(&self, who: &str, flags: &Flags, tracked: &Tracked, view: &View, strokes: Vec<Vec<(f32, f32)>>) -> Reply {
         let (button, modifiers) = (flags.mouse_button(), flags.modifiers()?);
+        if strokes.iter().flatten().any(|p| !p.0.is_finite() || !p.1.is_finite()) {
+            return Err("refused: stroke coordinates must be finite".into());
+        }
         let points: Vec<(i32, i32)> = strokes.iter().flatten().map(|p| (p.0.round() as i32, p.1.round() as i32)).collect();
         let (x, y) = *points.first().ok_or("nothing to draw")?;
         let jump = |x: i32, y: i32| self.overlay.jump(who, x, y);
@@ -2163,8 +2166,8 @@ impl Service {
                 self.first_read(&tracked, view, false)?;
             }
             let strokes = self.plan_draw(who, flags, &tracked, view, words)?;
-            if strokes.iter().flatten().any(|p| !win::inside(tracked.hwnd, p.0 as i32, p.1 as i32)) {
-                return Err("refused: that stroke leaves the window".into());
+            if let Some(bad) = strokes.iter().flatten().find(|p| !p.0.is_finite() || !p.1.is_finite() || !win::inside(tracked.hwnd, p.0.round() as i32, p.1.round() as i32)) {
+                return Err(format!("refused: {},{} on screen is not on this window", bad.0.round() as i32, bad.1.round() as i32));
             }
             (strokes, view.pids.clone())
         };
