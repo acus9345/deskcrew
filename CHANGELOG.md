@@ -6,6 +6,17 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.31] - 2026-11-25
+
+- **Cursor motion:** each agent's cursor leans into the direction it moves and straightens up smoothly when it stops; moves between points take the same time and curve as on qlinter.org, and drawn strokes slow down at corners like handwriting.
+- **Fixed:** after `draw --real`, the pointer sometimes stayed at the end of the stroke instead of going back.
+- **Sturdier input:** a failed key chord releases every key it pressed; Windows line endings type one Enter, not two; emoji and other two-part characters are typed whole; scroll counts are checked and capped at 200.
+- **Bad input is refused plainly:** `--region` and `place x,y,w,h` reject malformed or empty boxes; blank `--agent` or `DESKCREW_AGENT` falls back to detection; arguments with NUL bytes are refused.
+- **No hangs or crashes on odd apps:** accessibility walks on Windows, macOS and Linux stop at a node budget and skip cycles; huge or off-screen control bounds, empty pictures and very large images no longer overflow or skew; OCR can't deadlock on large pictures.
+- **Clipboard and service:** the clipboard is put back even if lending it fails, long clipboard text isn't cut mid-character, and oversized or truncated messages to the service are refused.
+- **Overlays:** cursor overlays handle zero or huge sizes, cap simultaneous flashes, and close cleanly.
+- **Windows:** moving a window to another monitor uses that monitor's work area without taking focus, and putting a window back keeps its place in the stack.
+
 ## [0.1.30] - 2026-11-22
 
 - **Quiet mode:** `deskcrew quiet on` (or `DESKCREW_QUIET`) refuses everything that takes focus or real input: `focus`, `down`, `--real`, `--mouse`, `launch --front`, the pen, and Win+... shortcuts that open shell UI, even with `--force` or inside `do`. Background clicks, typing and drawing by window messages keep working.
