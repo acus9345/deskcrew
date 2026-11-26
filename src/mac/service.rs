@@ -643,9 +643,7 @@ impl Service {
         let result = work();
         let elapsed = started.elapsed().as_secs_f64();
         if let Some(prev) = before
-            && prev != tracked.pid
-            && apps::front_pid() == Some(tracked.pid)
-            && apps::idle_seconds() >= elapsed
+            && should_restore_behind(prev, tracked.pid, apps::front_pid(), apps::idle_seconds(), apps::switch_idle_seconds(), elapsed)
         {
             apps::activate(prev);
         }
@@ -2142,4 +2140,33 @@ fn fill(field: &Owned, mut value: String, wanted: &str, stop: &dyn Fn() -> bool)
         thread::sleep(motion::KEY_EVERY);
     }
     Ok("value".into())
+}
+
+const MAC_SWITCH_GRACE_SECS: f64 = 0.60;
+
+/// True when the target app pushed forward after a background action with no recent switch input.
+fn should_restore_behind(prev: i32, target_pid: i32, front_after: Option<i32>, idle_seconds: f64, switch_idle_seconds: f64, elapsed: f64) -> bool {
+    prev != target_pid
+        && front_after == Some(target_pid)
+        && idle_seconds >= elapsed
+        && switch_idle_seconds >= elapsed + MAC_SWITCH_GRACE_SECS
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn keep_behind_respects_user_focus_and_recent_switch_gestures() {
+        // B already in front when work started: never restore.
+        assert!(!should_restore_behind(200, 200, Some(200), 10.0, 10.0, 0.05));
+        // Person clicked Dock/B or pressed Cmd+Tab just before or during work: keep B in front.
+        assert!(!should_restore_behind(100, 200, Some(200), 0.25, 0.25, 0.05));
+        assert!(!should_restore_behind(100, 200, Some(200), 0.02, 10.0, 0.05));
+        // Person was idle or merely typing regular keys in A (no click/Cmd+Tab) and B stole focus: restore A.
+        assert!(should_restore_behind(100, 200, Some(200), 5.0, 5.0, 0.05));
+        assert!(should_restore_behind(100, 200, Some(200), 0.20, 5.0, 0.05));
+        // Target didn't actually end up in front: nothing to restore.
+        assert!(!should_restore_behind(100, 200, Some(300), 5.0, 5.0, 0.05));
+    }
 }

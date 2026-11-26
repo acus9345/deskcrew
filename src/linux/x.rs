@@ -566,10 +566,16 @@ pub fn move_to(px: i32, py: i32) -> Result<(), String> {
     x.conn.flush().map_err(|e| e.to_string())
 }
 
-pub fn pointer() -> Option<(i32, i32)> {
+/// Pointer root coordinates and raw X11 modifier/button mask.
+pub fn pointer_state() -> Option<(i32, i32, u16)> {
     let x = x().ok()?;
     let reply = x.conn.query_pointer(x.root).ok()?.reply().ok()?;
-    Some((reply.root_x as i32, reply.root_y as i32))
+    Some((reply.root_x as i32, reply.root_y as i32, reply.mask.bits()))
+}
+
+pub fn pointer() -> Option<(i32, i32)> {
+    let (x, y, _) = pointer_state()?;
+    Some((x, y))
 }
 
 pub fn click(by: By, px: i32, py: i32, which: Button, count: u32, hold: Duration) -> Result<(), String> {

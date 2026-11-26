@@ -535,12 +535,39 @@ pub fn same_app(now: Hwnd, target: Hwnd) -> bool {
     pids.contains(&pid(now)) || pids.contains(&content_pid(now))
 }
 
-fn settle_behind(hwnd: Hwnd, front: Hwnd) {
+/// Root top-level window for `hwnd` (or `hwnd` itself if Windows reports no ancestor root).
+pub fn root_of(hwnd: Hwnd) -> Hwnd {
+    if hwnd == 0 {
+        return 0;
+    }
+    let outer = unsafe { GetAncestor(raw(hwnd), GA_ROOT) } as Hwnd;
+    if outer != 0 { outer } else { hwnd }
+}
+
+/// True if `name` is a Windows taskbar, Alt+Tab switcher, or shell switching surface.
+pub fn is_shell_switch_class(name: &str) -> bool {
+    matches!(
+        name,
+        "Shell_TrayWnd"
+            | "Shell_SecondaryTrayWnd"
+            | "TaskListThumbnailWnd"
+            | "XamlExplorerHostIslandWindow"
+            | "MultitaskingViewFrame"
+            | "TaskSwitcherWnd"
+            | "ForegroundStaging"
+    )
+}
+
+fn settle_behind(hwnd: Hwnd, front: Hwnd, input_before: u32) {
     let now = foreground();
-    if front != 0 && front != hwnd && now != front && same_app(now, hwnd) && !bring_forward(front) {
+    let front_root = root_of(front);
+    let hwnd_root = root_of(hwnd);
+    let now_root = root_of(now);
+    let user_switched = crate::real::last_input_tick() != input_before || person_switching() || recent_switch_to(now_root);
+    if !user_switched && front_root != 0 && front_root != hwnd_root && now_root != front_root && same_app(now, hwnd) && !bring_forward(front) {
         stop_flashing(front);
     }
-    if front != 0 && front != hwnd && foreground() == front {
+    if !user_switched && front_root != 0 && front_root != hwnd_root && root_of(foreground()) == front_root {
         lower_behind(hwnd, front);
     }
     stop_flashing(hwnd);
@@ -552,6 +579,7 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
     let front = foreground();
+    let input_before = crate::real::last_input_tick();
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
     let _fg_lock = (!front_thread(hwnd)).then(ForegroundLock::take);
@@ -569,7 +597,7 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
         if unsafe { IsZoomed(raw(hwnd)) } != 0 {
             drop(_fg_lock);
             drop(guard);
-            settle_behind(hwnd, front);
+            settle_behind(hwnd, front, input_before);
             return Ok(false);
         }
     }
@@ -588,7 +616,7 @@ pub fn fill_screen_behind(hwnd: Hwnd) -> Result<bool, String> {
     }
     drop(_fg_lock);
     drop(guard);
-    settle_behind(hwnd, front);
+    settle_behind(hwnd, front, input_before);
     Ok(false)
 }
 
@@ -725,6 +753,7 @@ pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
     use windows_sys::Win32::Graphics::Gdi::{GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_SHOWNOACTIVATE};
     let front = foreground();
+    let input_before = crate::real::last_input_tick();
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
     let _fg_lock = is_background(hwnd).then(ForegroundLock::take);
@@ -746,7 +775,7 @@ pub fn snap_half(hwnd: Hwnd, right: bool) -> Result<(), String> {
     }
     drop(_fg_lock);
     drop(guard);
-    settle_behind(hwnd, front);
+    settle_behind(hwnd, front, input_before);
     Ok(())
 }
 
@@ -754,7 +783,8 @@ fn apply_move_monitor(hwnd: Hwnd, pick: impl FnOnce(&[(isize, RECT)], isize) -> 
     use windows_sys::Win32::Graphics::Gdi::{MONITOR_DEFAULTTONEAREST, MonitorFromWindow};
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MAXIMIZE, SW_SHOWNOACTIVATE};
     let front = foreground();
-    let theirs = front == hwnd;
+    let input_before = crate::real::last_input_tick();
+    let theirs = root_of(front) == root_of(hwnd);
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
     let _fg_lock = is_background(hwnd).then(ForegroundLock::take);
@@ -803,7 +833,7 @@ fn apply_move_monitor(hwnd: Hwnd, pick: impl FnOnce(&[(isize, RECT)], isize) -> 
     }
     drop(_fg_lock);
     drop(guard);
-    settle_behind(hwnd, front);
+    settle_behind(hwnd, front, input_before);
     Ok(())
 }
 
@@ -857,7 +887,8 @@ pub fn move_monitor(hwnd: Hwnd, next: bool) -> Result<bool, String> {
 pub fn minimize_or_restore(hwnd: Hwnd) -> Result<(), String> {
     use windows_sys::Win32::UI::WindowsAndMessaging::{IsZoomed, SW_MINIMIZE, SW_SHOWMINNOACTIVE};
     let front = foreground();
-    let theirs = front == hwnd;
+    let input_before = crate::real::last_input_tick();
+    let theirs = root_of(front) == root_of(hwnd);
     let lock = window_lock(hwnd);
     let guard = lock.lock().unwrap();
     let _fg_lock = (!theirs).then(ForegroundLock::take);
@@ -879,7 +910,7 @@ pub fn minimize_or_restore(hwnd: Hwnd) -> Result<(), String> {
     drop(_fg_lock);
     drop(guard);
     if !theirs {
-        settle_behind(hwnd, front);
+        settle_behind(hwnd, front, input_before);
     } else {
         stop_flashing(hwnd);
     }
@@ -948,16 +979,24 @@ pub fn uncovered<T>(hwnd: Hwnd, work: impl FnOnce() -> T) -> T {
             unsafe { SetWindowPos(raw(opened), null_mut(), at.left + dx, at.top + dy, 0, 0, back) };
         }
     }
-    if was_front != 0 && was_front != hwnd && !person_switching() && crate::real::last_input_tick() == input_before {
-        let now = foreground();
-        if now != was_front && same_app(now, hwnd) {
-            if !bring_forward(was_front) {
-                stop_flashing(was_front);
-            }
-            lower_behind(hwnd, was_front);
-            if now != hwnd {
-                lower_behind(now, was_front);
-            }
+    let now = foreground();
+    let was_root = root_of(was_front);
+    let now_root = root_of(now);
+    let hwnd_root = root_of(hwnd);
+    if was_root != 0
+        && was_root != hwnd_root
+        && now_root != was_root
+        && same_app(now, hwnd)
+        && !person_switching()
+        && crate::real::last_input_tick() == input_before
+        && !recent_switch_to(now_root)
+    {
+        if !bring_forward(was_front) {
+            stop_flashing(was_front);
+        }
+        lower_behind(hwnd, was_front);
+        if now != hwnd {
+            lower_behind(now, was_front);
         }
     }
     stop_flashing(hwnd);
@@ -1763,6 +1802,284 @@ pub fn pulls_forward(pids: &[u32]) -> bool {
     PULLED.lock().unwrap().iter().any(|pid| pids.contains(pid))
 }
 
+const SWITCH_GRACE_MS: u64 = 600;
+const CLICK_EDGE_GRACE_MS: u64 = 1500;
+
+static CLOCK_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn clock_ms() -> u64 {
+    CLOCK_START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// Snapshot of foreground and input state consumed by [`FocusTracker::observe`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct FocusSample {
+    pub now_ms: u64,
+    pub guard_front: Hwnd,
+    pub guard_is_target: bool,
+    pub front_root: Hwnd,
+    pub front_is_target: bool,
+    pub front_is_shell: bool,
+    pub mouse_down: bool,
+    pub mouse_edge: bool,
+    pub pointer_root: Hwnd,
+    pub pointer_is_shell: bool,
+    pub switch_key_down: bool,
+    pub switch_key_edge: bool,
+}
+
+/// Outcome of inspecting a foreground transition while the focus keeper watches `guard_front`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FocusDecision {
+    Same,
+    OtherApp,
+    ChosenByPerson(Hwnd),
+    StoleFocus,
+}
+
+/// Pure state machine deciding whether a foreground change was the person switching windows
+/// (including quick clicks between polls, taskbar/thumbnail clicks, Alt+Tab, and Win+number)
+/// or an automated background app stealing focus on its own.
+#[derive(Debug, Default)]
+pub struct FocusTracker {
+    press_began_on: Option<(Hwnd, bool)>,
+    last_mouse_click_on: Option<(Hwnd, bool, u64)>,
+    last_switch_key_ms: Option<u64>,
+    chosen_front: Option<Hwnd>,
+    pending_mouse_edge: bool,
+    pending_switch_edge: bool,
+}
+
+impl FocusTracker {
+    /// Reset transient gesture edges (for example after synthetic `SendInput` or when going idle).
+    pub fn prime(&mut self, front_root: Hwnd, preserve_recent_input: bool) {
+        self.press_began_on = None;
+        self.last_mouse_click_on = None;
+        self.pending_mouse_edge = false;
+        self.pending_switch_edge = false;
+        if !preserve_recent_input {
+            self.last_switch_key_ms = None;
+            self.chosen_front = None;
+        } else if self.chosen_front.is_some_and(|w| w != front_root) && front_root != 0 {
+            self.chosen_front = None;
+        }
+    }
+
+    /// Record that `front_root` was intentionally brought forward or chosen as the person's window.
+    pub fn mark_chosen(&mut self, front_root: Hwnd) {
+        self.chosen_front = (front_root != 0).then_some(front_root);
+        self.last_mouse_click_on = None;
+        self.last_switch_key_ms = None;
+        self.pending_mouse_edge = false;
+        self.pending_switch_edge = false;
+    }
+
+    fn latch_bits(&mut self, bits: SwitchKeyBits, pointer_root: Hwnd, pointer_is_shell: bool, now_ms: u64) {
+        if bits.mouse_edge {
+            self.pending_mouse_edge = true;
+            if !bits.mouse_down && pointer_root != 0 && self.press_began_on.is_none() {
+                self.last_mouse_click_on = Some((pointer_root, pointer_is_shell, now_ms));
+            }
+        }
+        if bits.mouse_down && self.press_began_on.is_none() && pointer_root != 0 {
+            self.press_began_on = Some((pointer_root, pointer_is_shell));
+        }
+        if bits.switch_key_down || bits.switch_key_edge {
+            self.pending_switch_edge |= bits.switch_key_edge;
+            self.last_switch_key_ms = Some(now_ms);
+        }
+    }
+
+    fn is_switch_for(&self, front: Hwnd, now_ms: u64) -> bool {
+        let recent_switch_key = self.last_switch_key_ms.is_some_and(|at| now_ms.saturating_sub(at) <= SWITCH_GRACE_MS);
+        let mouse_click_for_front = self.press_began_on.is_some_and(|(r, shell)| r == front || shell)
+            || self.last_mouse_click_on.is_some_and(|(r, shell, at)| {
+                now_ms.saturating_sub(at) <= CLICK_EDGE_GRACE_MS && (r == front || shell)
+            });
+        recent_switch_key || mouse_click_for_front
+    }
+
+    pub fn recent_switch_to(&self, target_root: Hwnd, now_ms: u64) -> bool {
+        target_root != 0 && (self.chosen_front == Some(target_root) || self.is_switch_for(target_root, now_ms))
+    }
+
+    pub fn observe(&mut self, mut sample: FocusSample) -> FocusDecision {
+        sample.mouse_edge |= std::mem::take(&mut self.pending_mouse_edge);
+        sample.switch_key_edge |= std::mem::take(&mut self.pending_switch_edge);
+
+        if !sample.mouse_down {
+            if let Some((began_root, began_shell)) = self.press_began_on.take() {
+                self.last_mouse_click_on = Some((began_root, began_shell, sample.now_ms));
+            } else if sample.mouse_edge && sample.pointer_root != 0 {
+                self.last_mouse_click_on = Some((sample.pointer_root, sample.pointer_is_shell, sample.now_ms));
+            }
+        } else if self.press_began_on.is_none() && sample.pointer_root != 0 {
+            self.press_began_on = Some((sample.pointer_root, sample.pointer_is_shell));
+        }
+
+        if sample.switch_key_down || sample.switch_key_edge {
+            self.last_switch_key_ms = Some(sample.now_ms);
+        }
+
+        let front = sample.front_root;
+        let guard = sample.guard_front;
+        if front == 0 || guard == 0 || front == guard {
+            if front != 0 && !sample.front_is_target {
+                self.chosen_front = None;
+            }
+            return FocusDecision::Same;
+        }
+
+        if !sample.front_is_target {
+            if sample.guard_is_target && !sample.front_is_shell {
+                self.chosen_front = None;
+                return FocusDecision::ChosenByPerson(front);
+            }
+            if !sample.front_is_shell && self.is_switch_for(front, sample.now_ms) {
+                self.chosen_front = None;
+                return FocusDecision::ChosenByPerson(front);
+            }
+            return FocusDecision::OtherApp;
+        }
+
+        if self.is_switch_for(front, sample.now_ms) || self.chosen_front == Some(front) {
+            self.chosen_front = Some(front);
+            if !sample.mouse_down && !sample.switch_key_down {
+                self.last_mouse_click_on = None;
+                self.last_switch_key_ms = None;
+            }
+            return FocusDecision::ChosenByPerson(front);
+        }
+
+        FocusDecision::StoleFocus
+    }
+}
+
+/// Decision made when `focus_in` wakes with no active `FocusGuard`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum StartAction {
+    GuardCurrentAsPerson(Hwnd),
+    AdoptTarget(Hwnd),
+    RestorePerson(Hwnd),
+}
+
+/// Choose the initial guard when an agent starts work while the focus keeper was idle.
+pub fn decide_start_guard(
+    current_front: Hwnd,
+    current_is_target: bool,
+    prior_person: Option<Hwnd>,
+    person_switched_while_idle: bool,
+) -> StartAction {
+    if current_front == 0 || !current_is_target {
+        return StartAction::GuardCurrentAsPerson(current_front);
+    }
+    match prior_person {
+        Some(person) if person != current_front && !person_switched_while_idle => StartAction::RestorePerson(person),
+        _ => StartAction::AdoptTarget(current_front),
+    }
+}
+
+/// True if physical input or switch gestures happened while idle so a target window now in front
+/// is treated as the person's own switch rather than idle focus theft.
+pub fn idle_switch_detected(
+    idle_input_tick: Option<u32>,
+    current_input_tick: u32,
+    any_switch_key_or_mouse: bool,
+    recent_switch: bool,
+) -> bool {
+    idle_input_tick.is_none_or(|prev| prev != current_input_tick) || any_switch_key_or_mouse || recent_switch
+}
+
+#[derive(Clone, Copy, Default)]
+struct SwitchKeyBits {
+    mouse_down: bool,
+    mouse_edge: bool,
+    switch_key_down: bool,
+    switch_key_edge: bool,
+}
+
+fn poll_switch_keys() -> SwitchKeyBits {
+    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
+    let read = |keys: &[u16]| -> (bool, bool) {
+        let mut down = false;
+        let mut edge = false;
+        for &key in keys {
+            let state = unsafe { GetAsyncKeyState(key as i32) } as u16;
+            down |= (state & 0x8000) != 0;
+            edge |= (state & 0x0001) != 0;
+        }
+        (down, edge)
+    };
+    let (mouse_down, mouse_edge) = read(&[VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]);
+    let (switch_key_down, switch_key_edge) = read(&[VK_MENU, VK_LWIN, VK_RWIN]);
+    SwitchKeyBits { mouse_down, mouse_edge, switch_key_down, switch_key_edge }
+}
+
+fn pointer_root_and_shell() -> (Hwnd, bool) {
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, WindowFromPoint};
+    let mut point = POINT { x: 0, y: 0 };
+    if unsafe { GetCursorPos(&mut point) } == 0 {
+        return (0, false);
+    }
+    let root = root_of(unsafe { WindowFromPoint(point) } as Hwnd);
+    let shell = root != 0 && is_shell_switch_class(&class(root));
+    (root, shell)
+}
+
+static FOCUS_TRACKER: std::sync::Mutex<FocusTracker> = std::sync::Mutex::new(FocusTracker {
+    press_began_on: None,
+    last_mouse_click_on: None,
+    last_switch_key_ms: None,
+    chosen_front: None,
+    pending_mouse_edge: false,
+    pending_switch_edge: false,
+});
+
+/// Reset transient switch edges (for example after synthetic `SendInput` returns or before parking).
+pub fn prime_focus_tracker(front_root: Hwnd, preserve_recent_input: bool) {
+    let mut tracker = FOCUS_TRACKER.lock().unwrap();
+    if !preserve_recent_input {
+        let _ = poll_switch_keys();
+    }
+    tracker.prime(root_of(front_root), preserve_recent_input);
+}
+
+/// Record that `front_root` was intentionally chosen by the person (or explicitly focused).
+pub fn adopt_front_tracker(front_root: Hwnd) {
+    FOCUS_TRACKER.lock().unwrap().mark_chosen(root_of(front_root));
+}
+
+/// True if the person switched to `target_root` (click, taskbar, Alt+Tab, Win+key) within the grace window.
+pub fn recent_switch_to(target_root: Hwnd) -> bool {
+    let target_root = root_of(target_root);
+    if target_root == 0 {
+        return false;
+    }
+    let now_ms = clock_ms();
+    let (pointer_root, pointer_is_shell) = pointer_root_and_shell();
+    let mut tracker = FOCUS_TRACKER.lock().unwrap();
+    let bits = poll_switch_keys();
+    tracker.latch_bits(bits, pointer_root, pointer_is_shell, now_ms);
+    tracker.recent_switch_to(target_root, now_ms)
+}
+
+/// True if physical input or a mouse/Alt/Windows-key switch happened while the keeper was idle.
+pub fn switched_since_idle(idle_input_tick: Option<u32>, target_root: Hwnd) -> bool {
+    let target_root = root_of(target_root);
+    let now_ms = clock_ms();
+    let input_tick = crate::real::last_input_tick();
+    let (pointer_root, pointer_is_shell) = pointer_root_and_shell();
+    let mut tracker = FOCUS_TRACKER.lock().unwrap();
+    let bits = poll_switch_keys();
+    tracker.latch_bits(bits, pointer_root, pointer_is_shell, now_ms);
+    let any_key_or_mouse = bits.switch_key_down || bits.switch_key_edge || bits.mouse_down || bits.mouse_edge;
+    let switched = idle_switch_detected(idle_input_tick, input_tick, any_key_or_mouse, tracker.recent_switch_to(target_root, now_ms));
+    if switched {
+        tracker.mark_chosen(target_root);
+    }
+    switched
+}
+
 /// Remembers the person's window, and takes focus back if the app under control grabbed it.
 #[derive(Clone)]
 pub struct FocusGuard {
@@ -1772,14 +2089,12 @@ pub struct FocusGuard {
 impl FocusGuard {
     pub fn take() -> FocusGuard {
         // A Store app reports its inner window, which cannot be brought forward on its own.
-        let front = foreground();
-        let outer = unsafe { GetAncestor(raw(front), GA_ROOT) } as Hwnd;
-        FocusGuard { front: if outer != 0 { outer } else { front } }
+        FocusGuard { front: root_of(foreground()) }
     }
 
     /// Guard a window already known to be the person's.
     pub fn of(front: Hwnd) -> FocusGuard {
-        FocusGuard { front }
+        FocusGuard { front: root_of(front) }
     }
 
     pub fn front(&self) -> Hwnd {
@@ -1795,7 +2110,7 @@ impl FocusGuard {
     /// the person gets it back. Going to a window that already existed was their own doing.
     pub fn hold_against(&self, existing: &HashSet<Hwnd>) {
         let now = foreground();
-        let outer = unsafe { GetAncestor(raw(now), GA_ROOT) } as Hwnd;
+        let outer = root_of(now);
         if now != 0 && now != self.front && outer != self.front && !existing.contains(&now) && !existing.contains(&outer) && exists(self.front) {
             bring_forward(self.front);
         }
@@ -1821,7 +2136,7 @@ impl FocusGuard {
     /// True if focus had to be taken back. A switch to any other app was the person's, so it stays.
     pub fn restore(&self, target_pids: &[u32]) -> bool {
         let now = foreground();
-        let outer = unsafe { GetAncestor(raw(now), GA_ROOT) } as Hwnd;
+        let outer = root_of(now);
         if now == self.front || outer == self.front || now == 0 || self.front == 0 || !exists(self.front) {
             return false;
         }
@@ -1844,63 +2159,49 @@ impl FocusGuard {
         if !bring_forward(self.front) {
             stop_flashing(self.front);
         }
-        let intruder = if outer != 0 { outer } else { now };
-        self.keep_behind(intruder);
-        stop_flashing(intruder);
+        self.keep_behind(outer);
+        stop_flashing(outer);
         true
     }
-}
 
-impl FocusGuard {
-    /// The window the person has just switched to themself, when it belongs to the app agents work
-    /// in: clicked on it or its taskbar button, or reached it with Alt or the Windows key. It is
-    /// theirs from then on, to use and move, and is not taken away from them.
-    pub fn chosen(&self, target_pids: &[u32]) -> Option<Hwnd> {
-        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GetCursorPos, WindowFromPoint};
-        let held = |keys: &[u16]| keys.iter().any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0);
-        // Where the person's current press began. An app that jumps forward under a button they
-        // are already holding is under the pointer now, but they did not press on it.
-        let pressing = held(&[VK_LBUTTON, VK_RBUTTON, VK_MBUTTON]);
-        let began_on = {
-            let mut start = PRESS_BEGAN_ON.lock().unwrap();
-            if !pressing {
-                *start = None;
-            } else if start.is_none() {
-                let mut point = POINT { x: 0, y: 0 };
-                *start = Some(unsafe {
-                    GetCursorPos(&mut point);
-                    GetAncestor(WindowFromPoint(point), GA_ROOT) as Hwnd
-                });
-            }
-            *start
-        };
+    /// Classify the current foreground state so the keeper either adopts the person's chosen
+    /// window, ignores unrelated apps, or restores focus if the target app stole it.
+    pub fn watch_step(&self, target_pids: &[u32]) -> FocusDecision {
         let now = foreground();
-        let outer = unsafe { GetAncestor(raw(now), GA_ROOT) } as Hwnd;
-        let theirs = if outer != 0 { outer } else { now };
-        if now == 0 || now == self.front || outer == self.front {
-            return None;
-        }
-        if !target_pids.contains(&pid(now)) && !target_pids.contains(&content_pid(now)) {
-            return None;
-        }
-        if held(&[VK_MENU, VK_LWIN, VK_RWIN]) {
-            return Some(theirs);
-        }
-        // The press has to have begun on that window, or on the taskbar that switches to it.
-        let began_on = began_on?;
-        (began_on == theirs || matches!(class(began_on).as_str(), "Shell_TrayWnd" | "Shell_SecondaryTrayWnd")).then_some(theirs)
+        let front_root = root_of(now);
+        let front_is_target = now != 0 && (target_pids.contains(&pid(now)) || target_pids.contains(&content_pid(now)));
+        let guard_is_target = self.front != 0 && self.is_one_of(target_pids);
+        let front_is_shell = front_root != 0 && is_shell_switch_class(&class(front_root));
+        let now_ms = clock_ms();
+        let (pointer_root, pointer_is_shell) = pointer_root_and_shell();
+        let mut tracker = FOCUS_TRACKER.lock().unwrap();
+        let bits = poll_switch_keys();
+        let sample = FocusSample {
+            now_ms,
+            guard_front: self.front,
+            guard_is_target,
+            front_root,
+            front_is_target,
+            front_is_shell,
+            mouse_down: bits.mouse_down,
+            mouse_edge: bits.mouse_edge,
+            pointer_root,
+            pointer_is_shell,
+            switch_key_down: bits.switch_key_down,
+            switch_key_edge: bits.switch_key_edge,
+        };
+        tracker.observe(sample)
     }
 }
-
-/// The top window under the pointer when the person's current mouse press began, as the focus
-/// keeper last saw it.
-static PRESS_BEGAN_ON: std::sync::Mutex<Option<Hwnd>> = std::sync::Mutex::new(None);
 
 /// The person is pressing a mouse button, or holding Alt or the Windows key to switch apps.
 pub fn person_switching() -> bool {
-    use windows_sys::Win32::UI::Input::KeyboardAndMouse::{GetAsyncKeyState, VK_LBUTTON, VK_LWIN, VK_MBUTTON, VK_MENU, VK_RBUTTON, VK_RWIN};
-    [VK_LBUTTON, VK_RBUTTON, VK_MBUTTON, VK_MENU, VK_LWIN, VK_RWIN].iter().any(|&key| unsafe { GetAsyncKeyState(key as i32) } < 0)
+    let now_ms = clock_ms();
+    let (pointer_root, pointer_is_shell) = pointer_root_and_shell();
+    let mut tracker = FOCUS_TRACKER.lock().unwrap();
+    let bits = poll_switch_keys();
+    tracker.latch_bits(bits, pointer_root, pointer_is_shell, now_ms);
+    bits.mouse_down || bits.switch_key_down
 }
 
 pub fn lparam(x: i32, y: i32) -> LPARAM {
@@ -2163,5 +2464,157 @@ mod tests {
         assert!(!is_chromium_input_class("Intermediate D3D Window"));
         assert!(is_chromium_non_input_child("Intermediate D3D Window"));
         assert!(is_chromium_non_input_child("Chrome_RenderWidgetHostHWND"));
+    }
+
+    fn base_sample(now_ms: u64, guard_front: Hwnd, front_root: Hwnd, front_is_target: bool) -> FocusSample {
+        FocusSample {
+            now_ms,
+            guard_front,
+            guard_is_target: false,
+            front_root,
+            front_is_target,
+            front_is_shell: false,
+            mouse_down: false,
+            mouse_edge: false,
+            pointer_root: 0,
+            pointer_is_shell: false,
+            switch_key_down: false,
+            switch_key_edge: false,
+        }
+    }
+
+    #[test]
+    fn focus_tracker_allows_quick_click_between_samples() {
+        let mut tracker = FocusTracker::default();
+        assert_eq!(tracker.observe(base_sample(10, 100, 100, true)), FocusDecision::Same);
+        // User clicked and released quickly on B (200) between 2 ms samples.
+        let mut click = base_sample(12, 100, 200, true);
+        click.mouse_edge = true;
+        click.pointer_root = 200;
+        assert_eq!(tracker.observe(click), FocusDecision::ChosenByPerson(200));
+    }
+
+    #[test]
+    fn focus_tracker_allows_delayed_activation_after_click_on_target_or_taskbar() {
+        for (pointer_root, pointer_is_shell) in [(200, false), (900, true)] {
+            let mut tracker = FocusTracker::default();
+            let mut click = base_sample(10, 100, 100, false);
+            click.guard_front = 100;
+            click.front_root = 100;
+            click.mouse_edge = true;
+            click.pointer_root = pointer_root;
+            click.pointer_is_shell = pointer_is_shell;
+            assert_eq!(tracker.observe(click), FocusDecision::Same);
+
+            // Windows activates B 30 ms later after the mouse button is already up.
+            let activate = base_sample(40, 100, 200, true);
+            assert_eq!(tracker.observe(activate), FocusDecision::ChosenByPerson(200));
+        }
+    }
+
+    #[test]
+    fn focus_tracker_allows_alt_tab_held_and_quick_alt_tab_release() {
+        // Alt+Tab still held while switcher UI shows, then released onto B.
+        let mut tracker = FocusTracker::default();
+        let mut alt_ui = base_sample(10, 100, 777, false);
+        alt_ui.front_is_shell = true;
+        alt_ui.switch_key_down = true;
+        alt_ui.switch_key_edge = true;
+        assert_eq!(tracker.observe(alt_ui), FocusDecision::OtherApp);
+
+        let released_b = base_sample(180, 100, 200, true);
+        assert_eq!(tracker.observe(released_b), FocusDecision::ChosenByPerson(200));
+
+        // Very quick Alt+Tab / Win+number completed between samples before polling caught the hold.
+        let mut fast = FocusTracker::default();
+        let mut fast_switch = base_sample(50, 100, 200, true);
+        fast_switch.switch_key_edge = true;
+        assert_eq!(fast.observe(fast_switch), FocusDecision::ChosenByPerson(200));
+    }
+
+    #[test]
+    fn focus_tracker_rejects_self_focus_steal_even_while_typing_in_a() {
+        let mut tracker = FocusTracker::default();
+        let initial = FocusSample { pointer_root: 100, ..base_sample(10, 100, 100, false) };
+        assert_eq!(tracker.observe(initial), FocusDecision::Same);
+
+        // User clicks and types in A (100), then B (200) pushes forward on its own.
+        let mut click_a = base_sample(20, 100, 100, false);
+        click_a.mouse_edge = true;
+        click_a.pointer_root = 100;
+        assert_eq!(tracker.observe(click_a), FocusDecision::Same);
+
+        let mut steal = base_sample(30, 100, 200, true);
+        steal.pointer_root = 100;
+        assert_eq!(tracker.observe(steal), FocusDecision::StoleFocus);
+    }
+
+    #[test]
+    fn focus_tracker_rejects_steal_under_drag_started_in_a() {
+        let mut tracker = FocusTracker::default();
+        let mut drag_a = base_sample(10, 100, 100, false);
+        drag_a.mouse_down = true;
+        drag_a.pointer_root = 100;
+        assert_eq!(tracker.observe(drag_a), FocusDecision::Same);
+
+        // B steals foreground under the cursor while mouse is still held down from A.
+        let mut pop_b = base_sample(20, 100, 200, true);
+        pop_b.mouse_down = true;
+        pop_b.pointer_root = 200;
+        assert_eq!(tracker.observe(pop_b), FocusDecision::StoleFocus);
+    }
+
+    #[test]
+    fn focus_tracker_tracks_person_leaving_chosen_target_for_other_app() {
+        let mut tracker = FocusTracker::default();
+        let mut choose_b = base_sample(10, 100, 200, true);
+        choose_b.mouse_edge = true;
+        choose_b.pointer_root = 200;
+        assert_eq!(tracker.observe(choose_b), FocusDecision::ChosenByPerson(200));
+
+        // Transient zero foreground should not wipe the chosen target state.
+        assert_eq!(tracker.observe(base_sample(15, 200, 0, false)), FocusDecision::Same);
+        assert!(tracker.recent_switch_to(200, 15));
+
+        // Guard is now B (guard_is_target = true); user goes back to A (non-target, non-shell).
+        let mut leave_to_a = base_sample(30, 200, 100, false);
+        leave_to_a.guard_is_target = true;
+        assert_eq!(tracker.observe(leave_to_a), FocusDecision::ChosenByPerson(100));
+        assert!(!tracker.recent_switch_to(200, 30));
+    }
+
+    #[test]
+    fn start_guard_and_idle_switch_handle_idle_switches_and_steals() {
+        assert_eq!(decide_start_guard(0, true, Some(100), false), StartAction::GuardCurrentAsPerson(0));
+        assert_eq!(decide_start_guard(100, false, Some(100), false), StartAction::GuardCurrentAsPerson(100));
+        assert_eq!(decide_start_guard(200, true, None, false), StartAction::AdoptTarget(200));
+        assert_eq!(decide_start_guard(200, true, Some(200), false), StartAction::AdoptTarget(200));
+        assert_eq!(decide_start_guard(200, true, Some(100), true), StartAction::AdoptTarget(200));
+        assert_eq!(decide_start_guard(200, true, Some(100), false), StartAction::RestorePerson(100));
+
+        // Input tick advanced while idle even if another app consumed GetAsyncKeyState bit 0.
+        assert!(idle_switch_detected(Some(1000), 1200, false, false));
+        // Input tick unchanged and no switch gesture bits: treat as unattended idle steal.
+        assert!(!idle_switch_detected(Some(1000), 1000, false, false));
+        // Switch key/mouse bit or recent switch while tick unchanged still counts as user switch.
+        assert!(idle_switch_detected(Some(1000), 1000, true, false));
+        assert!(idle_switch_detected(Some(1000), 1000, false, true));
+    }
+
+    #[test]
+    fn shell_switch_classes_cover_taskbar_thumbnails_and_alt_tab() {
+        for name in [
+            "Shell_TrayWnd",
+            "Shell_SecondaryTrayWnd",
+            "TaskListThumbnailWnd",
+            "XamlExplorerHostIslandWindow",
+            "MultitaskingViewFrame",
+            "TaskSwitcherWnd",
+            "ForegroundStaging",
+        ] {
+            assert!(is_shell_switch_class(name), "{name} should be recognized as switch surface");
+        }
+        assert!(!is_shell_switch_class("Windows.UI.Core.CoreWindow"));
+        assert!(!is_shell_switch_class("Notepad"));
     }
 }

@@ -558,7 +558,7 @@ pub fn post_hover(root: Hwnd, x: i32, y: i32) -> Result<String, String> {
 }
 
 /// Guard that restores the previous foreground window if `root` sneaks to the front during a
-/// background action — unless the person moved/clicked/typed or is actively switching apps.
+/// background action — unless the person already had `root` in front or switched apps.
 struct KeepBehind {
     root: Hwnd,
     front: Hwnd,
@@ -567,10 +567,7 @@ struct KeepBehind {
 
 impl KeepBehind {
     fn new(hwnd: Hwnd) -> Self {
-        use windows_sys::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor};
-        let resolved = unsafe { GetAncestor(hwnd as HWND, GA_ROOT) } as Hwnd;
-        let root = if resolved != 0 { resolved } else { hwnd };
-        Self { root, front: win::foreground(), input_before: real::last_input_tick() }
+        Self { root: win::root_of(hwnd), front: win::foreground(), input_before: real::last_input_tick() }
     }
 }
 
@@ -580,21 +577,27 @@ impl Drop for KeepBehind {
     }
 }
 
+/// True when a background action caused `root`'s app to steal foreground from `front`
+/// without the person having brought `root` forward before or during the action.
+pub fn should_restore_background(root: Hwnd, front: Hwnd, front_root: Hwnd, now_root: Hwnd, same_app: bool, user_switched: bool) -> bool {
+    front != 0 && !user_switched && front_root != root && now_root != 0 && now_root != front_root && same_app
+}
+
 /// If a background app sneaked into the foreground during a posted message or shortcut, put the
 /// person's window right back in front, lower the intruder behind it, and cancel any taskbar flash.
-/// Skips restoration if the person interacted (clicked, typed, or held Alt/Win) during the action,
-/// so intentional app switches are never undone.
+/// Skips restoration when `root` was already the foreground window or when the person switched to it.
 fn restore_if_stole(root: Hwnd, front: Hwnd, input_before: u32) {
-    if front != 0 && !win::person_switching() && real::last_input_tick() == input_before {
-        let now = win::foreground();
-        if now != front && win::same_app(now, root) {
-            if !win::bring_forward(front) {
-                win::stop_flashing(front);
-            }
-            win::lower_behind(root, front);
-            if now != root {
-                win::lower_behind(now, front);
-            }
+    let now = win::foreground();
+    let front_root = win::root_of(front);
+    let now_root = win::root_of(now);
+    let user_switched = win::person_switching() || real::last_input_tick() != input_before || win::recent_switch_to(now_root);
+    if should_restore_background(root, front, front_root, now_root, win::same_app(now, root), user_switched) {
+        if !win::bring_forward(front) {
+            win::stop_flashing(front);
+        }
+        win::lower_behind(root, front);
+        if now != root {
+            win::lower_behind(now, front);
         }
     }
     win::stop_flashing(root);
@@ -1164,7 +1167,7 @@ pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
     }
     let window = win::key_window(root);
     let front = win::foreground();
-    if front == root || front == window {
+    if win::root_of(front) == win::root_of(root) || front == root || front == window {
         return if node.element.set_focus().is_ok() {
             Ok("focus".into())
         } else {
@@ -1553,5 +1556,22 @@ mod tests {
         assert_eq!(popup_shortcut_command(0, 0), None);
         assert_eq!(popup_shortcut_command(1, 42), None);
         assert_eq!(popup_shortcut_command(0, 0x1_002A), Some(0x002A));
+    }
+
+    #[test]
+    fn background_restore_respects_user_focus_and_switches() {
+        // B already in front when the action started (direct handle or Store/child frame): never restore.
+        assert!(!should_restore_background(200, 200, 200, 200, true, false));
+        assert!(!should_restore_background(200, 201, 200, 202, true, false));
+        // Person switched to B right before or during the action: never restore A.
+        assert!(!should_restore_background(200, 100, 100, 200, true, true));
+        // No previous foreground window or same foreground root: nothing to restore.
+        assert!(!should_restore_background(200, 0, 0, 200, true, false));
+        assert!(!should_restore_background(200, 100, 100, 100, true, false));
+        // B (or its popup) stole focus from A with no user switch: restore A.
+        assert!(should_restore_background(200, 100, 100, 200, true, false));
+        assert!(should_restore_background(200, 100, 100, 205, true, false));
+        // Unrelated app C came forward on its own: do not yank it back.
+        assert!(!should_restore_background(200, 100, 100, 300, false, false));
     }
 }

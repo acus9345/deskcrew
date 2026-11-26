@@ -385,6 +385,19 @@ pub fn idle_seconds() -> f64 {
     unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, u32::MAX) }
 }
 
+/// Seconds elapsed since a mouse click or modifier change (Command/Option) that can switch apps.
+pub fn switch_idle_seconds() -> f64 {
+    const HID_SYSTEM_STATE: i32 = 1;
+    const LEFT_MOUSE_DOWN: u32 = 1;
+    const RIGHT_MOUSE_DOWN: u32 = 3;
+    const FLAGS_CHANGED: u32 = 12;
+    const OTHER_MOUSE_DOWN: u32 = 25;
+    [LEFT_MOUSE_DOWN, RIGHT_MOUSE_DOWN, OTHER_MOUSE_DOWN, FLAGS_CHANGED]
+        .into_iter()
+        .map(|kind| unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, kind) })
+        .fold(f64::INFINITY, f64::min)
+}
+
 /// Replace the clipboard with text, or empty it with None.
 pub fn set_clipboard(text: Option<&str>) -> Result<(), String> {
     use objc2::msg_send;

@@ -483,14 +483,11 @@ impl Service {
     /// window switches are never undone.
     fn keep_behind<T>(&self, tracked: &Tracked, flags: &Flags, work: impl FnOnce() -> T) -> T {
         let before = (!flags.real && !flags.mouse).then(x::front).flatten();
-        let ptr_before = before.and_then(|_| x::pointer());
+        let ptr_before = before.and_then(|_| x::pointer_state());
         let started = Instant::now();
         let result = work();
         if let (Some(xid), Some(prev)) = (tracked.x11, before)
-            && prev != xid
-            && x::front() == Some(xid)
-            && started.elapsed() < Duration::from_millis(800)
-            && x::pointer() == ptr_before
+            && should_restore_behind(xid, prev, x::front(), ptr_before, x::pointer_state(), started.elapsed())
         {
             x::lower_behind(xid, prev);
             let _ = x::activate(prev);
@@ -2692,6 +2689,29 @@ pub fn run() {
     service.release(true);
 }
 
+fn should_restore_behind(
+    target_xid: u32,
+    prev_xid: u32,
+    front_after: Option<u32>,
+    ptr_before: Option<(i32, i32, u16)>,
+    ptr_after: Option<(i32, i32, u16)>,
+    elapsed: Duration,
+) -> bool {
+    use x11rb::protocol::xproto::KeyButMask;
+    if prev_xid == target_xid || front_after != Some(target_xid) || elapsed >= Duration::from_millis(800) {
+        return false;
+    }
+    let switch_mask = KeyButMask::MOD1.bits()
+        | KeyButMask::MOD4.bits()
+        | KeyButMask::BUTTON1.bits()
+        | KeyButMask::BUTTON2.bits()
+        | KeyButMask::BUTTON3.bits();
+    match (ptr_before, ptr_after) {
+        (Some((x1, y1, m1)), Some((x2, y2, m2))) => (x1, y1) == (x2, y2) && ((m1 | m2) & switch_mask) == 0,
+        _ => true,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2708,5 +2728,27 @@ mod tests {
         assert!(quiet_blocked("type", &Flags { paste: true, ..Flags::default() }, None).is_none());
         let step_real = vec![Step { flags: Flags { real: true, ..Flags::default() }, words: vec!["click".into(), "e1".into()] }];
         assert!(quiet_blocked("do", &plain, Some(&step_real)).is_some());
+    }
+
+    #[test]
+    fn keep_behind_respects_user_focus_pointer_clicks_and_switch_modifiers() {
+        use x11rb::protocol::xproto::KeyButMask;
+        let fast = Duration::from_millis(20);
+        // B already in front: never restore.
+        assert!(!should_restore_behind(200, 200, Some(200), Some((10, 10, 0)), Some((10, 10, 0)), fast));
+        // Pointer moved during work (click/switch): keep B in front.
+        assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((50, 50, 0)), fast));
+        // Stationary mouse button click on B without moving pointer: keep B in front.
+        let btn1 = KeyButMask::BUTTON1.bits();
+        assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((10, 10, btn1)), fast));
+        // Alt+Tab or Super switch key held: keep B in front.
+        let alt = KeyButMask::MOD1.bits();
+        let super_key = KeyButMask::MOD4.bits();
+        assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, alt)), Some((10, 10, 0)), fast));
+        assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((10, 10, super_key)), fast));
+        // Pointer stationary with no button/switch modifier and B stole focus quickly: restore A.
+        assert!(should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((10, 10, 0)), fast));
+        // Elapsed past 800 ms window: do not yank focus back.
+        assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((10, 10, 0)), Duration::from_millis(850)));
     }
 }
