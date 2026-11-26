@@ -78,6 +78,10 @@ pub fn minimized(hwnd: Hwnd) -> bool {
     unsafe { IsIconic(raw(hwnd)) != 0 }
 }
 
+pub fn app(hwnd: Hwnd) -> String {
+    image_name(content_pid(hwnd))
+}
+
 fn image_name(pid: u32) -> String {
     unsafe {
         let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);

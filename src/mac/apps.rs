@@ -80,6 +80,10 @@ pub fn launch(app: &str, args: &[String], front: bool) -> Result<Option<Window>,
     if !front {
         open.arg("-g");
     }
+    // macOS `open -a` drops `--args` if the browser is already running unless `-n` starts a new instance.
+    if args.iter().any(|a| a.starts_with("--remote-debugging-port")) {
+        open.arg("-n");
+    }
     if app.contains('/') {
         open.arg(app);
     } else {

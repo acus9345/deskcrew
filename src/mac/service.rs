@@ -8,6 +8,7 @@ use super::{
     input::{self, Button},
 };
 use crate::{
+    cdp,
     lines::{self, Seen},
     look, motion,
     overlay::{self, Overlay, Rect},
@@ -44,7 +45,8 @@ drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth] [--fill] [--close]
 pick-file \"path\"                      choose a file in an open file dialog
 do \"click e1; set e2 hi; key enter\" [--dry] [--risk low|medium|high]   many steps, one reply
 Any action: --expect \"text\" fails unless the text shows afterwards.
-launch app [args] [--front]     focus     close     place x,y,w,h|min|max|restore|left|right|monitor N
+launch app [args] [--front] [--cdp]     focus     close     place x,y,w,h|min|max|restore|left|right|monitor N
+cdp [status|on|off|port|tabs|use|goto|back|forward|reload]   control Chromium/Electron pages by DOM over CDP
 notifications [close]     apps     screens     clip     clip set \"text\"     clip clear     status     cursor     quiet [on|off]     resume     quit     setup     mcp
 Every action replies with what changed, in the picture too. x,y are points in the last shot, or text see read. Ctrl+Option+Esc stops every agent.
 Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
@@ -175,6 +177,7 @@ struct Flags {
     with: Option<String>,
     force: bool,
     front: bool,
+    cdp: bool,
     fast: bool,
     real: bool,
     paste: bool,
@@ -194,6 +197,49 @@ struct Flags {
 }
 
 impl Flags {
+    fn to_cdp(&self) -> Result<cdp::ActionFlags, String> {
+        let region = match &self.region {
+            Some(text) => Some(lines::parse_rect(text).ok_or("--region takes x,y,w,h")?),
+            None => None,
+        };
+        let button = match self.button {
+            Some(Ok(input::Button::Left)) => Some("left".to_string()),
+            Some(Ok(input::Button::Right)) => Some("right".to_string()),
+            Some(Ok(input::Button::Middle)) => Some("middle".to_string()),
+            Some(Ok(input::Button::Back)) => Some("back".to_string()),
+            Some(Ok(input::Button::Forward)) => Some("forward".to_string()),
+            Some(Err(())) => return Err("--button takes left, right or middle".into()),
+            None => None,
+        };
+        Ok(cdp::ActionFlags {
+            full: self.full,
+            all: self.all,
+            find: self.find.clone(),
+            from: self.from,
+            right: self.right,
+            double: self.double,
+            triple: self.triple,
+            middle: self.middle,
+            back: self.back,
+            forward: self.forward,
+            hold: self.hold,
+            with: self.with.clone(),
+            button,
+            smooth: self.smooth,
+            fill: self.fill,
+            close: self.close,
+            gone: self.gone,
+            ms: self.ms,
+            expect: self.expect.clone(),
+            force: self.force,
+            marks: self.marks,
+            rulers: self.rulers,
+            changed: self.changed,
+            edge: self.edge,
+            region,
+        })
+    }
+
     /// A step's own flags, with the command's switched on too.
     fn merged(mut self, outer: &Flags) -> Flags {
         self.right |= outer.right;
@@ -311,6 +357,7 @@ fn parse(words: &[String]) -> (Flags, Vec<String>) {
             "--close" => flags.close = true,
             "--force" => flags.force = true,
             "--front" => flags.front = true,
+            "--cdp" => flags.cdp = true,
             "--fast" => flags.fast = true,
             "--real" => flags.real = true,
             "--paste" => flags.paste = true,
@@ -374,6 +421,7 @@ struct Service {
     windows: Mutex<(u32, HashMap<u32, Arc<Tracked>>)>,
     agents: Mutex<HashMap<String, AgentState>>,
     overlay: Overlay,
+    cdp: cdp::CdpHub,
     last_used: Mutex<Instant>,
     quiet: AtomicBool,
     quit: AtomicBool,
@@ -416,6 +464,48 @@ impl Service {
 
     fn by_id(&self, id: u32) -> Option<Arc<Tracked>> {
         self.windows.lock().unwrap().1.values().find(|t| t.id == id).cloned()
+    }
+
+    fn cdp_target(&self, who: &str, spec: Option<&str>) -> Result<Option<(String, cdp::TargetInfo)>, String> {
+        if !self.cdp.is_enabled() {
+            return Ok(None);
+        }
+        if let Some(spec) = spec {
+            if let Some(direct) = self.cdp.pick_direct_spec(who, spec) {
+                let target = direct?;
+                self.cdp.set_active(who, target.clone());
+                self.agents.lock().unwrap().entry(who.to_string()).or_default().current = None;
+                return Ok(Some((spec.to_string(), target)));
+            }
+            let tracked = self.pick(who, Some(spec))?;
+            if let Ok(win) = self.window_of(&tracked)
+                && let Some(target) = self.cdp.target_for_window(&win.title, &win.app, false)
+            {
+                self.cdp.set_active(who, target.clone());
+                return Ok(Some((format!("w{}", tracked.id), target)));
+            }
+            self.cdp.clear_active(who);
+            return Ok(None);
+        }
+        let current = self.agents.lock().unwrap().get(who).and_then(|a| a.current);
+        if let Some(wid) = current {
+            let tracked = self.windows.lock().unwrap().1.get(&wid).cloned();
+            let Some(tracked) = tracked else {
+                self.cdp.clear_active(who);
+                return Ok(None);
+            };
+            let Ok(win) = self.window_of(&tracked) else {
+                self.cdp.clear_active(who);
+                return Ok(None);
+            };
+            if let Some(target) = self.cdp.target_for_window(&win.title, &win.app, false) {
+                self.cdp.set_active(who, target.clone());
+                return Ok(Some((format!("w{}", tracked.id), target)));
+            }
+            self.cdp.clear_active(who);
+            return Ok(None);
+        }
+        Ok(self.cdp.active_target(who).map(|t| ("cdp".to_string(), t)))
     }
 
     fn set_current(&self, who: &str, window: u32) {
@@ -1778,10 +1868,34 @@ impl Service {
             return Err(STOPPED.into());
         }
         let app = words.first().ok_or("launch needs an app")?;
-        let Some(window) = apps::launch(app, &words[1..], flags.front)? else { return Ok(format!("started {app}; no new window yet")) };
+        let raw_args = words[1..].join(" ");
+        let mut launch_args: Vec<String> = words[1..].to_vec();
+        let cdp_port = if flags.cdp {
+            let port = cdp::allocate_port()?;
+            if let Some(existing) = cdp::extract_debugging_port(&raw_args) {
+                Some(existing)
+            } else {
+                let mut prefixed = vec![format!("--remote-debugging-port={port}")];
+                if !raw_args.contains("--user-data-dir") {
+                    let dir = cdp::profile_dir(app);
+                    let _ = std::fs::create_dir_all(&dir);
+                    prefixed.push(format!("--user-data-dir={}", dir.display()));
+                }
+                prefixed.extend(launch_args);
+                launch_args = prefixed;
+                Some(port)
+            }
+        } else {
+            cdp::extract_debugging_port(&raw_args)
+        };
+        if let Some(port) = cdp_port {
+            self.cdp.register_port(port, app);
+        }
+        let Some(window) = apps::launch(app, &launch_args, flags.front)? else { return Ok(format!("started {app}; no new window yet")) };
         let tracked = self.track(&window);
         self.set_current(who, window.id);
-        Ok(format!("w{} \"{}\" {}", tracked.id, lines::clip(&window.title, 50), window.app))
+        let note = cdp_port.map_or(String::new(), |p| format!(" (cdp port {p})"));
+        Ok(format!("w{} \"{}\" {}{note}", tracked.id, lines::clip(&window.title, 50), window.app))
     }
 
     fn status(&self) -> Reply {
@@ -1902,11 +2016,60 @@ impl Service {
         match command.as_str() {
             "help" => Ok(HELP.into()),
             "windows" => self.windows_list(who, args.first()),
-            "see" => self.see(who, &flags, args),
-            "get" => self.get(who, &flags, args),
-            "table" => self.table(who, &flags, args),
-            "is" => self.is(who, &flags, args),
-            "shot" => self.shot(who, &flags, args),
+            "cdp" => {
+                if matches!(args.first().map(String::as_str), Some("goto" | "back" | "forward" | "reload")) && STOP.load(Ordering::Relaxed) {
+                    return Err(STOPPED.into());
+                }
+                let reply = self.cdp.command(who, args)?;
+                if matches!(args.first().map(String::as_str), Some("use"))
+                    || args.first().is_some_and(|s| cdp::parse_endpoint(s).is_ok())
+                {
+                    self.agents.lock().unwrap().entry(who.to_string()).or_default().current = None;
+                }
+                Ok(reply)
+            }
+            "see" => {
+                let spec = args.first().map(String::as_str).or(flags.window.as_deref());
+                if let Some((label, target)) = self.cdp_target(who, spec)? {
+                    return self.cdp.see(who, &label, &target, &flags.to_cdp()?);
+                }
+                self.see(who, &flags, args)
+            }
+            "get" => {
+                if let Some((_, target)) = self.cdp_target(who, flags.window.as_deref())? {
+                    let word = args.first().ok_or("get needs a control")?;
+                    return self.cdp.get(&target, word);
+                }
+                self.get(who, &flags, args)
+            }
+            "table" => {
+                if let Some((_, target)) = self.cdp_target(who, flags.window.as_deref())? {
+                    let word = args.first().ok_or("table needs a control")?;
+                    return self.cdp.table(&target, word, flags.from);
+                }
+                self.table(who, &flags, args)
+            }
+            "is" => {
+                if let Some((_, target)) = self.cdp_target(who, flags.window.as_deref())? {
+                    let [word, state] = args else { return Err("is e3 on|off|open|closed|selected|enabled|disabled".into()) };
+                    return self.cdp.is_state(&target, word, state);
+                }
+                self.is(who, &flags, args)
+            }
+            "shot" => {
+                if !flags.screen && (flags.region.is_none() || flags.window.as_deref().is_some_and(cdp::is_direct_spec)) {
+                    let first = args.first().map(String::as_str);
+                    let (spec, control) = match first {
+                        Some(w) if is_ref(w).is_some() => (flags.window.as_deref(), Some(w)),
+                        Some(w) => (Some(w), None),
+                        None => (flags.window.as_deref(), None),
+                    };
+                    if let Some((_, target)) = self.cdp_target(who, spec)? {
+                        return self.cdp.shot(who, &target, control, &flags.to_cdp()?);
+                    }
+                }
+                self.shot(who, &flags, args)
+            }
             "launch" => self.launch(who, &flags, args),
             "status" => self.status(),
             "focus" => {
@@ -1990,6 +2153,13 @@ impl Service {
                     })
                     .collect();
                 if flags.dry {
+                    if let Some((label, target)) = self.cdp_target(who, flags.window.as_deref())? {
+                        let cdp_steps: Result<Vec<cdp::ActionStep>, String> = steps
+                            .iter()
+                            .map(|s| Ok(cdp::ActionStep { flags: s.flags.to_cdp()?, words: s.words.clone() }))
+                            .collect();
+                        return self.cdp.dry_run(&label, &target, &cdp_steps?);
+                    }
                     let tracked = self.pick(who, flags.window.as_deref())?;
                     let mut view = tracked.view.lock().unwrap();
                     if !view.read_once {
@@ -2022,17 +2192,53 @@ impl Service {
                         }
                     }
                 }
-                self.act(who, &flags, &with_expect(steps))
+                let steps = with_expect(steps);
+                let all_cdp = !flags.real
+                    && steps.iter().all(|s| {
+                        !s.flags.real && s.words.first().is_some_and(|v| cdp::CDP_ACTIONS.contains(&v.as_str()) || v == "expect")
+                    });
+                if all_cdp && let Some((_, target)) = self.cdp_target(who, flags.window.as_deref())? {
+                    if STOP.load(Ordering::Relaxed) {
+                        return Err(STOPPED.into());
+                    }
+                    let cdp_steps: Result<Vec<cdp::ActionStep>, String> = steps
+                        .iter()
+                        .map(|s| Ok(cdp::ActionStep { flags: s.flags.to_cdp()?, words: s.words.clone() }))
+                        .collect();
+                    return self.cdp.run_steps(who, &target, &flags.to_cdp()?, &cdp_steps?, &STOP);
+                }
+                self.act(who, &flags, &steps)
             }
             "click" if args.len() > 1 => {
-                let steps = args.iter().map(|word| Step { flags: Flags::default(), words: vec!["click".to_string(), word.clone()] }).collect();
-                self.act(who, &flags, &with_expect(steps))
+                let steps = with_expect(args.iter().map(|word| Step { flags: Flags::default(), words: vec!["click".to_string(), word.clone()] }).collect());
+                if !flags.real && let Some((_, target)) = self.cdp_target(who, flags.window.as_deref())? {
+                    if STOP.load(Ordering::Relaxed) {
+                        return Err(STOPPED.into());
+                    }
+                    let cdp_steps: Result<Vec<cdp::ActionStep>, String> = steps
+                        .iter()
+                        .map(|s| Ok(cdp::ActionStep { flags: s.flags.to_cdp()?, words: s.words.clone() }))
+                        .collect();
+                    return self.cdp.run_steps(who, &target, &flags.to_cdp()?, &cdp_steps?, &STOP);
+                }
+                self.act(who, &flags, &steps)
             }
             "click" | "hover" | "set" | "clear" | "check" | "uncheck" | "toggle" | "expand" | "collapse" | "show" | "select" | "type" | "key"
             | "down" | "scroll" | "drag" | "draw" | "wait" | "pick-file" => {
                 let mut words = vec![command.clone()];
                 words.extend(args.iter().cloned());
-                self.act(who, &flags, &with_expect(vec![Step { flags: Flags::default(), words }]))
+                let steps = with_expect(vec![Step { flags: Flags::default(), words }]);
+                if !flags.real && cdp::CDP_ACTIONS.contains(&command.as_str()) && let Some((_, target)) = self.cdp_target(who, flags.window.as_deref())? {
+                    if STOP.load(Ordering::Relaxed) {
+                        return Err(STOPPED.into());
+                    }
+                    let cdp_steps: Result<Vec<cdp::ActionStep>, String> = steps
+                        .iter()
+                        .map(|s| Ok(cdp::ActionStep { flags: s.flags.to_cdp()?, words: s.words.clone() }))
+                        .collect();
+                    return self.cdp.run_steps(who, &target, &flags.to_cdp()?, &cdp_steps?, &STOP);
+                }
+                self.act(who, &flags, &steps)
             }
             other => Err(format!("unknown command '{other}': deskcrew help")),
         }
@@ -2103,6 +2309,7 @@ pub fn run() {
         windows: Mutex::new((0, HashMap::new())),
         agents: Mutex::new(HashMap::new()),
         overlay,
+        cdp: cdp::CdpHub::new(),
         last_used: Mutex::new(Instant::now()),
         quiet: AtomicBool::new(env_quiet()),
         quit: AtomicBool::new(false),

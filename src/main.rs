@@ -8,6 +8,7 @@ mod act;
 mod apps;
 #[cfg(windows)]
 mod borrow;
+mod cdp;
 mod client;
 #[cfg(windows)]
 mod demo;
