@@ -2708,7 +2708,7 @@ fn should_restore_behind(
         | KeyButMask::BUTTON3.bits();
     match (ptr_before, ptr_after) {
         (Some((x1, y1, m1)), Some((x2, y2, m2))) => (x1, y1) == (x2, y2) && ((m1 | m2) & switch_mask) == 0,
-        _ => true,
+        _ => false,
     }
 }
 
@@ -2748,6 +2748,9 @@ mod tests {
         assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((10, 10, super_key)), fast));
         // Pointer stationary with no button/switch modifier and B stole focus quickly: restore A.
         assert!(should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((10, 10, 0)), fast));
+        // Unavailable pointer state fails closed toward keeping focus untouched.
+        assert!(!should_restore_behind(200, 100, Some(200), None, Some((10, 10, 0)), fast));
+        assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), None, fast));
         // Elapsed past 800 ms window: do not yank focus back.
         assert!(!should_restore_behind(200, 100, Some(200), Some((10, 10, 0)), Some((10, 10, 0)), Duration::from_millis(850)));
     }

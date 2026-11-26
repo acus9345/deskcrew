@@ -1100,6 +1100,7 @@ impl Drop for KeptDrawn {
 /// let it come forward over the person's window just then, it stays minimized.
 pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
     let chromium = is_chromium(hwnd);
+    let input_before = crate::real::last_input_tick();
     let off_screen = if minimized(hwnd) || OFF_SCREEN.lock().unwrap().contains_key(&hwnd) {
         if !(chromium || is_wpf(hwnd) || pixels) {
             return KeptDrawn(None, None);
@@ -1112,7 +1113,9 @@ pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
         let shown = match outcome {
             ShareOutcome::Unavailable => return KeptDrawn(None, None),
             ShareOutcome::SelfActivated(front) => {
-                if front != 0 && !bring_forward(front) {
+                let now_root = root_of(foreground());
+                let switched = crate::real::last_input_tick() != input_before || person_switching() || recent_switch_to(now_root);
+                if front != 0 && !switched && root_of(front) != root_of(hwnd) && !bring_forward(front) {
                     stop_flashing(front);
                 }
                 return KeptDrawn(None, None);
@@ -1131,7 +1134,10 @@ pub fn keep_drawn(hwnd: Hwnd, pixels: bool) -> KeptDrawn {
                         .map(|(_, _, off)| off.front);
                     if let Some(front) = found {
                         let now = foreground();
-                        if now != front && same_app(now, hwnd) {
+                        let front_root = root_of(front);
+                        let now_root = root_of(now);
+                        let switched = crate::real::last_input_tick() != input_before || person_switching() || recent_switch_to(now_root);
+                        if !switched && front_root != root_of(hwnd) && now_root != front_root && same_app(now, hwnd) {
                             let removed = OFF_SCREEN.lock().unwrap().remove(&hwnd);
                             drop(removed);
                             bring_back = front;
@@ -1851,15 +1857,18 @@ pub struct FocusTracker {
 }
 
 impl FocusTracker {
-    /// Reset transient gesture edges (for example after synthetic `SendInput` or when going idle).
+    /// Reset transient gesture edges (for example after synthetic `SendInput`). When
+    /// `preserve_recent_input` is true, already-latched switch timestamps are preserved.
     pub fn prime(&mut self, front_root: Hwnd, preserve_recent_input: bool) {
         self.press_began_on = None;
-        self.last_mouse_click_on = None;
         self.pending_mouse_edge = false;
         self.pending_switch_edge = false;
         if !preserve_recent_input {
+            self.last_mouse_click_on = None;
             self.last_switch_key_ms = None;
-            self.chosen_front = None;
+            if front_root == 0 || self.chosen_front.is_some_and(|w| w != front_root) {
+                self.chosen_front = None;
+            }
         } else if self.chosen_front.is_some_and(|w| w != front_root) && front_root != 0 {
             self.chosen_front = None;
         }
@@ -1875,14 +1884,17 @@ impl FocusTracker {
     }
 
     fn latch_bits(&mut self, bits: SwitchKeyBits, pointer_root: Hwnd, pointer_is_shell: bool, now_ms: u64) {
-        if bits.mouse_edge {
-            self.pending_mouse_edge = true;
-            if !bits.mouse_down && pointer_root != 0 && self.press_began_on.is_none() {
+        if !bits.mouse_down {
+            if let Some((began_root, began_shell)) = self.press_began_on.take() {
+                self.last_mouse_click_on = Some((began_root, began_shell, now_ms));
+            } else if bits.mouse_edge && pointer_root != 0 {
                 self.last_mouse_click_on = Some((pointer_root, pointer_is_shell, now_ms));
             }
-        }
-        if bits.mouse_down && self.press_began_on.is_none() && pointer_root != 0 {
+        } else if self.press_began_on.is_none() && pointer_root != 0 {
             self.press_began_on = Some((pointer_root, pointer_is_shell));
+        }
+        if bits.mouse_edge {
+            self.pending_mouse_edge = true;
         }
         if bits.switch_key_down || bits.switch_key_edge {
             self.pending_switch_edge |= bits.switch_key_edge;
@@ -1933,10 +1945,18 @@ impl FocusTracker {
         if !sample.front_is_target {
             if sample.guard_is_target && !sample.front_is_shell {
                 self.chosen_front = None;
+                if !sample.mouse_down && !sample.switch_key_down {
+                    self.last_mouse_click_on = None;
+                    self.last_switch_key_ms = None;
+                }
                 return FocusDecision::ChosenByPerson(front);
             }
             if !sample.front_is_shell && self.is_switch_for(front, sample.now_ms) {
                 self.chosen_front = None;
+                if !sample.mouse_down && !sample.switch_key_down {
+                    self.last_mouse_click_on = None;
+                    self.last_switch_key_ms = None;
+                }
                 return FocusDecision::ChosenByPerson(front);
             }
             return FocusDecision::OtherApp;
@@ -2042,6 +2062,21 @@ pub fn prime_focus_tracker(front_root: Hwnd, preserve_recent_input: bool) {
         let _ = poll_switch_keys();
     }
     tracker.prime(root_of(front_root), preserve_recent_input);
+}
+
+/// Drain synthetic `GetAsyncKeyState` edges produced while focus was on loan (`--real`, `--mouse`,
+/// or notification panel shortcut). If the person is physically holding a mouse button or Alt/Win
+/// on `front_root` as the loan ends and `adopt_if_held` is true, preserve that switch instead.
+pub fn finish_synthetic_loan(front_root: Hwnd, adopt_if_held: bool) -> bool {
+    let front_root = root_of(front_root);
+    let mut tracker = FOCUS_TRACKER.lock().unwrap();
+    let bits = poll_switch_keys();
+    if adopt_if_held && front_root != 0 && (bits.mouse_down || bits.switch_key_down) {
+        tracker.mark_chosen(front_root);
+        return true;
+    }
+    tracker.prime(front_root, false);
+    false
 }
 
 /// Record that `front_root` was intentionally chosen by the person (or explicitly focused).
@@ -2576,11 +2611,50 @@ mod tests {
         assert_eq!(tracker.observe(base_sample(15, 200, 0, false)), FocusDecision::Same);
         assert!(tracker.recent_switch_to(200, 15));
 
-        // Guard is now B (guard_is_target = true); user goes back to A (non-target, non-shell).
+        // Guard is now B (guard_is_target = true); user goes back to A (non-target, non-shell)
+        // via taskbar click or Alt+Tab. Switch evidence for leaving B must be disarmed so an
+        // immediate self-steal by B right afterward is still caught and restored to A.
         let mut leave_to_a = base_sample(30, 200, 100, false);
         leave_to_a.guard_is_target = true;
+        leave_to_a.mouse_edge = true;
+        leave_to_a.pointer_root = 900;
+        leave_to_a.pointer_is_shell = true;
         assert_eq!(tracker.observe(leave_to_a), FocusDecision::ChosenByPerson(100));
         assert!(!tracker.recent_switch_to(200, 30));
+
+        let steal_after_leave = base_sample(80, 100, 200, true);
+        assert_eq!(tracker.observe(steal_after_leave), FocusDecision::StoleFocus);
+
+        // Same check when leaving B back to A with Alt+Tab / Win+key.
+        let mut choose_b2 = base_sample(100, 100, 200, true);
+        choose_b2.switch_key_edge = true;
+        assert_eq!(tracker.observe(choose_b2), FocusDecision::ChosenByPerson(200));
+
+        let mut leave_alt = base_sample(120, 200, 100, false);
+        leave_alt.guard_is_target = true;
+        leave_alt.switch_key_edge = true;
+        assert_eq!(tracker.observe(leave_alt), FocusDecision::ChosenByPerson(100));
+
+        let steal_after_alt_leave = base_sample(160, 100, 200, true);
+        assert_eq!(tracker.observe(steal_after_alt_leave), FocusDecision::StoleFocus);
+    }
+
+    #[test]
+    fn latch_bits_releases_press_and_prime_true_keeps_recent_click() {
+        let mut tracker = FocusTracker::default();
+        // Press starts on A (100), then releases before next watch_step: must not stick press_began_on.
+        let down = SwitchKeyBits { mouse_down: true, mouse_edge: true, switch_key_down: false, switch_key_edge: false };
+        tracker.latch_bits(down, 100, false, 10);
+        let up = SwitchKeyBits { mouse_down: false, mouse_edge: false, switch_key_down: false, switch_key_edge: false };
+        tracker.latch_bits(up, 100, false, 15);
+        assert!(tracker.press_began_on.is_none());
+
+        // Subsequent quick click on B (200) must latch onto B and survive prime(..., true).
+        let click_b = SwitchKeyBits { mouse_down: false, mouse_edge: true, switch_key_down: false, switch_key_edge: false };
+        tracker.latch_bits(click_b, 200, false, 20);
+        tracker.prime(100, true);
+        assert!(tracker.recent_switch_to(200, 30));
+        assert_eq!(tracker.observe(base_sample(30, 100, 200, true)), FocusDecision::ChosenByPerson(200));
     }
 
     #[test]

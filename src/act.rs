@@ -1167,6 +1167,7 @@ pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
     }
     let window = win::key_window(root);
     let front = win::foreground();
+    let input_before = real::last_input_tick();
     if win::root_of(front) == win::root_of(root) || front == root || front == window {
         return if node.element.set_focus().is_ok() {
             Ok("focus".into())
@@ -1189,10 +1190,7 @@ pub fn focus_wpf_field(root: Hwnd, node: &Node) -> Result<String, String> {
         SetFocus(std::ptr::null_mut());
         AttachThreadInput(mine, theirs, 0);
         // Should the app have come forward all the same, the person gets their window back.
-        let now = win::foreground();
-        if front != 0 && now != front && win::same_app(now, root) && !win::bring_forward(front) {
-            win::stop_flashing(front);
-        }
+        restore_if_stole(root, front, input_before);
         if !focused {
             return Err(NEEDS_REAL.into());
         }
@@ -1362,7 +1360,7 @@ pub fn win_shortcut(chord: &Chord, target: Option<Hwnd>) -> Option<Result<String
         }
         return Some(match action {
             WinShortcut::MaximizeWindow => (|| {
-                if win::foreground() == hwnd {
+                if win::root_of(win::foreground()) == win::root_of(hwnd) {
                     win::place_max_front(hwnd)?;
                 } else {
                     win::fill_screen_behind(hwnd)?;

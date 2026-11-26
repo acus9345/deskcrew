@@ -545,6 +545,7 @@ pub struct Service {
     windows: Mutex<(u32, HashMap<Hwnd, Arc<Tracked>>)>,
     agents: Mutex<HashMap<String, AgentState>>,
     real_input: Mutex<()>,
+    focus_init: Mutex<()>,
     borrow: Permission,
     home: Mutex<Home>,
     keeper: OnceLock<thread::Thread>,
@@ -791,6 +792,7 @@ impl Service {
         if root == 0 {
             return;
         }
+        let _init = self.focus_init.lock().unwrap();
         {
             let mut home = self.home.lock().unwrap();
             home.person = Some(root);
@@ -805,56 +807,63 @@ impl Service {
     /// Remember the person's window once, however many agents are working. An agent arriving
     /// while another app has just grabbed focus must not mistake that app for the person's.
     fn focus_in(&self, pids: &[u32]) {
-        let idle_wake = {
+        let needs_init = {
             let mut home = self.home.lock().unwrap();
             home.agents += 1;
             home.leaving = None;
             home.pids.extend_from_slice(pids);
             win::note_worked(pids);
-            if home.guard.is_none() {
-                Some((home.pids.clone(), home.person, home.idle_input_tick))
-            } else {
-                None
-            }
+            home.guard.is_none()
         };
-        if let Some((all_pids, prior_person, idle_input_tick)) = idle_wake {
-            let current = FocusGuard::take();
-            let current_front = current.front();
-            let current_is_target = current.is_one_of(&all_pids);
-            let valid_prior = prior_person.filter(|hwnd| win::exists(*hwnd));
-            let switched = if current_is_target && valid_prior.is_some_and(|p| p != current_front) {
-                win::switched_since_idle(idle_input_tick, current_front)
-            } else {
-                false
-            };
-            let (final_guard, new_person) = match win::decide_start_guard(current_front, current_is_target, valid_prior, switched) {
-                win::StartAction::GuardCurrentAsPerson(hwnd) => {
-                    win::prime_focus_tracker(hwnd, true);
-                    (FocusGuard::of(hwnd), Some(hwnd))
-                }
-                win::StartAction::AdoptTarget(hwnd) => {
-                    win::adopt_front_tracker(hwnd);
-                    (FocusGuard::of(hwnd), Some(hwnd))
-                }
-                win::StartAction::RestorePerson(person) => {
-                    let restored_guard = FocusGuard::of(person);
-                    restored_guard.restore(&all_pids);
-                    win::prime_focus_tracker(person, false);
-                    (restored_guard, Some(person))
-                }
-            };
-            {
-                let mut home = self.home.lock().unwrap();
+        if needs_init {
+            let _init = self.focus_init.lock().unwrap();
+            let idle_wake = {
+                let home = self.home.lock().unwrap();
                 if home.guard.is_none() {
-                    home.guard = Some(final_guard);
-                    if let Some(person) = new_person.filter(|hwnd| *hwnd != 0) {
-                        home.person = Some(person);
-                    }
-                    home.idle_input_tick = None;
+                    Some((home.pids.clone(), home.person, home.idle_input_tick))
+                } else {
+                    None
                 }
-            }
-            if let Some(keeper) = self.keeper.get() {
-                keeper.unpark();
+            };
+            if let Some((all_pids, prior_person, idle_input_tick)) = idle_wake {
+                let current = FocusGuard::take();
+                let current_front = current.front();
+                let current_is_target = current.is_one_of(&all_pids);
+                let valid_prior = prior_person.filter(|hwnd| win::exists(*hwnd));
+                let switched = if current_is_target && valid_prior.is_some_and(|p| p != current_front) {
+                    win::switched_since_idle(idle_input_tick, current_front)
+                } else {
+                    false
+                };
+                let (final_guard, new_person) = match win::decide_start_guard(current_front, current_is_target, valid_prior, switched) {
+                    win::StartAction::GuardCurrentAsPerson(hwnd) => {
+                        win::prime_focus_tracker(hwnd, true);
+                        (FocusGuard::of(hwnd), Some(hwnd))
+                    }
+                    win::StartAction::AdoptTarget(hwnd) => {
+                        win::adopt_front_tracker(hwnd);
+                        (FocusGuard::of(hwnd), Some(hwnd))
+                    }
+                    win::StartAction::RestorePerson(person) => {
+                        let restored_guard = FocusGuard::of(person);
+                        restored_guard.restore(&all_pids);
+                        win::prime_focus_tracker(person, false);
+                        (restored_guard, Some(person))
+                    }
+                };
+                {
+                    let mut home = self.home.lock().unwrap();
+                    if home.guard.is_none() {
+                        home.guard = Some(final_guard);
+                        if let Some(person) = new_person.filter(|hwnd| *hwnd != 0) {
+                            home.person = Some(person);
+                        }
+                        home.idle_input_tick = None;
+                    }
+                }
+                if let Some(keeper) = self.keeper.get() {
+                    keeper.unpark();
+                }
             }
         }
     }
@@ -872,59 +881,65 @@ impl Service {
     /// through idle time and is woken when an agent starts.
     fn keep_focus(&self) {
         loop {
-            let (held, reset_tracker) = {
+            let (held, expire) = {
                 let mut home = self.home.lock().unwrap();
-                let mut reset_tracker = false;
                 if home.on_loan && home.panel.is_some_and(|panel| win::foreground() != panel) {
                     home.on_loan = false;
                     home.panel = None;
-                    reset_tracker = true;
                 }
                 if home.holding_mouse == MouseHold::Held && !real::holding_button() {
                     home.holding_mouse = MouseHold::Off;
-                    reset_tracker = true;
-                }
-                if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
-                    home.guard = None;
-                    home.pids.clear();
-                    home.leaving = None;
-                    home.idle_input_tick = Some(real::last_input_tick());
-                    reset_tracker = true;
                 }
                 let paused = home.on_loan || home.holding_mouse != MouseHold::Off;
+                let expire = home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER);
                 let held = home.guard.clone().filter(|_| !paused).map(|guard| (guard, home.pids.clone()));
-                (held, reset_tracker)
+                (held, expire)
             };
-            if reset_tracker {
-                win::prime_focus_tracker(win::root_of(win::foreground()), false);
-            }
-            match held {
-                Some((guard, pids)) => {
-                    // A window of the app the person picks themself becomes theirs; anything the
-                    // app pulls forward on its own goes back behind.
-                    match guard.watch_step(&pids) {
-                        win::FocusDecision::ChosenByPerson(theirs) => {
-                            let mut home = self.home.lock().unwrap();
-                            if home.guard.is_some() {
-                                home.guard = Some(FocusGuard::of(theirs));
-                                home.person = Some(theirs);
-                            }
+            if let Some((guard, pids)) = held {
+                // A window of the app the person picks themself becomes theirs; anything the
+                // app pulls forward on its own goes back behind.
+                match guard.watch_step(&pids) {
+                    win::FocusDecision::ChosenByPerson(theirs) => {
+                        let mut home = self.home.lock().unwrap();
+                        if home.guard.is_some() {
+                            home.guard = Some(FocusGuard::of(theirs));
+                            home.person = Some(theirs);
                         }
-                        win::FocusDecision::StoleFocus => {
-                            guard.restore(&pids);
-                        }
-                        win::FocusDecision::Same | win::FocusDecision::OtherApp => {}
                     }
-                    thread::sleep(FOCUS_WATCH);
+                    win::FocusDecision::StoleFocus => {
+                        guard.restore(&pids);
+                    }
+                    win::FocusDecision::Same | win::FocusDecision::OtherApp => {}
                 }
-                None if {
+                if expire {
+                    let mut home = self.home.lock().unwrap();
+                    if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
+                        home.guard = None;
+                        home.pids.clear();
+                        home.leaving = None;
+                        home.idle_input_tick = Some(real::last_input_tick());
+                    }
+                }
+                thread::sleep(FOCUS_WATCH);
+            } else {
+                if expire {
+                    let mut home = self.home.lock().unwrap();
+                    if home.agents == 0 && home.leaving.is_some_and(|at| at.elapsed() > FOCUS_LINGER) {
+                        home.guard = None;
+                        home.pids.clear();
+                        home.leaving = None;
+                        home.idle_input_tick = Some(real::last_input_tick());
+                    }
+                }
+                let wait = {
                     let home = self.home.lock().unwrap();
                     home.on_loan || home.holding_mouse != MouseHold::Off
-                } =>
-                {
-                    thread::sleep(FOCUS_WATCH)
+                };
+                if wait {
+                    thread::sleep(FOCUS_WATCH);
+                } else {
+                    thread::park();
                 }
-                None => thread::park(),
             }
         }
     }
@@ -1092,7 +1107,10 @@ impl Service {
             Ok(work())
         })();
         self.home.lock().unwrap().on_loan = false;
-        win::prime_focus_tracker(win::root_of(win::foreground()), false);
+        let now_root = win::root_of(win::foreground());
+        if win::finish_synthetic_loan(now_root, true) {
+            self.adopt_front(now_root);
+        }
         result
     }
 
@@ -1505,7 +1523,10 @@ impl Service {
                 home.holding_mouse
             };
             if holding == MouseHold::Off {
-                win::prime_focus_tracker(win::root_of(win::foreground()), false);
+                let now_root = win::root_of(win::foreground());
+                if win::finish_synthetic_loan(now_root, true) {
+                    self.adopt_front(now_root);
+                }
             }
             return result;
         }
@@ -1553,7 +1574,10 @@ impl Service {
                 home.on_loan = false;
                 home.panel = None;
             }
-            win::prime_focus_tracker(win::root_of(win::foreground()), false);
+            let now_root = win::root_of(win::foreground());
+            if win::finish_synthetic_loan(now_root, true) {
+                self.adopt_front(now_root);
+            }
             return Ok("ok".into());
         }
         // The panel closes the moment it loses focus, so the focus keeper stands aside until close.
@@ -1577,9 +1601,13 @@ impl Service {
                     home.on_loan = false;
                     home.panel = None;
                 }
-                win::prime_focus_tracker(win::root_of(win::foreground()), false);
+                let now_root = win::root_of(win::foreground());
+                if win::finish_synthetic_loan(now_root, true) {
+                    self.adopt_front(now_root);
+                }
                 return Err("the notification panel did not open".into());
             }
+            win::finish_synthetic_loan(before, false);
             let mut home = self.home.lock().unwrap();
             home.on_loan = true;
             home.panel = Some(front);
@@ -2938,7 +2966,8 @@ impl Service {
         // A window in the back stays there: Windows' own minimize, maximize and restore activate
         // the window, which would take the person's keyboard. Their own window is theirs to change.
         let front = win::foreground();
-        let theirs = front == tracked.hwnd;
+        let input_before = real::last_input_tick();
+        let theirs = win::root_of(front) == win::root_of(tracked.hwnd);
         let _lock = (!theirs).then(win::ForegroundLock::take);
         let mut said = "ok";
         match word.as_str() {
@@ -2966,10 +2995,18 @@ impl Service {
         }
         // Should the app have come forward all the same, the person gets their window back.
         let fg = win::foreground();
+        let fg_root = win::root_of(fg);
+        let front_root = win::root_of(front);
+        let target_root = win::root_of(tracked.hwnd);
         let pids = win::app_pids(tracked.hwnd);
-        if !theirs && front != 0 && fg != front && (fg == tracked.hwnd || pids.contains(&win::pid(fg)) || pids.contains(&win::content_pid(fg))) {
+        let same_app = fg == tracked.hwnd || pids.contains(&win::pid(fg)) || pids.contains(&win::content_pid(fg));
+        let switched = win::person_switching() || real::last_input_tick() != input_before || win::recent_switch_to(fg_root);
+        if !theirs && act::should_restore_background(target_root, front, front_root, fg_root, same_app, switched) {
             thread::sleep(Duration::from_millis(30));
-            if !win::bring_forward(front) {
+            let fg_after = win::foreground();
+            let fg_after_root = win::root_of(fg_after);
+            let switched_after = win::person_switching() || real::last_input_tick() != input_before || win::recent_switch_to(fg_after_root);
+            if !switched_after && fg_after_root != front_root && !win::bring_forward(front) {
                 win::stop_flashing(front);
             }
         }
@@ -3067,7 +3104,10 @@ impl Service {
                     }
                 };
                 if cleared || count > 0 {
-                    win::prime_focus_tracker(win::root_of(win::foreground()), false);
+                    let now_root = win::root_of(win::foreground());
+                    if win::finish_synthetic_loan(now_root, true) {
+                        self.adopt_front(now_root);
+                    }
                 }
                 Ok(format!("let go of {count}"))
             }
@@ -3286,6 +3326,7 @@ pub fn run() {
         windows: Mutex::new((0, HashMap::new())),
         agents: Mutex::new(HashMap::new()),
         real_input: Mutex::new(()),
+        focus_init: Mutex::new(()),
         borrow: Permission::default(),
         home: Mutex::new(Home::default()),
         keeper: OnceLock::new(),

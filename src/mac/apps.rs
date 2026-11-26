@@ -99,6 +99,7 @@ pub fn launch(app: &str, args: &[String], front: bool) -> Result<Option<Window>,
                 && front_pid() == Some(new.pid)
                 && prev != new.pid
                 && idle_seconds() >= started.elapsed().as_secs_f64()
+                && switch_idle_seconds() >= started.elapsed().as_secs_f64() + 0.60
             {
                 activate(prev);
             }
@@ -389,10 +390,13 @@ pub fn idle_seconds() -> f64 {
 pub fn switch_idle_seconds() -> f64 {
     const HID_SYSTEM_STATE: i32 = 1;
     const LEFT_MOUSE_DOWN: u32 = 1;
+    const LEFT_MOUSE_UP: u32 = 2;
     const RIGHT_MOUSE_DOWN: u32 = 3;
+    const RIGHT_MOUSE_UP: u32 = 4;
     const FLAGS_CHANGED: u32 = 12;
     const OTHER_MOUSE_DOWN: u32 = 25;
-    [LEFT_MOUSE_DOWN, RIGHT_MOUSE_DOWN, OTHER_MOUSE_DOWN, FLAGS_CHANGED]
+    const OTHER_MOUSE_UP: u32 = 26;
+    [LEFT_MOUSE_DOWN, LEFT_MOUSE_UP, RIGHT_MOUSE_DOWN, RIGHT_MOUSE_UP, OTHER_MOUSE_DOWN, OTHER_MOUSE_UP, FLAGS_CHANGED]
         .into_iter()
         .map(|kind| unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, kind) })
         .fold(f64::INFINITY, f64::min)
