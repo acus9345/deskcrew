@@ -6,6 +6,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.32] - 2026-11-26
+
+- **Your window switch wins:** clicking into the window an agent is working in, or reaching it with Alt+Tab, Win+number or the taskbar, keeps your focus there on the agent's next moves, including after a pause between moves. Quick clicks between checks are no longer mistaken for the app stealing focus. Apps that jump forward on their own are still put back behind your window.
+- `focus` and `launch --front` make that window yours, so later actions don't hand focus back to an older one.
+- The same rules apply on macOS (Cmd+Tab and clicks) and Linux (clicks and Alt/Super switches).
+
 ## [0.1.31] - 2026-11-25
 
 - **Cursor motion:** each agent's cursor leans into the direction it moves and straightens up smoothly when it stops; moves between points take the same time and curve as on qlinter.org, and drawn strokes slow down at corners like handwriting.
