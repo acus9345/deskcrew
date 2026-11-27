@@ -86,34 +86,20 @@ fn out_of_sight() -> String {
 
 const NO_WINDOW: &str = "no window yet: run deskcrew windows, then deskcrew see <name>";
 
-pub const HELP: &str = r#"deskcrew drives Windows apps in the background. Fastest: see a window once, then do every step in one call.
-windows [filter]                      list windows
-see [window] [-f] [-a] [--find word] [--from N]
-                                      controls; later reads show only changes (-f for all, -a off-screen too)
-get e3                                a control's full text
-shot [window|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
-                                      PNG path; "unchanged" if it matches the last one
-click e3 [e4 ...] | "Name" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift] [--hold ms]
-hover e3 | x,y     check e3     uncheck e3     toggle e3     expand e3     collapse e3     clear e3
-is e3 on|off|open|closed|selected|enabled|disabled
-down shift --real | down left x,y --mouse     up (lets go; 30 s limit)
-set e3 "value"     type [e3] "text" [--paste]     key enter [--hold ms --real]     select e3 "Item"
-scroll [e3] up|down|left|right [n]     show e3     wait "text" [--gone] [--ms N]
-table e5 [--from N]                   a table or grid, as many rows as fit     pick-file "path"   fill an Open or Save dialog
-drag a b     draw [e3] "x,y x,y; x,y x,y" [--smooth]     both take [--button right|middle] [--with shift|ctrl|alt]
-  shapes in draw: line a b | rect x,y w,h | circle x,y r | ellipse x,y rx,ry | arc x,y r from to | bezier a b c d | poly a b c [--close]; --fill fills rect and circle
-do "set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Yes" [--dry] [--risk low|medium|high]
-                                      many steps, one reply; names work as refs, and it goes on into dialogs it opens
-Any action: --expect "text" fails unless the text shows afterwards.
-launch app [args] [--front] [--cdp]     focus     close     place x,y,w,h|min|max|restore|left|right|monitor N
-cdp [status|on|off|port|tabs|use|goto|back|forward|reload]   control Chromium/Electron pages by DOM over CDP
-apps     screens     notifications [close]     clip     clip set "text"     clip clear     status     resume     quit     setup (installs for your coding agents)     mcp (the same as MCP tools, over stdio)
-Every action replies with what changed, new dialogs and their text too: no need to see again or sleep. x,y are pixels in the last shot, or text see read. Ctrl+Alt+Esc stops every agent.
-Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
---real (brings the window forward for a moment and uses the keyboard or a pen: a last resort),
---mouse (asks the person to borrow their cursor, if they allow asking: only if nothing else works).
-cursor [off|ask|session|always]   who may borrow the cursor; off by default, and the person confirms anything else.
-quiet [on|off|status]             hard background-only lock: refuses focus, --real, --mouse, --front, and down."#;
+pub const HELP: &str = r#"deskcrew: background Windows & CDP browser control. Read once (`see`), batch steps (`do`).
+windows [filter] | see [win] [-f] [-a] [--find w] [--from N] | get e3 | table e5 [--from N]
+shot [win|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
+click e3 [e4..]|"Name"|x,y [--right|--double|--triple|--middle|--back|--forward] [--with ctrl+shift] [--hold ms]
+hover e3|x,y | check|uncheck|toggle|expand|collapse|clear|show e3 | is e3 on|off|open|closed|selected|enabled|disabled
+set e3 "val" | type [e3] "text" [--paste] | key enter [--hold ms --real] | select e3 "Item" | pick-file "path"
+scroll [e3] up|down|left|right [n] | wait "text"|ms [--gone] [--ms N] | down shift --real | down left x,y --mouse | up
+drag a b | draw [e3] "x,y x,y; line a b; rect x,y w,h; circle x,y r; ellipse x,y rx,ry; arc x,y r a b; bezier a b c d; poly a b c [--close]" [--smooth] [--fill] [--button right|middle] [--with shift|ctrl|alt]
+do "set Name Ada; select Country Japan; click Submit; click Yes" [--dry] [--risk low|medium|high]  (names work as refs; continues into dialogs; replies with changes)
+launch app [args] [--front] [--cdp] | focus | close | place x,y,w,h|min|max|restore|left|right|monitor N
+cdp [status|on|off|port|tabs|use|goto|back|forward|reload]   (DOM control; -w cdp|t1|cdp:<q>)
+apps | screens | notifications [close] | clip [set "text"|clear] | status | resume | quit | setup | mcp
+cursor [off|ask|session|always] | quiet [on|off|status]
+Flags: -w win, --agent name, --expect "text", --fast, --force, --real (focus last resort), --mouse (cursor last resort). Ctrl+Alt+Esc stops all."#;
 
 /// Add text to the end of a control through the value it reports, for a control that takes no
 /// window messages. None if it has no value that can be set.

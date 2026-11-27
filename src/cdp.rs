@@ -1027,43 +1027,45 @@ const DOM_SNAPSHOT_JS: &str = r#"(() => {
     return false;
   };
 
+  const usedLabelEls = new WeakSet();
   const labelText = (el, root) => {
     const labelledBy = el.getAttribute('aria-labelledby');
     if (labelledBy) {
       const parts = labelledBy.trim().split(/\s+/).map(id => {
         const ref = (root && root.getElementById ? root.getElementById(id) : null) || document.getElementById(id);
+        if (ref) usedLabelEls.add(ref);
         return ref ? (ref.innerText || ref.textContent || '') : '';
       }).filter(Boolean);
-      if (parts.length) return clip(parts.join(' '), 120);
+      if (parts.length) return clip(parts.join(' '), 80);
     }
     const aria = el.getAttribute('aria-label');
-    if (aria && aria.trim()) return clip(aria, 120);
+    if (aria && aria.trim()) return clip(aria, 80);
     if (el.labels && el.labels.length) {
       const txt = Array.from(el.labels).map(l => l.innerText || l.textContent || '').join(' ');
-      if (txt.trim()) return clip(txt, 120);
+      if (txt.trim()) return clip(txt, 80);
     }
     if (el.id && root && root.querySelector) {
       try {
         const lab = root.querySelector('label[for="' + CSS.escape(el.id) + '"]');
         if (lab) {
           const txt = lab.innerText || lab.textContent || '';
-          if (txt.trim()) return clip(txt, 120);
+          if (txt.trim()) return clip(txt, 80);
         }
       } catch (_) {}
     }
     const alt = el.getAttribute('alt');
-    if (alt && alt.trim()) return clip(alt, 120);
+    if (alt && alt.trim()) return clip(alt, 80);
     const placeholder = el.getAttribute('placeholder');
-    if (placeholder && placeholder.trim()) return clip(placeholder, 120);
+    if (placeholder && placeholder.trim()) return clip(placeholder, 80);
     const title = el.getAttribute('title');
-    if (title && title.trim()) return clip(title, 120);
+    if (title && title.trim()) return clip(title, 80);
     const tag = el.tagName;
     if (tag === 'INPUT' && (el.type === 'button' || el.type === 'submit' || el.type === 'reset')) {
-      return clip(el.value || '', 120);
+      return clip(el.value || '', 80);
     }
     if (tag !== 'INPUT' && tag !== 'TEXTAREA' && tag !== 'SELECT') {
       const txt = el.innerText || el.textContent || '';
-      if (txt.trim()) return clip(txt, 120);
+      if (txt.trim()) return clip(txt, 80);
     }
     return clip(el.getAttribute('name') || '', 80);
   };
@@ -1157,16 +1159,16 @@ const DOM_SNAPSHOT_JS: &str = r#"(() => {
     let value = null;
     if (!isPassword) {
       if (tag === 'input' && !checkable && role !== 'button') {
-        if (el.value) value = clip(el.value, 120);
+        if (el.value) value = clip(el.value, 60);
       } else if (tag === 'textarea') {
-        if (el.value) value = clip(el.value, 120);
+        if (el.value) value = clip(el.value, 60);
       } else if (tag === 'select') {
         const opt = el.options && el.selectedIndex >= 0 ? el.options[el.selectedIndex] : null;
-        if (opt && opt.text) value = clip(opt.text, 120);
+        if (opt && opt.text) value = clip(opt.text, 60);
       } else if (el.isContentEditable) {
         const txt = el.innerText || el.textContent || '';
-        if (txt.trim()) value = clip(txt, 120);
-        if (name === value) name = clip(el.getAttribute('aria-label') || el.getAttribute('placeholder') || '', 120);
+        if (txt.trim()) value = clip(txt, 60);
+        if (name === value) name = clip(el.getAttribute('aria-label') || el.getAttribute('placeholder') || '', 80);
       }
     }
     const states = [];
@@ -1227,10 +1229,18 @@ const DOM_SNAPSHOT_JS: &str = r#"(() => {
       return;
     }
 
+    if (tag === 'SVG' || tag === 'svg') {
+      const svgRole = mapRole(node);
+      if (svgRole !== null && (svgRole !== 'image' || (node.getAttribute('aria-label') || '').trim())) {
+        pushNode(node, svgRole, root, ox, oy, path, null);
+      }
+      return;
+    }
+
     const role = mapRole(node);
     if (role === 'row') {
       const cellEls = Array.from(node.children).filter(c => c.tagName === 'TD' || c.tagName === 'TH' || c.getAttribute('role') === 'cell' || c.getAttribute('role') === 'gridcell' || c.getAttribute('role') === 'columnheader');
-      const cells = cellEls.map(c => clip(c.innerText || c.textContent || '', 60)).filter(Boolean);
+      const cells = cellEls.map(c => clip(c.innerText || c.textContent || '', 32)).filter(Boolean);
       if (cells.length) {
         pushNode(node, 'row', root, ox, oy, path, cells);
       }
@@ -1264,8 +1274,8 @@ const DOM_SNAPSHOT_JS: &str = r#"(() => {
       for (const ch of node.childNodes) {
         if (ch.nodeType === 3 && ch.nodeValue) direct += ch.nodeValue;
       }
-      direct = clip(direct, 120);
-      if (direct && tag !== 'LABEL') {
+      direct = clip(direct, 80);
+      if (direct && tag !== 'LABEL' && !usedLabelEls.has(node)) {
         pushNode(node, '', root, ox, oy, path, null);
       }
     }
@@ -1375,6 +1385,29 @@ fn parse_dom_snapshot(val: &Value) -> Result<DomSnapshot, String> {
         });
     }
     Ok(DomSnapshot { title, url, viewport, hidden, nodes })
+}
+
+/// Drop standalone DOM text nodes that merely repeat the immediately following control's label
+/// (e.g., `<div>Full Name:</div><input aria-label="Full Name">`) or an identical previous text node.
+fn drop_dom_labels(nodes: &mut Vec<DomNode>) {
+    let mut at = 0;
+    while at < nodes.len() {
+        let is_plain = nodes[at].parts.role.is_empty() && nodes[at].parts.value.is_none();
+        let dup_next = is_plain
+            && at + 1 < nodes.len()
+            && !nodes[at + 1].parts.role.is_empty()
+            && lines::same_label(&nodes[at].parts.name, &nodes[at + 1].parts.name);
+        let dup_prev = is_plain
+            && at > 0
+            && nodes[at - 1].parts.role.is_empty()
+            && nodes[at - 1].parts.value.is_none()
+            && nodes[at - 1].parts.name == nodes[at].parts.name;
+        if dup_next || dup_prev {
+            nodes.remove(at);
+        } else {
+            at += 1;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1607,7 +1640,10 @@ impl PageState {
     fn read_dom(&mut self, ws_url: &str, all: bool) -> Result<(), String> {
         let expr = DOM_SNAPSHOT_JS.replace("__ALL__", if all { "true" } else { "false" });
         let val = self.with_session_read(ws_url, |s| s.eval_json(&expr))?;
-        let snap = parse_dom_snapshot(&val)?;
+        let mut snap = parse_dom_snapshot(&val)?;
+        if !all {
+            drop_dom_labels(&mut snap.nodes);
+        }
         self.title = snap.title;
         self.url = snap.url;
         self.viewport = snap.viewport;
@@ -2085,7 +2121,7 @@ impl CdpHub {
             let seen = page.seen_by.get(who).cloned().filter(|_| !flags.full && !filtered && !flags.all);
             if let Some(prev) = seen {
                 let changes = lines::changes(&prev, &page.lines);
-                if changes.len() * 2 <= page.lines.len().max(1) {
+                if changes.len() <= lines::MAX_LINES && changes.len() * 2 <= page.lines.len().max(1) {
                     let snapshot = page.lines.clone();
                     page.seen_by.insert(who.to_string(), snapshot);
                     return Ok(if changes.is_empty() { "no change".into() } else { changes.join("\n") });
@@ -2511,7 +2547,11 @@ impl CdpHub {
                 }
             }
         }
-        page.settle_dom(&target.ws_url, stop)?;
+        let waited_only = !steps.is_empty()
+            && steps.iter().all(|s| s.words.first().is_some_and(|v| v == "wait" || v == "expect"));
+        if !waited_only {
+            page.settle_dom(&target.ws_url, stop)?;
+        }
         let (changes, complete) = lines::change_report(&before, &page.lines);
         if complete {
             let snapshot = page.lines.clone();
@@ -3488,6 +3528,28 @@ mod tests {
         let parsed = parse_targets_json(&raw).unwrap();
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].id, "2");
+    }
+
+    #[test]
+    fn drop_dom_labels_removes_duplicate_form_labels_and_keeps_distinct_text() {
+        let snap = json!({
+            "title": "Form",
+            "url": "https://example.test",
+            "viewport": [800, 600],
+            "hidden": 0,
+            "nodes": [
+                { "dom_id": 1, "identity": "|lbl:Full Name:", "role": "", "name": "Full Name:", "value": null, "states": [], "cells": [], "rect": [10, 10, 80, 20], "is_password": false, "disabled": false, "readonly": false },
+                { "dom_id": 2, "identity": "edit|#name", "role": "edit", "name": "Full Name", "value": "Ada", "states": [], "cells": [], "rect": [10, 30, 200, 24], "is_password": false, "disabled": false, "readonly": false },
+                { "dom_id": 3, "identity": "|lbl:Ready", "role": "", "name": "Ready", "value": null, "states": [], "cells": [], "rect": [10, 60, 60, 20], "is_password": false, "disabled": false, "readonly": false },
+                { "dom_id": 4, "identity": "|lbl:Ready2", "role": "", "name": "Ready", "value": null, "states": [], "cells": [], "rect": [10, 60, 60, 20], "is_password": false, "disabled": false, "readonly": false }
+            ]
+        });
+        let mut parsed = parse_dom_snapshot(&snap).unwrap();
+        drop_dom_labels(&mut parsed.nodes);
+        assert_eq!(parsed.nodes.len(), 2);
+        assert_eq!(parsed.nodes[0].parts.role, "edit");
+        assert_eq!(parsed.nodes[0].parts.name, "Full Name");
+        assert_eq!(parsed.nodes[1].parts.name, "Ready");
     }
 
     #[test]

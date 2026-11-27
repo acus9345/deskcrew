@@ -27,31 +27,19 @@ use std::{
 };
 
 pub const HELP: &str = "\
-deskcrew drives Mac apps in the background. Refs stay valid, so read once.
-windows [filter]                      list windows
-see [window] [-f] [-a] [--find word] [--from N]
-                                      controls; later reads show only changes (-f for all, -a off-screen too)
-get e3                                a control's full text
-table e3 [--from N]                   a table or list as tab-separated rows
-shot [window|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
-                                      PNG path; \"unchanged\" if it matches the last one
-click e3 [e4 ...] | \"Name\" | x,y [--right] [--double] [--triple] [--middle] [--back] [--forward] [--with ctrl+shift] [--hold ms]
-hover e3 | x,y     check e3     uncheck e3     toggle e3     expand e3     collapse e3     clear e3
-is e3 on|off|open|closed|selected|enabled|disabled
-down shift     up (lets go; 30 s limit)
-set e3 \"value\"     type [e3] \"text\" [--paste]     key enter [--hold ms]     select e3 \"Item\"
-scroll [e3] up|down|left|right [n]     show e3     wait \"text\"|ms [--gone] [--ms N]
-drag a b     draw e3 \"x,y x,y; x,y x,y\" [--smooth] [--fill] [--close]
-pick-file \"path\"                      choose a file in an open file dialog
-do \"click e1; set e2 hi; key enter\" [--dry] [--risk low|medium|high]   many steps, one reply
-Any action: --expect \"text\" fails unless the text shows afterwards.
-launch app [args] [--front] [--cdp]     focus     close     place x,y,w,h|min|max|restore|left|right|monitor N
-cdp [status|on|off|port|tabs|use|goto|back|forward|reload]   control Chromium/Electron pages by DOM over CDP
-notifications [close]     apps     screens     clip     clip set \"text\"     clip clear     status     cursor     quiet [on|off]     resume     quit     setup     mcp
-Every action replies with what changed, in the picture too. x,y are points in the last shot, or text see read. Ctrl+Option+Esc stops every agent.
-Flags: -w window, --agent name, --fast (no glide), --force (allow risky keys),
---real (brings the app forward for a moment and uses the system keyboard: a last resort).
-macOS asks once for Accessibility, and for Screen Recording before the first picture.";
+deskcrew: background macOS & CDP browser control. Read once (`see`), batch steps (`do`).
+windows [filter] | see [win] [-f] [-a] [--find w] [--from N] | get e3 | table e3 [--from N]
+shot [win|e3] [-f] [--marks] [--rulers] [--screen [-a]] [--region x,y,w,h] [--changed] [--edge N]
+click e3 [e4..]|\"Name\"|x,y [--right|--double|--triple|--middle|--back|--forward] [--with ctrl+shift] [--hold ms]
+hover e3|x,y | check|uncheck|toggle|expand|collapse|clear|show e3 | is e3 on|off|open|closed|selected|enabled|disabled
+set e3 \"val\" | type [e3] \"text\" [--paste] | key enter [--hold ms] | select e3 \"Item\" | pick-file \"path\"
+scroll [e3] up|down|left|right [n] | wait \"text\"|ms [--gone] [--ms N] | down shift | up (30s)
+drag a b | draw e3 \"x,y x,y; line|rect|circle|ellipse|arc|bezier|poly\" [--smooth] [--fill] [--close]
+do \"click e1; set e2 hi; key enter\" [--dry] [--risk low|medium|high]  (names work as refs; replies with changes)
+launch app [args] [--front] [--cdp] | focus | close | place x,y,w,h|min|max|restore|left|right|monitor N
+cdp [status|on|off|port|tabs|use|goto|back|forward|reload]   (DOM control; -w cdp|t1|cdp:<q>)
+notifications [close] | apps | screens | clip [set \"text\"|clear] | status | cursor | quiet [on|off] | resume | quit | setup | mcp
+Flags: -w win, --agent name, --expect \"text\", --fast, --force, --real (focus last resort). Ctrl+Option+Esc stops all.";
 
 /// What a picture of a window the agent has not read yet says: reading is far cheaper.
 const READ_FIRST: &str = "\nnot read yet: see gives this window's controls and its text with x,y to click, with no picture. Shots are for looking at drawings, not for reading text or checking what was typed.";

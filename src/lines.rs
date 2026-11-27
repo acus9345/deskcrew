@@ -24,6 +24,16 @@ pub fn parse_rect(text: &str) -> Option<(i32, i32, i32, i32)> {
     Some((x, y, w, h))
 }
 
+/// True when a standalone label (such as `"Name:"` or `"Email *"`) repeats an adjacent control's name.
+pub fn same_label(label: &str, control: &str) -> bool {
+    fn clean(s: &str) -> &str {
+        s.trim().trim_end_matches([':', '*', ' ']).trim()
+    }
+    let a = clean(label);
+    let b = clean(control);
+    !a.is_empty() && a.eq_ignore_ascii_case(b)
+}
+
 /// One line of text, cut to length, so a long value cannot flood a reply.
 pub fn clip(text: &str, max: usize) -> String {
     let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -282,6 +292,10 @@ mod tests {
         assert_eq!(clip("a\n  b", 10), "a b");
         assert_eq!(clip("abcdef", 3), "abc...");
         assert_eq!(clip("字元對應表", 2), "字元...");
+        assert!(same_label("Name:", "Name"));
+        assert!(same_label("Email *", "email"));
+        assert!(!same_label("Status: ready", "Status"));
+        assert!(!same_label("", "Name"));
     }
 
     #[test]

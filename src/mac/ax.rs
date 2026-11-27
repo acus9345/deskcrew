@@ -712,7 +712,7 @@ fn drop_labels(nodes: &mut Vec<Node>, quiet: &mut Vec<Bounds>) {
     while at + 1 < nodes.len() {
         let (label, next) = (&nodes[at].parts, &nodes[at + 1].parts);
         let shell = !label.role.is_empty() && encloses(nodes[at].rect, nodes[at + 1].rect);
-        if (label.role.is_empty() || shell) && label.value.is_none() && !label.name.is_empty() && !next.role.is_empty() && next.name == label.name {
+        if (label.role.is_empty() || shell) && label.value.is_none() && !next.role.is_empty() && crate::lines::same_label(&label.name, &next.name) {
             quiet.push(nodes.remove(at).rect);
         } else {
             at += 1;

@@ -401,28 +401,37 @@ pub fn encloses(outer: Bounds, inner: Bounds) -> bool {
     ix0 >= ox0 - SLACK && iy0 >= oy0 - SLACK && ix1 <= ox1 + SLACK && iy1 <= oy1 + SLACK
 }
 
-/// Drop static text nodes whose text duplicates a named control enclosing them, returning
-/// `(kept, dropped_count, quiet_rects)` so `blind_spot` still treats those rects as covered.
+/// Drop static text nodes whose text duplicates an enclosing or immediately following named control,
+/// returning `(kept, dropped_count, quiet_rects)` so `blind_spot` still treats those rects as covered.
 pub fn drop_labels(nodes: Vec<Node>) -> (Vec<Node>, usize, Vec<Bounds>) {
     let boxes: Vec<(Bounds, String)> = nodes
         .iter()
         .filter(|n| !n.parts.role.is_empty() && !n.parts.name.is_empty())
-        .map(|n| (n.rect, n.parts.name.to_lowercase()))
+        .map(|n| (n.rect, n.parts.name.clone()))
         .collect();
-    let mut kept = Vec::with_capacity(nodes.len());
+    let mut kept: Vec<Node> = Vec::with_capacity(nodes.len());
     let mut quiet = Vec::new();
     let mut dropped = 0;
     for node in nodes {
-        if node.parts.role.is_empty() {
-            let lower = node.parts.name.to_lowercase();
-            let duplicate = !lower.is_empty() && boxes.iter().any(|(b, name)| name == &lower && encloses(*b, node.rect));
-            if duplicate {
-                quiet.push(node.rect);
-                dropped += 1;
-                continue;
-            }
+        if node.parts.role.is_empty()
+            && node.parts.value.is_none()
+            && boxes.iter().any(|(b, name)| crate::lines::same_label(&node.parts.name, name) && encloses(*b, node.rect))
+        {
+            quiet.push(node.rect);
+            dropped += 1;
+            continue;
         }
         kept.push(node);
+    }
+    let mut at = 0;
+    while at + 1 < kept.len() {
+        let (label, next) = (&kept[at].parts, &kept[at + 1].parts);
+        if label.role.is_empty() && label.value.is_none() && !next.role.is_empty() && crate::lines::same_label(&label.name, &next.name) {
+            quiet.push(kept.remove(at).rect);
+            dropped += 1;
+        } else {
+            at += 1;
+        }
     }
     (kept, dropped, quiet)
 }
