@@ -1584,7 +1584,7 @@ impl Service {
         let current = self.agents.lock().unwrap().get(who).and_then(|a| a.current);
         let listed = apps::list();
         self.windows.lock().unwrap().1.retain(|id, _| listed.iter().any(|w| w.id == *id));
-        let shown: Vec<String> = listed
+        let mut shown: Vec<String> = listed
             .iter()
             .filter(|w| wanted.as_ref().is_none_or(|f| w.title.to_lowercase().contains(f) || w.app.to_lowercase().contains(f)))
             .take(MAX_WINDOWS)
@@ -1593,6 +1593,7 @@ impl Service {
                 format!("w{}{mark} \"{}\" {}", self.track(w).id, lines::clip(&w.title, 50), w.app)
             })
             .collect();
+        shown.extend(self.cdp.window_lines(who, wanted.as_deref()));
         Ok(if shown.is_empty() { "no windows".into() } else { shown.join("\n") })
     }
 

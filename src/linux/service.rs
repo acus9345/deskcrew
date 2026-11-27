@@ -2066,7 +2066,7 @@ impl Service {
         let known_before: std::collections::HashSet<WindowKey> = self.windows.lock().unwrap().1.keys().cloned().collect();
         let listed = self.list_windows()?;
         self.windows.lock().unwrap().1.retain(|key, _| !known_before.contains(key) || listed.iter().any(|w| &w.key == key));
-        let shown: Vec<String> = listed
+        let mut shown: Vec<String> = listed
             .iter()
             .filter(|w| wanted.as_ref().is_none_or(|f| w.title.to_lowercase().contains(f) || w.app.to_lowercase().contains(f)))
             .take(MAX_WINDOWS)
@@ -2075,6 +2075,7 @@ impl Service {
                 format!("w{}{mark} \"{}\" {}", self.track(w).id, lines::clip(&w.title, 50), w.app)
             })
             .collect();
+        shown.extend(self.cdp.window_lines(who, wanted.as_deref()));
         Ok(if shown.is_empty() { "no windows".into() } else { shown.join("\n") })
     }
 

@@ -1883,6 +1883,36 @@ impl CdpHub {
         out
     }
 
+    /// Format connected CDP tabs for `deskcrew windows` (only when a CDP endpoint was explicitly
+    /// configured or launched via `launch --cdp`, so non-CDP `windows` calls add zero latency).
+    pub fn window_lines(&self, who: &str, filter: Option<&str>) -> Vec<String> {
+        if !self.is_enabled() {
+            return Vec::new();
+        }
+        let configured = {
+            let st = self.state.lock().unwrap();
+            st.explicit.is_some() || !st.launched_ports.is_empty()
+        };
+        if !configured {
+            return Vec::new();
+        }
+        let wanted = filter.map(str::to_ascii_lowercase);
+        let active_ws = self.active_target(who).map(|t| t.ws_url);
+        self.all_page_targets()
+            .into_iter()
+            .enumerate()
+            .filter(|(_, t)| {
+                wanted.as_ref().is_none_or(|f| {
+                    f == "cdp" || t.title.to_ascii_lowercase().contains(f) || t.url.to_ascii_lowercase().contains(f)
+                })
+            })
+            .map(|(i, t)| {
+                let mark = if active_ws.as_deref() == Some(t.ws_url.as_str()) { "*" } else { "" };
+                format!("t{}{mark} \"{}\" {} [cdp]", i + 1, lines::clip(&t.title, 50), lines::clip(&t.url, 60))
+            })
+            .collect()
+    }
+
     /// Handle `deskcrew cdp ...`: status, connect `<port|url>`, `off`, `on`, `tabs`, `use`,
     /// `goto <url>`, `back`, `forward`, `reload`.
     pub fn command(&self, who: &str, args: &[String]) -> Result<String, String> {
@@ -3169,7 +3199,7 @@ mod tests {
         };
 
         let server = thread::spawn(move || {
-            for incoming in listener.incoming().take(4) {
+            for incoming in listener.incoming().take(5) {
                 let Ok(mut stream) = incoming else { break };
                 let _ = stream.set_read_timeout(Some(Duration::from_secs(3)));
                 let mut req = Vec::new();
@@ -3329,8 +3359,13 @@ mod tests {
         });
 
         let hub = CdpHub::new_isolated();
+        assert!(hub.window_lines("tester", None).is_empty(), "unconfigured hub must not probe during windows");
         let connected = hub.command("tester", &[port.to_string()]).unwrap();
         assert!(connected.contains("1 pages"), "{connected}");
+
+        let win_lines = hub.window_lines("tester", Some("mock"));
+        assert_eq!(win_lines.len(), 1);
+        assert!(win_lines[0].contains("t1*") && win_lines[0].contains("[cdp]"), "{win_lines:?}");
 
         // Explicit CDP mode MUST NOT hijack non-browser native windows like Calculator or Notepad!
         assert!(hub.target_for_window("Calculator", "CalculatorApp", false).is_none());

@@ -16,11 +16,11 @@ fn tools() -> Value {
     json!([
         {
             "name": "see",
-            "description": "Read a window's controls as refs (e3, e4...) with names and values. Later reads show only what changed. Read once, then do every step with `do`.",
+            "description": "Read a window's controls as refs (e3, e4...) with names and values (reads the live DOM via CDP automatically for CDP-enabled browsers). Later reads show only what changed. Read once, then do every step with `do`.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "window": { "type": "string", "description": "Title, part of it, app name or w-ref from `windows`" },
+                    "window": { "type": "string", "description": "Title, part of it, app name, w-ref from `windows`, or CDP tab (`cdp`, `t1`, `cdp:<query>`)" },
                     "full": { "type": "boolean", "description": "Everything again, not only changes" },
                     "all": { "type": "boolean", "description": "Off-screen controls too" },
                     "find": { "type": "string", "description": "Only controls matching this word" }
@@ -30,12 +30,12 @@ fn tools() -> Value {
         },
         {
             "name": "do",
-            "description": "Run many steps in one call, separated by `;`, e.g. \"set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Yes\". Names work in place of refs, and it goes on into dialogs the steps open. Replies with everything that changed.",
+            "description": "Run many steps in one call, separated by `;`, e.g. \"set Name Ada; select Country Japan; check 'Gift wrap'; click Submit; click Yes\". Names work in place of refs, and it goes on into dialogs the steps open. Uses DOM/CDP automatically on CDP-enabled browsers. Replies with everything that changed.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
                     "steps": { "type": "string" },
-                    "window": { "type": "string" },
+                    "window": { "type": "string", "description": "Window title, app name, w-ref, or CDP tab (`cdp`, `t1`, `cdp:<query>`)" },
                     "dry": { "type": "boolean", "description": "Check the steps without running them" }
                 },
                 "required": ["steps", "window"]
@@ -43,11 +43,11 @@ fn tools() -> Value {
         },
         {
             "name": "shot",
-            "description": "A picture of a window, the screen or a region, without bringing anything forward. Use it only where `see` finds no controls.",
+            "description": "A picture of a window, CDP tab, the screen or a region, without bringing anything forward. Use it only where `see` finds no controls.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
-                    "window": { "type": "string", "description": "Window, or a ref like e3 for one control" },
+                    "window": { "type": "string", "description": "Window, CDP tab (`cdp`, `t1`), or a ref like e3 for one control" },
                     "screen": { "type": "boolean", "description": "The whole screen instead of a window" },
                     "region": { "type": "string", "description": "x,y,w,h of the window or screen" },
                     "marks": { "type": "boolean", "description": "Label controls with their refs" },
@@ -273,7 +273,7 @@ pub fn serve() {
                     "protocolVersion": version,
                     "capabilities": { "tools": {} },
                     "serverInfo": { "name": "deskcrew", "version": env!("CARGO_PKG_VERSION") },
-                    "instructions": "deskcrew controls desktop apps in the background, without the person's mouse or focus. Read a window once with `see`, then run every step in one `do` call; the reply lists what changed."
+                    "instructions": "deskcrew controls desktop apps and CDP browsers in the background, without the person's mouse or focus. Read a window once with `see`, then run every step in one `do` call; the reply lists what changed. For web tasks, launch browsers with `[\"launch\", \"chrome\", \"--cdp\"]` (or `msedge --cdp`) and navigate with `[\"cdp\", \"goto\", \"https://...\"]` so pages are read and driven through their DOM via CDP (use `cdp`, `t1`, or `cdp:<query>` as `window` for tabs/headless pages)."
                 }))
             }
             "ping" => Ok(json!({})),

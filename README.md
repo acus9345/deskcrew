@@ -271,7 +271,7 @@ From each tool's own README, help and tool list, checked on 2026-11-03. A dash m
 | Screenshots | yes | yes | yes | yes, annotated | — |
 | Tables and grids | `table` | — | — | — | yes |
 | Open and Save dialogs | `pick-file` | — | — | — | yes |
-| Web pages | windows as apps, and `fetch` for page text | agent-browser | Electron apps | page DOM and scraping | Edge and Chrome pages |
+| Web pages | direct DOM via CDP (`launch chrome --cdp`, `cdp goto\|tabs`, auto-attached on CDP browsers), accessibility fallback, and `fetch` for page text | agent-browser | Electron apps | page DOM and scraping | Edge and Chrome pages |
 | Batches | `do`, `--expect` | — | `batch`, YAML workflows | multi-select and multi-edit | `ui_batch` |
 | Wait for text | yes | yes | yes | yes | yes |
 | Hold keys and buttons | yes, let go after 30 s | listed, not working yet | — | — | — |
