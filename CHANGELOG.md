@@ -6,6 +6,12 @@ and this project uses [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+## [0.1.33] - 2026-11-27
+
+- **Browser control through CDP (Windows, macOS, Linux):** read and act on Chromium and Electron web pages directly through their live DOM instead of the OS accessibility tree, with zero added crate dependencies and no focus stealing or cursor movement. Supports open Shadow DOM, same-origin `<iframe>`s, `<canvas>` drawing, native and custom ARIA selects, password redaction, `table`, `is`, `shot`, `do`, `launch <browser> --cdp`, `cdp [status|on|off|port|tabs|use|goto|back|forward|reload]`, and direct tab targeting (`-w cdp`, `-w t1`, `-w cdp:<query>`).
+- **Automatic agent adoption:** updated the bundled `deskcrew` skill, standing rules (`deskcrew setup`), MCP instructions/schemas, and `deskcrew windows` (listing live `[cdp]` tabs when configured) so coding agents automatically use CDP for web tasks.
+- **Lower token and turn cost:** cut `SKILL.md` by 44% and `HELP`/MCP schemas by 37–45%, made the standing rule self-sufficient so agents skip redundant skill-load and dialog-confirm turns, extended duplicate form-label pruning (`"Name:"` / `"Email *"`) across Windows UIA, macOS AX, Linux AT-SPI and CDP DOM, and pruned inline `<svg>` noise and `aria-labelledby` duplicates in CDP snapshots.
+
 ## [0.1.32] - 2026-11-26
 
 - **Your window switch wins:** clicking into the window an agent is working in, or reaching it with Alt+Tab, Win+number or the taskbar, keeps your focus there on the agent's next moves, including after a pause between moves. Quick clicks between checks are no longer mistaken for the app stealing focus. Apps that jump forward on their own are still put back behind your window.
